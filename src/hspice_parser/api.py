@@ -61,7 +61,8 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None) -> dict:
     return {
         "path": h.path, "format": h.version, "analysis": h.analysis, "x": h.x_name,
         "sweep_params": h.sweep_params, "sweep_values": ts.sweep_values,
-        "sweeps": len(ts.sweep_values), "truncated": ts.truncated, "traces": traces,
+        "sweeps": len(ts.sweep_values), "sweep_indices": list(ts.sweep_indices),
+        "truncated": ts.truncated, "traces": traces,
     }
 
 
@@ -71,6 +72,9 @@ def default_dest(path, output: str) -> str:
     return f"{root}_{ext.lstrip('.')}_traces.{output}"
 
 
+CSV_ROWS_PER_SLICE = 65536      # rows stacked as float64 at a time; bounds writer memory
+
+
 def _write_csv(ts: TraceSet, dest: str) -> None:
     h = ts.header
     with_lead = bool(h.nsweepparam) or len(ts.sweep_values) > 1
@@ -78,14 +82,17 @@ def _write_csv(ts: TraceSet, dest: str) -> None:
     with open(dest, "w", newline="") as f:
         f.write(",".join(lead_names + ts.selected) + "\n")
         for i, params in enumerate(ts.sweep_values):
-            arrays = [ts.data[n][i].astype(np.float64) for n in ts.selected]
-            n = arrays[0].size
-            if n == 0:
-                continue
-            lead = []
-            if with_lead:
-                lead = [np.full(n, i, dtype=np.float64)] + [np.full(n, v, dtype=np.float64) for v in params]
-            np.savetxt(f, np.column_stack(lead + arrays), delimiter=",", fmt="%.17g")
+            n = ts.data[ts.selected[0]][i].size
+            sweep_id = ts.sweep_indices[i]
+            for start in range(0, n, CSV_ROWS_PER_SLICE):
+                stop = min(start + CSV_ROWS_PER_SLICE, n)
+                rows = stop - start
+                lead = []
+                if with_lead:
+                    lead = ([np.full(rows, sweep_id, dtype=np.float64)]
+                            + [np.full(rows, v, dtype=np.float64) for v in params])
+                cols = [ts.data[name][i][start:stop].astype(np.float64) for name in ts.selected]
+                np.savetxt(f, np.column_stack(lead + cols), delimiter=",", fmt="%.17g")
 
 
 def _write_npz(ts: TraceSet, dest: str) -> None:
@@ -93,7 +100,7 @@ def _write_npz(ts: TraceSet, dest: str) -> None:
     arrays = {}
     for name in ts.selected:
         for i, arr in enumerate(ts.data[name]):
-            arrays[name if single else f"{name}@{i}"] = arr
+            arrays[name if single else f"{name}@{ts.sweep_indices[i]}"] = arr
     arrays["__sweep_values__"] = np.asarray(ts.sweep_values, dtype=np.float64).reshape(
         len(ts.sweep_values), ts.header.nsweepparam)
     arrays["__sweep_params__"] = np.asarray(ts.header.sweep_params, dtype=str)
@@ -118,6 +125,8 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
     """Read selected traces and return them as arrays, a summary dict, or a written file path."""
     if output not in OUTPUTS:
         raise ValueError(f"output must be one of {OUTPUTS}, not {output!r}")
+    if downsample is not None and downsample < 2:
+        raise ValueError("downsample must be at least 2")
     ts = read_traces(path, names, sweeps)
     if output == "summary":
         return summarize(ts, downsample)

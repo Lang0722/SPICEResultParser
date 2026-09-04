@@ -51,6 +51,26 @@ def _analysis_from_extension(path: str) -> Optional[str]:
     return ext if ext in ("tr", "sw", "ac") else None
 
 
+def _uniquify(path: str, names: List[str]) -> List[str]:
+    """Make sanitized names 1:1 with columns: repeats get a '#<column_index>' suffix."""
+    seen = set()
+    out: List[str] = []
+    duplicates: List[str] = []
+    for i, name in enumerate(names):
+        if name in seen:
+            duplicates.append(name)
+            name = f"{name}#{i}"
+        seen.add(name)
+        out.append(name)
+    if duplicates:
+        warnings.warn(
+            f"{path}: duplicate sanitized trace names disambiguated with '#<column>': "
+            f"{', '.join(sorted(set(duplicates)))}",
+            RuntimeWarning,
+        )
+    return out
+
+
 def _build_header(path: str, is_bin: bool, version: str, nauto: int, nprobe: int,
                   nsweepparam: int, sweep_count: int, tokens: Sequence[str]) -> Header:
     nvars = nauto + nprobe
@@ -79,6 +99,7 @@ def _build_header(path: str, is_bin: bool, version: str, nauto: int, nprobe: int
     else:
         names = [parse_var_name(r) for r in raw_names]
         col_raw = list(raw_names)
+    names = _uniquify(path, names)
     return Header(
         path=path, is_binary=is_bin, version=version, analysis=analysis, ncols=len(names),
         nsweepparam=nsweepparam, sweep_count_hint=sweep_count, x_name=x_name, names=names,
@@ -87,8 +108,24 @@ def _build_header(path: str, is_bin: bool, version: str, nauto: int, nprobe: int
     )
 
 
-def _read_block(f, index: int) -> Optional[bytes]:
-    """Read one framed block (16-byte head, payload, 4-byte tail). None at EOF."""
+def _short_block(index: int, payload: bytes, itemsize: int) -> bytes:
+    """A block cut short by EOF: warn and keep whole values only."""
+    kept = len(payload) - len(payload) % itemsize
+    warnings.warn(
+        f"block {index}: file ends mid-block; keeping {kept} of {len(payload)} payload bytes",
+        RuntimeWarning,
+    )
+    return payload[:kept]
+
+
+def _read_block(f, index: int, itemsize: int = 1) -> Optional[bytes]:
+    """Read one framed block (16-byte head, payload, 4-byte tail). None at EOF.
+
+    A block the file ends inside of (short payload, or a tail of fewer than 4
+    bytes) is returned truncated to a whole number of values, with a warning:
+    that is what a file still being written by the simulator looks like. A tail
+    that is present but disagrees with the head is corruption and raises.
+    """
     head = f.read(16)
     if not head:
         return None
@@ -98,16 +135,18 @@ def _read_block(f, index: int) -> Optional[bytes]:
     if size < 0:
         raise ValueError(f"block {index}: negative block size {size}")
     payload = f.read(size)
-    if len(payload) != size:
-        raise ValueError(f"block {index}: head promises {size} bytes, file has {len(payload)}")
+    if len(payload) < size:
+        return _short_block(index, payload, itemsize)
     tail = f.read(4)
-    if len(tail) != 4 or struct.unpack("<i", tail)[0] != size:
+    if len(tail) < 4:
+        return _short_block(index, payload, itemsize)
+    if struct.unpack("<i", tail)[0] != size:
         raise ValueError(f"block {index}: tail length does not match head length {size}")
     return payload
 
 
 def _read_binary_header(f, path: str) -> Header:
-    payload = _read_block(f, 0)
+    payload = _read_block(f, 0, 1)
     if payload is None:
         raise ValueError(f"{path}: empty file")
     text = payload.decode("utf-8", errors="replace")
@@ -146,7 +185,7 @@ def _read_ascii_header(f, path: str) -> Header:
     return _build_header(path, False, "ascii", nauto, nprobe, nsweepparam, sweep_count, tokens)
 
 
-def _iter_ascii_values(f) -> Iterator[np.ndarray]:
+def _iter_ascii_values(f, path: str) -> Iterator[np.ndarray]:
     """One float64 array per non-empty data line. Field width follows the old module's rule."""
     width = None
     for line in f:
@@ -154,7 +193,10 @@ def _iter_ascii_values(f) -> Iterator[np.ndarray]:
         if not line:
             continue
         if width is None:
-            width = line.find("E") + 4
+            exponent = line.find("E")
+            if exponent < 0:
+                raise ValueError(f"{path}: cannot determine ASCII field width from first data line")
+            width = exponent + 4
         yield np.array([float(line[i:i + width]) for i in range(0, len(line), width)], dtype=np.float64)
 
 
@@ -164,7 +206,7 @@ def read_header(path) -> Header:
     if is_binary(path):
         with open(path, "rb") as f:
             return _read_binary_header(f, path)
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
         return _read_ascii_header(f, path)
 
 
@@ -173,6 +215,7 @@ class TraceSet:
     header: Header
     selected: List[str]                 # names in column order, x always first
     sweep_values: List[List[float]]     # per kept sweep: nsweepparam values
+    sweep_indices: List[int]            # original sweep index of each kept sweep
     data: dict                          # name -> list of arrays, one per kept sweep
     truncated: bool                     # file ended without a final sentinel
 
@@ -197,7 +240,10 @@ def resolve_columns(header: Header, names) -> List[int]:
         if not hits:
             hits = [i for i, n in enumerate(header.names) if fnmatch.fnmatchcase(n, req)]
         if not hits:
-            raise ValueError(f"unknown trace {req!r}; available traces: {', '.join(header.names)}")
+            shown = ", ".join(header.names[:20])
+            if len(header.names) > 20:
+                shown += f", ... and {len(header.names) - 20} more"
+            raise ValueError(f"unknown trace {req!r}; available traces: {shown}")
         chosen.update(hits)
     return sorted(chosen)
 
@@ -214,6 +260,7 @@ class _Collector:
         self.params: List[float] = []
         self.chunks = {c: [] for c in self.cols}
         self.sweep_values: List[List[float]] = []
+        self.sweep_indices: List[int] = []
         self.data = {c: [] for c in self.cols}
 
     def _keep(self) -> bool:
@@ -255,6 +302,7 @@ class _Collector:
                 # copy when trimming: a view would pin the whole concatenated array
                 self.data[c].append(arr[:n].copy() if n < arr.size else arr)
             self.sweep_values.append(list(self.params))
+            self.sweep_indices.append(self.sweep_idx)
         self.pos = 0
         self.params = []
         self.sweep_idx += 1
@@ -273,7 +321,7 @@ class _Collector:
 def _iter_binary_blocks(f, header: Header) -> Iterator[np.ndarray]:
     index = 1
     while True:
-        payload = _read_block(f, index)
+        payload = _read_block(f, index, header.dtype.itemsize)
         if payload is None:
             return
         if len(payload) % header.dtype.itemsize:
@@ -297,17 +345,18 @@ def read_traces(path, names=None, sweeps=None) -> TraceSet:
             for block in _iter_binary_blocks(f, header):
                 collector.feed(block)
     else:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
             header = _read_ascii_header(f, path)
             cols = resolve_columns(header, names)
             collector = _Collector(header, cols, sweeps)
-            for values in _iter_ascii_values(f):
+            for values in _iter_ascii_values(f, path):
                 collector.feed(values)
     truncated = collector.finish()
     return TraceSet(
         header=header,
         selected=[header.names[c] for c in cols],
         sweep_values=collector.sweep_values,
+        sweep_indices=collector.sweep_indices,
         data={header.names[c]: collector.data[c] for c in cols},
         truncated=truncated,
     )

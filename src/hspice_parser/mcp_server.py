@@ -46,6 +46,8 @@ def extract(path: str, names: Optional[List[str]] = None, sweeps: Optional[List[
     """
     if output == "arrays":
         raise ValueError("output='arrays' is not available over MCP; use 'summary', 'csv' or 'npz'")
+    if output not in ("summary", "csv", "npz"):
+        raise ValueError(f"output must be one of ('summary', 'csv', 'npz'), not {output!r}")
     if output == "summary":
         return api.extract(path, names, sweeps, "summary", 200 if downsample is None else downsample)
     ts = api.extract(path, names, sweeps, "arrays", downsample)
@@ -53,6 +55,7 @@ def extract(path: str, names: Optional[List[str]] = None, sweeps: Optional[List[
     x = ts.header.x_name
     return {
         "output": output, "path": written, "traces": ts.selected, "sweeps": len(ts.sweep_values),
+        "sweep_indices": list(ts.sweep_indices),
         "points": [int(ts.data[x][i].size) for i in range(len(ts.sweep_values))],
         "truncated": ts.truncated,
     }

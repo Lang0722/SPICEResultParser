@@ -270,12 +270,37 @@ class TestBinaryRead(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "block 1: tail length"):
             read_traces(path)
 
-    def test_short_payload_raises(self):
-        path, _ = make_multi(self.dir, "9601")
+    def test_short_final_block_truncates_gracefully(self):
+        path, sweeps = make_multi(self.dir, "9601")
         b = path.read_bytes()
-        path.write_bytes(b[:-10])
-        with self.assertRaisesRegex(ValueError, "head promises"):
-            read_traces(path)
+        path.write_bytes(b[:-10])                       # kills the last tail and part of its payload
+        with self.assertWarns(RuntimeWarning):
+            ts = read_traces(path)
+        self.assertTrue(ts.truncated)
+        self.assertEqual(len(ts.sweep_values), 3)
+        for col, name in enumerate(ts.selected):
+            for i in (0, 1):
+                np.testing.assert_array_equal(ts.data[name][i], sweeps[i][1][:, col].astype(np.dtype("<f4")))
+
+    def test_truncated_mid_block_keeps_prefix(self):
+        path, sweeps = make_multi(self.dir, "9601")
+        b = path.read_bytes()
+        cut = 12000
+        n0 = struct.unpack("<i", b[12:16])[0]
+        payload2 = 20 + n0 + (16 + 8192 + 4) + 16       # first byte of block 2's payload
+        self.assertLess(payload2, cut)
+        self.assertLess(cut, payload2 + 8192)           # the cut lands inside block 2
+        path.write_bytes(b[:cut])
+        with self.assertWarns(RuntimeWarning):
+            ts = read_traces(path)
+        self.assertTrue(ts.truncated)
+        self.assertEqual(len(ts.sweep_values), 1)
+        values = (8192 + (cut - payload2)) // 4         # whole float32 values kept
+        npoints = (values - 1) // 7                     # one sweep-parameter value precedes the points
+        for col, name in enumerate(ts.selected):
+            self.assertEqual(ts.data[name][0].size, npoints)
+            np.testing.assert_array_equal(ts.data[name][0],
+                                          sweeps[0][1][:npoints, col].astype(np.dtype("<f4")))
 
     def test_negative_block_size_raises(self):
         path, _ = make_multi(self.dir, "9601")
@@ -286,6 +311,43 @@ class TestBinaryRead(unittest.TestCase):
         path.write_bytes(bytes(b))
         with self.assertRaisesRegex(ValueError, "block 1: negative block size"):
             read_traces(path)
+
+
+class TestDuplicateNames(unittest.TestCase):
+    """`.` and `:` both sanitize to `_`, so distinct HSPICE names can collide."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        rng = np.random.default_rng(11)
+        self.data = rng.random((50, 4))
+        self.path = self.dir / "dup.tr0"
+        fixtures.write_binary(self.path, "2001", ["TIME", "v(a.b", "v(a:b", "v(c"],
+                              [1, 1, 1, 1], [([], self.data)])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_names_stay_one_to_one_with_columns(self):
+        with self.assertWarns(RuntimeWarning):
+            info = api.list_traces(self.path)
+        self.assertEqual(info["traces"], ["v_a_b", "v_a_b#2", "v_c"])
+        with self.assertWarns(RuntimeWarning):
+            ts = read_traces(self.path)
+        self.assertEqual(ts.selected, ["TIME", "v_a_b", "v_a_b#2", "v_c"])
+        self.assertEqual(len(ts.data), 4)
+        for col, name in enumerate(ts.selected):
+            np.testing.assert_array_equal(ts.data[name][0], self.data[:, col])
+
+    def test_csv_header_and_downsample(self):
+        dest = self.dir / "dup.csv"
+        with self.assertWarns(RuntimeWarning):
+            api.extract(self.path, output="csv", dest=dest)
+        self.assertEqual(dest.read_text().splitlines()[0], "TIME,v_a_b,v_a_b#2,v_c")
+        with self.assertWarns(RuntimeWarning):
+            ts = api.extract(self.path, downsample=5)        # used to raise IndexError
+        for name in ts.selected:
+            self.assertEqual(ts.data[name][0].size, 5)
 
 
 class TestSelection(unittest.TestCase):
@@ -327,10 +389,12 @@ class TestSelection(unittest.TestCase):
     def test_sweeps_filter(self):
         ts = read_traces(self.path, ["v_a"], sweeps=[1])
         self.assertEqual(ts.sweep_values, [[2000.0]])
+        self.assertEqual(ts.sweep_indices, [1])
         self.assertEqual(len(ts.data["v_a"]), 1)
         np.testing.assert_array_equal(ts.data["v_a"][0], self.sweeps[1][1][:, 1])
         ts = read_traces(self.path, ["v_a"], sweeps=[0, 2])
         self.assertEqual(ts.sweep_values, [[1000.0], [3000.0]])
+        self.assertEqual(ts.sweep_indices, [0, 2])
         np.testing.assert_array_equal(ts.data["TIME"][1], self.sweeps[2][1][:, 0])
 
     def test_ac_raw_name_selects_mag_and_phase(self):
@@ -412,6 +476,13 @@ class TestAsciiRead(unittest.TestCase):
         self.assertEqual(ts.selected, ["TIME", "v_b"])
         self.assertEqual(ts.sweep_values, [[2000.0]])
         self.assertEqual(ts.data["v_b"][0].size, 5)
+
+    def test_first_data_line_without_exponent_raises(self):
+        lines = self.path.read_text().splitlines()
+        lines[4] = "0.1000000+00 0.2000000+00"          # no 'E': field width undeterminable
+        self.path.write_text("\n".join(lines) + "\n")
+        with self.assertRaisesRegex(ValueError, "cannot determine ASCII field width"):
+            read_traces(self.path)
 
     def test_truncated_ascii(self):
         lines = self.path.read_text().splitlines()
@@ -501,6 +572,13 @@ class TestApi(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "output must be one of"):
             api.extract(self.path, output="xlsx")
 
+    def test_bad_downsample_rejected_before_reading(self):
+        # a path that cannot be opened: the ValueError proves nothing was read first
+        with self.assertRaisesRegex(ValueError, "downsample must be at least 2"):
+            api.extract(self.dir / "missing.tr0", ["v_a"], downsample=1)
+        with self.assertRaisesRegex(ValueError, "downsample must be at least 2"):
+            api.extract(self.path, ["v_a"], downsample=1)
+
 
 class TestFileOutputs(unittest.TestCase):
     def setUp(self):
@@ -570,6 +648,42 @@ class TestFileOutputs(unittest.TestCase):
             np.testing.assert_array_equal(z["__sweep_values__"], [[1000.0], [2000.0], [3000.0]])
             self.assertEqual(list(z["__sweep_params__"]), ["r1"])
 
+    def test_csv_sweep_column_uses_original_index(self):
+        dest = self.dir / "sweep2.csv"
+        api.extract(self.path, ["v_a"], sweeps=[2], output="csv", dest=dest)
+        table = np.loadtxt(dest, delimiter=",", skiprows=1)
+        self.assertEqual(dest.read_text().splitlines()[0], "sweep,r1,TIME,v_a")
+        np.testing.assert_array_equal(table[:, 0], 2)
+        np.testing.assert_array_equal(table[:, 1], 3000.0)
+        np.testing.assert_array_equal(table[:, 3], self.sweeps[2][1][:, 1])
+
+    def test_npz_keys_use_original_sweep_indices(self):
+        dest = self.dir / "sub.npz"
+        api.extract(self.path, ["v_a"], sweeps=[1, 2], output="npz", dest=dest)
+        with np.load(dest) as z:
+            self.assertIn("v_a@1", z.files)
+            self.assertIn("v_a@2", z.files)
+            self.assertNotIn("v_a@0", z.files)
+            np.testing.assert_array_equal(z["v_a@2"], self.sweeps[2][1][:, 1])
+
+    def test_csv_writer_memory_stays_bounded(self):
+        rng = np.random.default_rng(8)
+        npoints, ncols = 200_000, 5
+        data = rng.random((npoints, ncols), dtype=np.float32)
+        path = self.dir / "wide.tr0"
+        fixtures.write_binary(path, "9601", ["TIME"] + [f"v({i}" for i in range(ncols - 1)],
+                              [1] * ncols, [([], data)])
+        del data
+        dest = self.dir / "wide.csv"
+        tracemalloc.start()
+        tracemalloc.reset_peak()
+        api.extract(path, ["v(2"], output="csv", dest=dest)
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        selected_bytes_as_float64 = 2 * npoints * 8            # TIME + v_2 widened
+        self.assertLess(peak, 2 * selected_bytes_as_float64 + 4_000_000, f"peak {peak} bytes")
+        self.assertEqual(len(dest.read_text().splitlines()), 1 + npoints)
+
     def test_write_file_rejects_other_outputs(self):
         ts = read_traces(self.path, ["v_a"])
         with self.assertRaises(ValueError):
@@ -624,6 +738,10 @@ class TestMcp(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not available over MCP"):
             self.m.extract(str(HERE / "test_9601.tr0"), output="arrays")
 
+    def test_bad_output_rejected_before_reading(self):
+        with self.assertRaisesRegex(ValueError, "summary"):
+            self.m.extract(str(HERE / "test_9601.tr0"), output="xlsx")
+
     def test_summary_is_json(self):
         out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], downsample=20)
         json.dumps(out)
@@ -636,6 +754,7 @@ class TestMcp(unittest.TestCase):
         self.assertEqual(out["traces"], ["TIME", "v_vo"])
         self.assertEqual(out["sweeps"], 1)
         self.assertEqual(out["points"], [2605])
+        self.assertEqual(out["sweep_indices"], [0])
         self.assertFalse(out["truncated"])
         self.assertTrue(dest.exists())
         json.dumps(out)
