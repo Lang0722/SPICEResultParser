@@ -17,7 +17,7 @@ sys.path.insert(0, str(HERE))
 
 import fixtures  # noqa: E402
 
-from hspice_parser.reader import read_header  # noqa: E402
+from hspice_parser.reader import read_header, read_traces  # noqa: E402
 
 
 class TestHeader(unittest.TestCase):
@@ -158,6 +158,123 @@ class TestFixtures(unittest.TestCase):
         np.testing.assert_allclose(old["v_a"][0], sweeps[0][1][:, 1], rtol=1e-6)
         self.assertEqual(len(old["i_c"][1]), 5)
 
+
+MULTI_NAMES = ["TIME", "v(a", "v(b", "v(c", "v(d", "i(e", "i(f", "r1"]   # 7 data columns + 1 sweep param
+MULTI_CODES = [1, 1, 1, 1, 1, 8, 8]
+
+
+def make_multi(directory, version, **kw):
+    """Three-sweep transient fixture with 7 columns so points straddle 8192-byte blocks."""
+    rng = np.random.default_rng(3)
+    sweeps = [([1000.0], rng.random((1500, 7))),
+              ([2000.0], rng.random((977, 7))),
+              ([3000.0], rng.random((2310, 7)))]
+    path = Path(directory) / f"multi_{version}.tr0"
+    fixtures.write_binary(path, version, MULTI_NAMES, MULTI_CODES, sweeps, **kw)
+    return path, sweeps
+
+
+class TestBinaryRead(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def assert_matches_old(self, ts, old):
+        self.assertEqual(sorted(ts.data), sorted(old))
+        self.assertEqual(ts.selected, list(old))
+        for key in old:
+            self.assertEqual(len(ts.data[key]), len(old[key]))
+            for new_arr, old_lst in zip(ts.data[key], old[key]):
+                np.testing.assert_array_equal(new_arr.astype(np.float64), np.asarray(old_lst, dtype=np.float64))
+
+    def test_tr_9601_matches_old(self):
+        with open(HERE / "data_dict_9601.pickle", "rb") as f:
+            old = pickle.load(f)
+        ts = read_traces(HERE / "test_9601.tr0")
+        self.assert_matches_old(ts, old)
+        self.assertEqual(ts.sweep_values, [[]])
+        self.assertFalse(ts.truncated)
+        self.assertEqual(ts.data["TIME"][0].dtype, np.dtype("<f4"))
+
+    def test_tr_2001_matches_old(self):
+        with open(HERE / "data_dict_tr_2001.pickle", "rb") as f:
+            old = pickle.load(f)
+        ts = read_traces(HERE / "test_2001.tr0")
+        self.assert_matches_old(ts, old)
+        self.assertEqual(ts.data["TIME"][0].dtype, np.dtype("<f8"))
+
+    def test_sw_9601_matches_old(self):
+        with open(HERE / "data_dict_sw_9601.pickle", "rb") as f:
+            old = pickle.load(f)
+        ts = read_traces(HERE / "test_9601.sw0")
+        self.assert_matches_old(ts, old)
+
+    def test_ac_9601_matches_old_ac_path(self):
+        # data_dict_ac_9601.pickle was produced through the "tr" path and is wrong; use the live ac path.
+        from hspice_parser.hspiceParser import read_binary_signal_file, write_to_dict
+
+        header_str, blocks = read_binary_signal_file(str(HERE / "test_9601.ac0"))
+        old, _, _, _ = write_to_dict(blocks, header_str, "ac")
+        ts = read_traces(HERE / "test_9601.ac0")
+        self.assert_matches_old(ts, old)
+        self.assertEqual(ts.selected[:3], ["HERTZ", "v_0_Mag", "v_0_Phase"])
+        self.assertEqual(ts.data["HERTZ"][0].size, 41)
+
+    def _check_multi(self, version):
+        path, sweeps = make_multi(self.dir, version)
+        dtype = np.dtype("<f4") if version == "9601" else np.dtype("<f8")
+        ts = read_traces(path)
+        self.assertEqual(ts.header.nsweepparam, 1)
+        self.assertEqual(ts.header.sweep_params, ["r1"])
+        self.assertEqual(ts.header.sweep_count_hint, 3)
+        self.assertEqual(ts.sweep_values, [[1000.0], [2000.0], [3000.0]])
+        self.assertEqual(ts.selected, ["TIME", "v_a", "v_b", "v_c", "v_d", "i_e", "i_f"])
+        self.assertFalse(ts.truncated)
+        for col, name in enumerate(ts.selected):
+            self.assertEqual(len(ts.data[name]), 3)
+            for i, (_, data) in enumerate(sweeps):
+                np.testing.assert_array_equal(ts.data[name][i], data[:, col].astype(dtype))
+
+    def test_multi_sweep_9601(self):
+        self._check_multi("9601")
+
+    def test_multi_sweep_2001(self):
+        self._check_multi("2001")
+
+    def test_truncated_file_keeps_complete_points(self):
+        path, sweeps = make_multi(self.dir, "2001", final_sentinel=False, drop_tail=3)
+        with self.assertWarns(RuntimeWarning):
+            ts = read_traces(path)
+        self.assertTrue(ts.truncated)
+        self.assertEqual(len(ts.sweep_values), 3)
+        self.assertEqual(ts.sweep_values[2], [3000.0])
+        last = sweeps[2][1]
+        for col, name in enumerate(ts.selected):
+            self.assertEqual(ts.data[name][2].size, 2309)
+            np.testing.assert_array_equal(ts.data[name][2], last[:2309, col])
+        np.testing.assert_array_equal(ts.data["v_a"][1], sweeps[1][1][:, 1])
+
+    def test_corrupt_tail_raises(self):
+        path, _ = make_multi(self.dir, "9601")
+        b = bytearray(path.read_bytes())
+        n0 = struct.unpack("<i", b[12:16])[0]
+        off1 = 20 + n0
+        size1 = struct.unpack("<i", b[off1 + 12:off1 + 16])[0]
+        tail = off1 + 16 + size1
+        b[tail:tail + 4] = struct.pack("<i", size1 + 4)
+        path.write_bytes(bytes(b))
+        with self.assertRaisesRegex(ValueError, "block 1: tail length"):
+            read_traces(path)
+
+    def test_short_payload_raises(self):
+        path, _ = make_multi(self.dir, "9601")
+        b = path.read_bytes()
+        path.write_bytes(b[:-10])
+        with self.assertRaisesRegex(ValueError, "head promises"):
+            read_traces(path)
 
 if __name__ == "__main__":
     unittest.main()
