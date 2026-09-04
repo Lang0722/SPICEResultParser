@@ -24,10 +24,13 @@ Targets: one trace under 60 MB and about 0.3 s; all traces about 1.0x the
 selected data (~500 MB) and under 1 s. `hspiceParser.py` stays untouched.
 
 Outcome: both time targets are met with room to spare and all-traces RSS is
-close to the ~500 MB of selected data, but one trace peaks at 95 MB rather than
-under 60 MB -- the capacity derived from the file preallocates about 25 MB per
-selected column (here TIME plus the one trace) on top of the ~29 MB Python +
-numpy baseline and the two slab buffers.
+close to the ~500 MB of selected data. One trace peaks at 95 MB rather than
+under 60 MB, but that target was not reachable for this file: the preallocated
+buffers carry essentially no slack (capacity/fill = 1.000 on the 490 MB file),
+and "one trace" always keeps TIME as well, so the selected data alone is two
+float64 columns of 3.2 M points = 51 MB on top of the 27-29 MB that Python +
+numpy cost before any file is opened -- a floor of about 78 MB. The bulk path
+adds only its read buffer and slab (about 4 MB).
 
 ## Non-goals
 
@@ -42,9 +45,11 @@ numpy baseline and the two slab buffers.
 
 `_Collector` allocates `np.empty(capacity, dtype)` per selected column once,
 and writes kept points into it sequentially across all kept sweeps. A finished
-sweep is exposed as a view `buf[c][sweep_start:fill]`; no concatenation. Pages
-of `np.empty` are only touched when written, so an over-estimated capacity
-costs virtual address space, not RSS, and unselected sweeps never touch pages.
+sweep is recorded as a `(start, stop)` span and materialised in `finish()`, as
+a view `buf[c][start:stop]` when the buffer ended up nearly full and otherwise
+as a copy that releases the buffer; no concatenation. Pages of `np.empty` are
+only touched when written, so an over-estimated capacity costs virtual address
+space, not RSS, and unselected sweeps never touch pages.
 
 Capacity is an upper bound derived from the file size:
 
@@ -55,8 +60,9 @@ Capacity is an upper bound derived from the file size:
   over-estimate).
 
 If the estimate is ever too small, buffers grow to `max(needed, 2 * capacity)`
-with a copy; views already handed out for finished sweeps stay valid because
-they reference the old array.
+with a copy; nothing references the old array -- finished sweeps are spans, not
+views -- so it is freed, and the grown buffer's unused tail makes `finish()`
+copy the kept sweeps out.
 
 ### 2. Point alignment via a carry, not a running modulo
 
@@ -75,16 +81,23 @@ with a 16-byte head and 4-byte tail, so frame `k` begins at
 `header_frame_bytes + k * (block_payload + 20)`.
 
 `read_traces` reads the first data block's head to learn `block_payload`, then,
-when `block_payload > 0` and a multiple of the itemsize, enters the bulk path:
+when `block_payload > 0`, a multiple of the itemsize, and its frame
+(`block_payload + 20`) fits in `_MAX_CHUNK_BYTES`, enters the bulk path. A file
+whose single frame exceeds `_MAX_CHUNK_BYTES` (4 MB) skips the bulk path
+entirely and takes the per-block path, which allocates one payload at a time.
+The bulk path is:
 
-1. `readinto` a reusable `bytearray` of `FRAMES_PER_CHUNK * frame_size` bytes
-   (`FRAMES_PER_CHUNK = 256`, about 2.1 MB for 8 KB blocks).
+1. `readinto` a reusable `bytearray` of `nframes * frame_size` bytes, where
+   `nframes = max(1, min(FRAMES_PER_CHUNK, _MAX_CHUNK_BYTES // frame_size,
+   ceil(remaining_bytes / frame_size)))` (`FRAMES_PER_CHUNK = 256`,
+   `_MAX_CHUNK_BYTES = 4 << 20`; about 2.1 MB for 8 KB blocks).
 2. View it as `uint8 (nframes, frame_size)`; extract head sizes and tail sizes
    as int32 vectors; find the first frame whose head or tail differs from
    `block_payload`.
 3. Frames before that point are valid full frames: make the payload slab
-   contiguous once (`np.ascontiguousarray(u8[:stop, 16:16+B])`), view it as the
-   native dtype, and feed the flat values to the collector.
+   contiguous once (`u8[:stop, 16:16+B].copy()`, so the collector never holds a
+   view into the reusable buffer), view it as the native dtype, and feed the
+   flat values to the collector.
 4. At the first non-matching frame, or when the read returned fewer bytes than
    requested, seek back to the first unprocessed byte and hand the rest of the
    file to the existing per-block reader (`_iter_binary_blocks`), which keeps
@@ -96,9 +109,9 @@ So the last (short) block of every file, and any file with non-uniform blocks,
 goes through the per-block path; everything else goes through numpy in 2 MB
 slabs. Block indices in error messages are preserved across the hand-off.
 
-Memory in the bulk path: the 2.1 MB read buffer plus one 2.1 MB contiguous
-copy, plus the selected columns. The per-block fallback allocates one block at
-a time as before.
+Memory in the bulk path: the read buffer (2.1 MB for 8 KB blocks, at most
+4 MB) plus one contiguous copy of the same size, plus the selected columns. The
+per-block fallback allocates one block at a time as before.
 
 ### 4. Unchanged
 
@@ -123,8 +136,8 @@ New tests:
   (sentinels and sweep prefixes straddling chunk boundaries) equals the fixture
   arrays, and `sweep_indices` are correct under a `sweeps` filter;
 - mixed block sizes: a fixture whose blocks cycle through several payload sizes
-  (fixtures gain an optional `block_sizes` sequence) equals the fixture arrays,
-  proving the fallback hand-off mid-file;
+  (fixtures gain `block_bytes` accepting an int or a sequence of sizes cycled
+  through) equals the fixture arrays, proving the fallback hand-off mid-file;
 - the existing corruption, negative-size, mid-block-cut and short-tail tests
   continue to name the right block index.
 

@@ -156,11 +156,21 @@ Algorithm (binary):
 2. Keep two integers of state: `pos` (values consumed in the current sweep,
    after the sweep-parameter prefix) and `sweep_idx`. Keep a small
    `pending_params` list for the sweep-parameter prefix.
-3. For each data block: read head, `np.frombuffer(payload, dtype)`, read tail,
-   raise `ValueError` if the tail is present but disagrees with the head; a
-   payload or tail cut short by EOF is handled as truncation, see below.
-4. Find sentinel positions in the block with `np.flatnonzero(block == sentinel)`.
-   Split the block into segments between sentinels.
+3. Read the data blocks. When the first data block's declared payload size is
+   positive, a multiple of the itemsize, and its frame fits in `_MAX_CHUNK_BYTES`
+   (4 MB), blocks are read in bulk: up to
+   `FRAMES_PER_CHUNK` (256) frames per `readinto`, capped at `_MAX_CHUNK_BYTES`
+   (4 MB) and at the bytes remaining in the file; every head and tail int32 is
+   checked against that size vectorially and the payloads of the matching
+   frames are fed to the collector as one flat slab. At the first frame that
+   does not match (the short last block, an odd-sized block, corruption, a
+   truncated file) the reader seeks back and falls back to per-block reads:
+   read head, `np.frombuffer(payload, dtype)`, read tail, raise `ValueError`
+   if the tail is present but disagrees with the head; a payload or tail cut
+   short by EOF is handled as truncation, see below. All error and truncation
+   semantics live in the per-block reader.
+4. Find sentinel positions in each fed array (a slab or a single block) with
+   `np.flatnonzero(arr == sentinel)`. Split it into segments between sentinels.
 5. For each segment: first consume up to `nsweepparam` values into
    `pending_params` if the sweep prefix is not complete. The rest is a run of
    whole points once a `carry` holding the values of an incomplete trailing
@@ -169,8 +179,9 @@ Algorithm (binary):
    selected column `c` is gathered from `rows[:, c]` straight into that
    column's preallocated buffer. What is left over becomes the new `carry`.
    Advance `pos` by the segment length.
-6. On a sentinel: if the current sweep is selected, store each column's slice
-   of its buffer (`buf[c][sweep_start:fill]`, a view) as that sweep's array;
+6. On a sentinel: if the current sweep is selected, record the span
+   `(sweep_start, fill)` in the column buffers as that sweep's extent (`finish()`
+   turns each span into an array);
    record `pending_params` as `sweep_values[sweep_idx]`; drop an incomplete
    `carry`; reset `pos`, `pending_params`; `sweep_idx += 1`.
 7. On EOF with `pos > 0` or a non-empty prefix: finalize the partial sweep,
@@ -187,11 +198,13 @@ the head, and a negative block size, are still hard `ValueError`s.
 
 Memory: one preallocated buffer per selected column, sized from the file size
 (an upper bound; `np.empty` pages are touched only when written), plus one
-2 MB read buffer and one 2 MB contiguous slab in the bulk path. Sweeps are views
-into the column buffers; nothing is concatenated. A read that leaves most of the
-capacity unused -- a selective `sweeps=`, or ASCII's coarser bytes-per-value
-estimate -- copies the kept sweeps out at the end and releases the buffers. See
-`2026-09-04-bulk-frame-reader-design.md` for the slab parser and fallback.
+2 MB read buffer and one 2 MB contiguous slab in the bulk path. Sweeps are
+recorded as spans and materialised in `finish()`; nothing is concatenated. They
+are views into the column buffers when the buffers ended up nearly full; a read
+that left a noticeable share of the capacity unused -- a selective `sweeps=`, or
+a buffer that had to grow -- copies the kept sweeps out instead and releases
+the buffers. See `2026-09-04-bulk-frame-reader-design.md` for the slab parser
+and fallback.
 
 Algorithm (ASCII): same state machine over a stream of floats produced by a
 line iterator that parses fixed-width fields. Lines are read one at a time;
@@ -304,8 +317,10 @@ files.
    larger than the trace keeps every point.
 8. **Memory**: build a 9601 file with 20 columns and about 40 MB of data;
    under `tracemalloc`, `read_traces(names=[one column])` peak allocation
-   must be below `3 * selected_bytes + 1 MB`. numpy reports allocations to
-   tracemalloc, so this is a real bound on array memory.
+   must be below `selected_bytes + 3 * chunk_bytes + 1 MB`, where
+   `chunk_bytes = FRAMES_PER_CHUNK * (8192 + 20)` is one bulk read buffer.
+   numpy reports allocations to tracemalloc, so this is a real bound on array
+   memory.
 9. **MCP**: skipped when `mcp` is not importable. Otherwise instantiate the
    server, call the tool functions directly on the fixture files, assert
    `output="arrays"` raises and `"summary"` returns JSON-serialisable data.

@@ -10,7 +10,7 @@ import os
 import struct
 import warnings
 from dataclasses import dataclass
-from typing import Iterable, Iterator, List, Optional, Sequence
+from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -23,7 +23,7 @@ _FRAME_OVERHEAD = 20            # 16-byte block head + 4-byte block tail
 _ASCII_BYTES_PER_VALUE = 13     # one HSPICE ASCII field; used only to bound the preallocation
 
 FRAMES_PER_CHUNK = 256          # frames per bulk read: 256 * (8192 + 20) bytes ≈ 2.1 MB for HSPICE's 8 KB blocks
-_MAX_CHUNK_BYTES = 4 << 20      # cap on one bulk read buffer, whatever the declared block size
+_MAX_CHUNK_BYTES = 4 << 20      # cap on one bulk read buffer; blocks whose frame exceeds it take the per-block path
 
 
 @dataclass
@@ -254,7 +254,8 @@ def resolve_columns(header: Header, names) -> List[int]:
 
 
 def _binary_capacity(file_size: int, data_start: int, block_payload: int, ncols: int, itemsize: int) -> int:
-    """Upper bound on data points in a binary file: bytes after the header minus per-frame overhead, as values."""
+    """Estimated data points in a binary file (an upper bound when all full frames carry the peeked payload size):
+    bytes after the header minus per-frame overhead, as values."""
     remaining = max(0, file_size - data_start)
     frame = max(1, block_payload) + _FRAME_OVERHEAD
     nframes = -(-remaining // frame)
@@ -282,11 +283,11 @@ class _Collector:
     """State machine over the flat value stream: sweep-parameter prefix, points, sentinel.
 
     Kept points are written into one preallocated buffer per selected column, so
-    nothing is concatenated; finished sweeps are views into those buffers, unless most
-    of the capacity went unused (a selective `sweeps=`, or an over-estimate such as
-    ASCII's bytes-per-value bound), in which case `finish()` copies the kept sweeps out
-    and releases the buffers. `capacity` is an upper bound on kept points (the caller
-    derives it from the file size); if it proves too small the buffers grow with a copy.
+    nothing is concatenated; `capacity` is the caller's estimate of the kept points
+    from the file size, and if it proves too small the buffers grow with a copy.
+    Finished sweeps are recorded as `(start, stop)` spans and turned into arrays in
+    `finish()`: views into the buffer when it is nearly full, otherwise copies (a
+    selective `sweeps=`, a grown buffer, an over-estimate) so the buffer is released.
     Values are consumed per segment (between sentinels, after the sweep-parameter
     prefix); `carry` holds the values of an incomplete trailing point until the next
     segment completes it, and an incomplete point at a sentinel or at EOF is dropped.
@@ -306,6 +307,7 @@ class _Collector:
         self.params: List[float] = []
         self.sweep_values: List[List[float]] = []
         self.sweep_indices: List[int] = []
+        self.spans: List[Tuple[int, int]] = []  # (start, stop) in the buffers, one per kept sweep
         self.data = {c: [] for c in self.cols}
 
     def _keep(self) -> bool:
@@ -356,13 +358,12 @@ class _Collector:
         for c in self.cols:
             grown = np.empty(new_capacity, self.h.dtype)
             grown[:self.fill] = self.buf[c][:self.fill]
-            self.buf[c] = grown             # views of finished sweeps keep referencing the old array
+            self.buf[c] = grown             # nothing references the old array: sweeps are spans, not views
         self.capacity = new_capacity
 
     def _end_sweep(self) -> None:
         if self._keep():
-            for c in self.cols:
-                self.data[c].append(self.buf[c][self.sweep_start:self.fill])
+            self.spans.append((self.sweep_start, self.fill))
             self.sweep_values.append(list(self.params))
             self.sweep_indices.append(self.sweep_idx)
         self.sweep_start = self.fill
@@ -379,11 +380,14 @@ class _Collector:
                 RuntimeWarning,
             )
             self._end_sweep()
-        if 2 * self.fill < self.capacity:
-            # A selective read (sweeps=) or a badly over-estimated capacity left most of the
-            # buffer unused; copy the kept sweeps out so the TraceSet does not pin it.
-            for c in self.cols:
-                self.data[c] = [arr.copy() for arr in self.data[c]]
+        # Materialise the kept sweeps. When a noticeable share of the capacity went unused
+        # (a selective sweeps=, a grown buffer, an over-estimate) copy the spans out so the
+        # TraceSet does not pin the buffer; otherwise hand out views into it.
+        compact = self.fill < 0.9 * self.capacity
+        for c in self.cols:
+            buf = self.buf[c]
+            self.data[c] = [buf[a:b].copy() if compact else buf[a:b] for a, b in self.spans]
+        if compact:
             self.buf = {}
         return truncated
 
@@ -452,7 +456,8 @@ def read_traces(path, names=None, sweeps=None) -> TraceSet:
                                         header.ncols, header.dtype.itemsize)
             collector = _Collector(header, cols, sweeps, capacity)
             index = 1
-            if block_payload > 0 and block_payload % header.dtype.itemsize == 0:
+            frame = block_payload + _FRAME_OVERHEAD
+            if block_payload > 0 and block_payload % header.dtype.itemsize == 0 and frame <= _MAX_CHUNK_BYTES:
                 index = _feed_bulk_frames(f, header, collector, block_payload, index)
             for block in _iter_binary_blocks(f, header, index):
                 collector.feed(block)

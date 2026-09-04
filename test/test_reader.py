@@ -8,6 +8,7 @@ import sys
 import tempfile
 import tracemalloc
 import unittest
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -366,7 +367,7 @@ class TestBinaryRead(unittest.TestCase):
             np.testing.assert_array_equal(ts.data[name][0], sweeps[0][1][:, col])
             np.testing.assert_array_equal(ts.data[name][1], sweeps[2][1][:, col])
 
-    def test_bulk_buffer_is_clamped_for_huge_declared_blocks(self):
+    def test_bulk_buffer_is_clamped_to_remaining_file_bytes(self):
         # A 1 MB block size makes the fixture a single ~268 KB block; unclamped, the bulk
         # reader would allocate FRAMES_PER_CHUNK frames of that size (~69 MB). The clamp on
         # remaining file bytes must bring the read buffer down to one frame.
@@ -377,7 +378,7 @@ class TestBinaryRead(unittest.TestCase):
             _, peak = tracemalloc.get_traced_memory()
         finally:
             tracemalloc.stop()
-        self.assertLess(peak, reader._MAX_CHUNK_BYTES * 3 + 1_000_000, f"peak {peak} bytes")
+        self.assertLess(peak, 2 * path.stat().st_size + 1_000_000, f"peak {peak} bytes")
         for col, name in enumerate(ts.selected):
             for i, (_, data) in enumerate(sweeps):
                 np.testing.assert_array_equal(ts.data[name][i], data[:, col])
@@ -419,6 +420,112 @@ class TestBinaryRead(unittest.TestCase):
             self.assertIsNone(arr.base)                 # owns its memory: the file-sized buffer is released
             self.assertEqual(arr.size, 977)
         np.testing.assert_array_equal(ts.data["v_a"][0], sweeps[1][1][:, 1])
+
+
+    def test_growth_does_not_strand_old_buffers(self):
+        # First block 512 bytes, later blocks 1 MB: the capacity estimate from the first block is
+        # low, the buffers grow once, and finish() must not leave the old buffers pinned.
+        path, sweeps = make_multi(self.dir, "2001", block_bytes=[512, 1 << 20])
+        ts = read_traces(path, ["v_a"])
+        npts = 1500 + 977 + 2310
+        for name, col in (("TIME", 0), ("v_a", 1)):
+            arrs = ts.data[name]
+            bases = {id(a.base): a.base for a in arrs if a.base is not None}
+            retained = sum(b.nbytes for b in bases.values()) + sum(a.nbytes for a in arrs if a.base is None)
+            self.assertLessEqual(retained, int(npts * 8 * 1.1) + 64, f"{name} retains {retained} bytes")
+            for i, (_, data) in enumerate(sweeps):
+                np.testing.assert_array_equal(arrs[i], data[:, col])
+
+    def test_oversized_declared_block_takes_the_per_block_path(self):
+        path, _ = make_multi(self.dir, "9601")
+        b = bytearray(path.read_bytes())
+        n0 = struct.unpack("<i", b[12:16])[0]
+        off = 20 + n0                                  # head of data block 1
+        b[off + 12:off + 16] = struct.pack("<i", 1 << 28)
+        path.write_bytes(bytes(b))
+
+        def must_not_run(*args, **kwargs):
+            raise AssertionError("bulk path used for a block larger than _MAX_CHUNK_BYTES")
+
+        original = reader._feed_bulk_frames
+        reader._feed_bulk_frames = must_not_run
+        self.addCleanup(setattr, reader, "_feed_bulk_frames", original)
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            ts = read_traces(path)
+        self.assertTrue(ts.truncated)
+
+    def test_byte_cap_binds_the_bulk_buffer(self):
+        path, sweeps = make_multi(self.dir, "2001")
+        original = reader._MAX_CHUNK_BYTES
+        reader._MAX_CHUNK_BYTES = 2 * (8192 + 20)      # two frames per readinto
+        self.addCleanup(setattr, reader, "_MAX_CHUNK_BYTES", original)
+        tracemalloc.start()
+        try:
+            ts = read_traces(path, ["v_b"])
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        npts = 1500 + 977 + 2310
+        self.assertLess(peak, 2 * npts * 8 + 3 * reader._MAX_CHUNK_BYTES + 1_000_000, f"peak {peak} bytes")
+        for i, (_, data) in enumerate(sweeps):
+            np.testing.assert_array_equal(ts.data["v_b"][i], data[:, 2])
+
+    def _read_both_ways(self, path):
+        def run():
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                try:
+                    ts, err = read_traces(path), None
+                except ValueError as e:
+                    ts, err = None, str(e)
+            return ts, err, [str(w.message) for w in caught]
+
+        bulk = run()
+        original = reader._peek_block_payload
+        reader._peek_block_payload = lambda f: 0          # forces the per-block path
+        try:
+            per_block = run()
+        finally:
+            reader._peek_block_payload = original
+        return bulk, per_block
+
+    def test_bulk_and_per_block_paths_agree(self):
+        cases = {
+            "uniform": {},
+            "mixed": {"block_bytes": [8192, 4096]},
+            "tiny": {"block_bytes": 64},
+            "partial_point": {"drop_tail": 3},
+            "no_final_sentinel": {"final_sentinel": False},
+        }
+        for label, kw in cases.items():
+            sub = self.dir / label
+            sub.mkdir()
+            path, _ = make_multi(sub, "9601", **kw)
+            if label == "uniform":                          # also a corrupt-tail variant
+                bad = bytearray(path.read_bytes())
+                n0 = struct.unpack("<i", bad[12:16])[0]
+                off = 20 + n0 + 2 * (8192 + 20)
+                size = struct.unpack("<i", bad[off + 12:off + 16])[0]
+                tail = off + 16 + size
+                bad[tail:tail + 4] = struct.pack("<i", size + 4)
+                (sub / "corrupt.tr0").write_bytes(bytes(bad))
+                cases_paths = [path, sub / "corrupt.tr0"]
+            else:
+                cases_paths = [path]
+            for p in cases_paths:
+                with self.subTest(case=label, file=p.name):
+                    (ts_b, err_b, warn_b), (ts_p, err_p, warn_p) = self._read_both_ways(p)
+                    self.assertEqual(err_b, err_p)
+                    self.assertEqual(warn_b, warn_p)
+                    if ts_b is not None:
+                        self.assertEqual(ts_b.truncated, ts_p.truncated)
+                        self.assertEqual(ts_b.sweep_indices, ts_p.sweep_indices)
+                        self.assertEqual(ts_b.sweep_values, ts_p.sweep_values)
+                        for name in ts_b.selected:
+                            self.assertEqual(len(ts_b.data[name]), len(ts_p.data[name]))
+                            for a, b in zip(ts_b.data[name], ts_p.data[name]):
+                                np.testing.assert_array_equal(a, b)
 
 
 class TestDuplicateNames(unittest.TestCase):
@@ -525,6 +632,8 @@ class TestSelection(unittest.TestCase):
         tracemalloc.stop()
         selected_bytes = 2 * npoints * 4                                 # TIME + v_7 as float32
         chunk_bytes = reader.FRAMES_PER_CHUNK * (8192 + 20)              # one bulk read buffer
+        # Deliberately tight (about 1.1x headroom): a bump to FRAMES_PER_CHUNK or
+        # _MAX_CHUNK_BYTES should fail here.
         self.assertLess(peak, selected_bytes + 3 * chunk_bytes + 1_000_000, f"peak {peak} bytes")
         self.assertEqual(ts.selected, ["TIME", "v_7"])
         np.testing.assert_array_equal(ts.data["v_7"][0], expected)
