@@ -126,13 +126,46 @@ def _read_binary_header(f, path: str) -> Header:
     return _build_header(path, True, version, nauto, nprobe, nsweepparam, int(tokens[0]), tokens[1:])
 
 
+def _read_ascii_header(f, path: str) -> Header:
+    """Consume the ASCII header lines, leaving f positioned at the first data line."""
+    first = f.readline()
+    if not first:
+        raise ValueError(f"{path}: empty file")
+    nauto, nprobe, nsweepparam = int(first[0:4]), int(first[4:8]), int(first[8:12])
+    f.readline()                                  # copyright line
+    third = f.readline()
+    sweep_count = int(third.split()[-1])
+    text = f.readline()
+    while _TERMINATOR not in text:
+        more = f.readline()
+        if not more:
+            raise ValueError(f"{path}: header terminator {_TERMINATOR} not found")
+        text += more
+    tokens = text.split()
+    tokens = tokens[:tokens.index(_TERMINATOR)]
+    return _build_header(path, False, "ascii", nauto, nprobe, nsweepparam, sweep_count, tokens)
+
+
+def _iter_ascii_values(f) -> Iterator[np.ndarray]:
+    """One float64 array per non-empty data line. Field width follows the old module's rule."""
+    width = None
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        if width is None:
+            width = line.find("E") + 4
+        yield np.array([float(line[i:i + width]) for i in range(0, len(line), width)], dtype=np.float64)
+
+
 def read_header(path) -> Header:
-    """Parse only the header of a binary result file. Never touches data blocks."""
+    """Parse only the header. Never touches data."""
     path = os.fspath(path)
     if is_binary(path):
         with open(path, "rb") as f:
             return _read_binary_header(f, path)
-    raise ValueError(f"{path}: ASCII files are not supported yet")
+    with open(path, "r") as f:
+        return _read_ascii_header(f, path)
 
 
 @dataclass
@@ -256,14 +289,20 @@ def read_traces(path, names=None, sweeps=None) -> TraceSet:
     sweeps: None for all, else sweep indices to keep.
     """
     path = os.fspath(path)
-    if not is_binary(path):
-        raise ValueError(f"{path}: ASCII files are not supported yet")
-    with open(path, "rb") as f:
-        header = _read_binary_header(f, path)
-        cols = resolve_columns(header, names)
-        collector = _Collector(header, cols, sweeps)
-        for block in _iter_binary_blocks(f, header):
-            collector.feed(block)
+    if is_binary(path):
+        with open(path, "rb") as f:
+            header = _read_binary_header(f, path)
+            cols = resolve_columns(header, names)
+            collector = _Collector(header, cols, sweeps)
+            for block in _iter_binary_blocks(f, header):
+                collector.feed(block)
+    else:
+        with open(path, "r") as f:
+            header = _read_ascii_header(f, path)
+            cols = resolve_columns(header, names)
+            collector = _Collector(header, cols, sweeps)
+            for values in _iter_ascii_values(f):
+                collector.feed(values)
     truncated = collector.finish()
     return TraceSet(
         header=header,

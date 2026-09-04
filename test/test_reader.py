@@ -355,6 +355,72 @@ class TestSelection(unittest.TestCase):
         self.assertEqual(ts.selected, ["TIME", "v_7"])
         np.testing.assert_array_equal(ts.data["v_7"][0], expected)
 
+ASCII_NAMES = ["TIME", "v(a", "v(b", "i(c", "r1"]
+ASCII_CODES = [1, 1, 1, 8]
+
+
+def make_ascii(directory):
+    rng = np.random.default_rng(2)
+    sweeps = [([1000.0], rng.uniform(-1, 1, (7, 4))), ([2000.0], rng.uniform(-1, 1, (5, 4)))]
+    path = Path(directory) / "ascii.tr0"
+    fixtures.write_ascii(path, ASCII_NAMES, ASCII_CODES, sweeps)
+    return path, sweeps
+
+
+class TestAsciiRead(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.path, self.sweeps = make_ascii(self.dir)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_header(self):
+        h = read_header(self.path)
+        self.assertFalse(h.is_binary)
+        self.assertEqual(h.version, "ascii")
+        self.assertEqual(h.analysis, "tr")
+        self.assertEqual(h.ncols, 4)
+        self.assertEqual(h.nsweepparam, 1)
+        self.assertEqual(h.sweep_count_hint, 2)
+        self.assertEqual(h.names, ["TIME", "v_a", "v_b", "i_c"])
+        self.assertEqual(h.sweep_params, ["r1"])
+        self.assertEqual(h.dtype, np.dtype("<f8"))
+
+    def test_matches_old_ascii_reader(self):
+        from hspice_parser.hspiceParser import signal_file_ascii_read
+
+        old = signal_file_ascii_read(str(self.path))
+        ts = read_traces(self.path)
+        self.assertEqual(ts.selected, ["TIME", "v_a", "v_b", "i_c"])
+        self.assertEqual(ts.sweep_values, [[1000.0], [2000.0]])
+        self.assertFalse(ts.truncated)
+        for name in ts.selected:
+            for i in range(2):
+                np.testing.assert_array_equal(ts.data[name][i], np.asarray(old[name][i]))
+
+    def test_matches_generator_to_7_digits(self):
+        ts = read_traces(self.path)
+        for col, name in enumerate(ts.selected):
+            for i, (_, data) in enumerate(self.sweeps):
+                np.testing.assert_allclose(ts.data[name][i], data[:, col], rtol=1e-6)
+
+    def test_selection_and_sweeps_on_ascii(self):
+        ts = read_traces(self.path, ["v(b)"], sweeps=[1])
+        self.assertEqual(ts.selected, ["TIME", "v_b"])
+        self.assertEqual(ts.sweep_values, [[2000.0]])
+        self.assertEqual(ts.data["v_b"][0].size, 5)
+
+    def test_truncated_ascii(self):
+        lines = self.path.read_text().splitlines()
+        self.path.write_text("\n".join(lines[:-1]) + "\n")   # drop the last line (holds the final sentinel)
+        with self.assertWarns(RuntimeWarning):
+            ts = read_traces(self.path)
+        self.assertTrue(ts.truncated)
+        self.assertEqual(len(ts.sweep_values), 2)
+        self.assertEqual(ts.data["TIME"][0].size, 7)
+
 
 if __name__ == "__main__":
     unittest.main()
