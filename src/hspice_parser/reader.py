@@ -145,10 +145,28 @@ class TraceSet:
 
 
 def resolve_columns(header: Header, names) -> List[int]:
-    """Column indices to keep. None means every column."""
+    """Column indices to keep, sorted, always including column 0.
+
+    Each entry of names matches, in order of preference: an exact sanitized name
+    (v_vo), a raw HSPICE name with optional closing paren (v(vo) or v(vo, which
+    for AC selects both _Mag and _Phase), or an fnmatch glob on sanitized names (v_*).
+    """
     if names is None:
         return list(range(header.ncols))
-    raise NotImplementedError("trace selection arrives in the next task")
+    if isinstance(names, str):
+        names = [names]
+    chosen = {0}
+    for req in names:
+        hits = [i for i, n in enumerate(header.names) if n == req]
+        if not hits:
+            bare = req.rstrip(")")
+            hits = [i for i, r in enumerate(header.col_raw_names) if r == bare]
+        if not hits:
+            hits = [i for i, n in enumerate(header.names) if fnmatch.fnmatchcase(n, req)]
+        if not hits:
+            raise ValueError(f"unknown trace {req!r}; available traces: {', '.join(header.names)}")
+        chosen.update(hits)
+    return sorted(chosen)
 
 
 class _Collector:
@@ -200,7 +218,9 @@ class _Collector:
                 chunks.clear()
             n = min(a.size for a in arrays.values()) if arrays else 0
             for c in self.cols:
-                self.data[c].append(arrays[c][:n])
+                arr = arrays[c]
+                # copy when trimming: a view would pin the whole concatenated array
+                self.data[c].append(arr[:n].copy() if n < arr.size else arr)
             self.sweep_values.append(list(self.params))
         self.pos = 0
         self.params = []

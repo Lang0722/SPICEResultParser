@@ -276,5 +276,85 @@ class TestBinaryRead(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "head promises"):
             read_traces(path)
 
+    def test_negative_block_size_raises(self):
+        path, _ = make_multi(self.dir, "9601")
+        b = bytearray(path.read_bytes())
+        n0 = struct.unpack("<i", b[12:16])[0]
+        off1 = 20 + n0
+        b[off1 + 12:off1 + 16] = struct.pack("<i", -8)
+        path.write_bytes(bytes(b))
+        with self.assertRaisesRegex(ValueError, "block 1: negative block size"):
+            read_traces(path)
+
+
+class TestSelection(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.path, self.sweeps = make_multi(self.dir, "2001")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_exact_names(self):
+        ts = read_traces(self.path, ["v_b", "i_f"])
+        self.assertEqual(ts.selected, ["TIME", "v_b", "i_f"])
+        self.assertEqual(sorted(ts.data), ["TIME", "i_f", "v_b"])
+        np.testing.assert_array_equal(ts.data["v_b"][0], self.sweeps[0][1][:, 2])
+        np.testing.assert_array_equal(ts.data["i_f"][2], self.sweeps[2][1][:, 6])
+
+    def test_raw_names_with_or_without_paren(self):
+        ts = read_traces(self.path, ["v(b)", "i(f"])
+        self.assertEqual(ts.selected, ["TIME", "v_b", "i_f"])
+
+    def test_glob(self):
+        ts = read_traces(self.path, ["i_*"])
+        self.assertEqual(ts.selected, ["TIME", "i_e", "i_f"])
+
+    def test_single_string(self):
+        ts = read_traces(self.path, "v_a")
+        self.assertEqual(ts.selected, ["TIME", "v_a"])
+
+    def test_x_always_first_even_if_requested_last(self):
+        ts = read_traces(self.path, ["v_d", "TIME"])
+        self.assertEqual(ts.selected, ["TIME", "v_d"])
+
+    def test_unknown_lists_available(self):
+        with self.assertRaisesRegex(ValueError, r"unknown trace 'nope'; available traces: TIME, v_a, v_b"):
+            read_traces(self.path, ["nope"])
+
+    def test_sweeps_filter(self):
+        ts = read_traces(self.path, ["v_a"], sweeps=[1])
+        self.assertEqual(ts.sweep_values, [[2000.0]])
+        self.assertEqual(len(ts.data["v_a"]), 1)
+        np.testing.assert_array_equal(ts.data["v_a"][0], self.sweeps[1][1][:, 1])
+        ts = read_traces(self.path, ["v_a"], sweeps=[0, 2])
+        self.assertEqual(ts.sweep_values, [[1000.0], [3000.0]])
+        np.testing.assert_array_equal(ts.data["TIME"][1], self.sweeps[2][1][:, 0])
+
+    def test_ac_raw_name_selects_mag_and_phase(self):
+        ts = read_traces(HERE / "test_9601.ac0", ["v(vo)"])
+        self.assertEqual(ts.selected, ["HERTZ", "v_vo_Mag", "v_vo_Phase"])
+
+    def test_memory_stays_near_selected_size(self):
+        rng = np.random.default_rng(6)
+        npoints, ncols = 500_000, 20
+        data = rng.random((npoints, ncols), dtype=np.float32)          # 40 MB
+        path = self.dir / "big.tr0"
+        fixtures.write_binary(path, "9601", ["TIME"] + [f"v({i}" for i in range(ncols - 1)],
+                              [1] * ncols, [([], data)])
+        expected = data[:, 8].copy()
+        del data
+        tracemalloc.start()
+        tracemalloc.reset_peak()
+        ts = read_traces(path, ["v(7"])
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        selected_bytes = 2 * npoints * 4                                 # TIME + v_7 as float32
+        self.assertLess(peak, 3 * selected_bytes + 1_000_000, f"peak {peak} bytes")
+        self.assertEqual(ts.selected, ["TIME", "v_7"])
+        np.testing.assert_array_equal(ts.data["v_7"][0], expected)
+
+
 if __name__ == "__main__":
     unittest.main()
