@@ -18,6 +18,7 @@ sys.path.insert(0, str(HERE))
 import fixtures  # noqa: E402
 
 from hspice_parser.reader import read_header, read_traces  # noqa: E402
+from hspice_parser import api  # noqa: E402
 
 
 class TestHeader(unittest.TestCase):
@@ -420,6 +421,85 @@ class TestAsciiRead(unittest.TestCase):
         self.assertTrue(ts.truncated)
         self.assertEqual(len(ts.sweep_values), 2)
         self.assertEqual(ts.data["TIME"][0].size, 7)
+
+
+class TestApi(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.path, self.sweeps = make_multi(self.dir, "2001")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_list_traces(self):
+        info = api.list_traces(HERE / "test_9601.tr0")
+        self.assertEqual(info, {
+            "path": str(HERE / "test_9601.tr0"), "format": "9601", "analysis": "tr", "x": "TIME",
+            "traces": ["v_0", "v_vo", "v_vs", "i_vs"], "sweep_params": [], "sweep_count_hint": 0,
+        })
+        info = api.list_traces(self.path)
+        self.assertEqual(info["sweep_params"], ["r1"])
+        self.assertEqual(info["sweep_count_hint"], 3)
+
+    def test_decimation_indices(self):
+        self.assertIsNone(api.decimation_indices(10, None))
+        self.assertIsNone(api.decimation_indices(10, 10))
+        self.assertIsNone(api.decimation_indices(10, 20))
+        np.testing.assert_array_equal(api.decimation_indices(10, 4), [0, 3, 6, 9])
+        np.testing.assert_array_equal(api.decimation_indices(10, 2), [0, 9])
+        with self.assertRaises(ValueError):
+            api.decimation_indices(10, 1)
+
+    def test_extract_arrays_equals_read_traces(self):
+        ts = api.extract(self.path, ["v_a"])
+        ref = read_traces(self.path, ["v_a"])
+        self.assertEqual(ts.selected, ref.selected)
+        for i in range(3):
+            np.testing.assert_array_equal(ts.data["v_a"][i], ref.data["v_a"][i])
+
+    def test_extract_arrays_downsampled(self):
+        ts = api.extract(self.path, ["v_a"], downsample=5)
+        for i, (_, data) in enumerate(self.sweeps):
+            self.assertEqual(ts.data["TIME"][i].size, 5)
+            self.assertEqual(ts.data["v_a"][i].size, 5)
+            self.assertEqual(ts.data["v_a"][i][0], data[0, 1])
+            self.assertEqual(ts.data["v_a"][i][-1], data[-1, 1])
+
+    def test_summary(self):
+        s = api.extract(self.path, ["v_a"], output="summary", downsample=4)
+        self.assertEqual(s["analysis"], "tr")
+        self.assertEqual(s["x"], "TIME")
+        self.assertEqual(s["sweeps"], 3)
+        self.assertEqual(s["sweep_values"], [[1000.0], [2000.0], [3000.0]])
+        self.assertFalse(s["truncated"])
+        self.assertEqual(list(s["traces"]), ["v_a"])
+        entry = s["traces"]["v_a"][1]
+        col = self.sweeps[1][1][:, 1]
+        self.assertEqual(entry["count"], 977)
+        self.assertEqual(entry["min"], float(col.min()))
+        self.assertEqual(entry["max"], float(col.max()))
+        self.assertAlmostEqual(entry["mean"], float(col.mean()), places=12)
+        self.assertEqual(entry["first"], float(col[0]))
+        self.assertEqual(entry["last"], float(col[-1]))
+        self.assertEqual(len(entry["x"]), 4)
+        self.assertEqual(len(entry["y"]), 4)
+        self.assertEqual(entry["x"][0], float(self.sweeps[1][1][0, 0]))
+        self.assertEqual(entry["x"][-1], float(self.sweeps[1][1][-1, 0]))
+        json.dumps(s)   # must be JSON serialisable
+
+    def test_summary_without_downsample_has_no_points(self):
+        s = api.extract(self.path, ["v_a"], output="summary")
+        self.assertNotIn("x", s["traces"]["v_a"][0])
+
+    def test_summary_on_sample_file(self):
+        s = api.extract(HERE / "test_9601.tr0", ["v(vo"], output="summary", downsample=10)
+        self.assertEqual(s["traces"]["v_vo"][0]["count"], 2605)
+        self.assertEqual(len(s["traces"]["v_vo"][0]["y"]), 10)
+
+    def test_bad_output(self):
+        with self.assertRaisesRegex(ValueError, "output must be one of"):
+            api.extract(self.path, output="xlsx")
 
 
 if __name__ == "__main__":
