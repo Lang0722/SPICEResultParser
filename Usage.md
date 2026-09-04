@@ -56,11 +56,13 @@ from hspice_parser import list_traces, extract
 list_traces("run.tr0")
 # {'path': 'run.tr0', 'format': '2001', 'analysis': 'tr', 'x': 'TIME',
 #  'traces': ['v_out', 'v_in', 'i_vdd'], 'sweep_params': ['r1'], 'sweep_count_hint': 3}
+# sweep_count_hint is 0 for a single-sweep file (it is the header's inner-sweep count).
 
 ts = extract("run.tr0", ["v(out)", "i_*"])        # names: sanitized, raw HSPICE, or glob
 ts.selected                                       # ['TIME', 'v_out', 'i_vdd']
 ts.data["v_out"][0]                               # numpy array, sweep 0, native dtype
 ts.sweep_values                                   # [[1000.0], [2000.0], [3000.0]]
+ts.sweep_indices                                  # original sweep index of each kept sweep
 
 extract("run.tr0", ["v(out)"], output="csv")      # -> 'run_tr0_traces.csv' beside the input
 extract("run.tr0", ["v(out)"], output="npz", dest="out.npz", downsample=1000)
@@ -70,6 +72,10 @@ extract("run.tr0", ["v(out)"], output="summary", downsample=200)   # JSON-friend
 `sweeps=[0, 2]` keeps only those sweeps. `downsample=N` keeps `N` evenly spaced
 points per sweep (first and last always kept). If the simulator is still writing
 the file, the partial last sweep is returned and `ts.truncated` is `True`.
+
+Two different HSPICE variables can sanitize to the same name (`.` and `:` both
+become `_`). The reader keeps one trace per column and appends `#<column index>`
+to the repeats -- `v_a_b`, `v_a_b#2` -- with a `RuntimeWarning` naming them.
 
 In AC files each variable becomes two traces (`v_vo_Mag` and `v_vo_Phase`), so the
 sanitized base name `v_vo` is not selectable on its own -- pass the raw name
@@ -90,3 +96,9 @@ pip install 'hspice_parser[mcp]'
 Tools: `list_traces(path)` and `extract(path, names, sweeps, output, downsample, dest)`.
 Over MCP `output` is `summary` (default, returns statistics and downsampled points),
 `csv`, or `npz` (writes a file and returns its path); full arrays are never sent inline.
+
+`downsample` is optional over MCP: left unset it defaults to 200 points per sweep
+for `summary`, and to no decimation at all for `csv` and `npz`, which keep every
+point. `dest` names the output file for `csv`/`npz`; it is not restricted to the
+input's directory, so the agent can write to any path the server process can
+reach. Leave it unset to write `<input>_<ext>_traces.<csv|npz>` beside the input.

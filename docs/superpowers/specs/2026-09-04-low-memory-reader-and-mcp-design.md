@@ -105,6 +105,7 @@ class Header:
     sweep_count_hint: int   # token after "Reserved."; informational only
     x_name: str             # sanitized name of column 0 (TIME, HERTZ, sweep var)
     names: list[str]        # sanitized trace names, one per data column, in column order
+                            # repeats get a '#<column index>' suffix (see below)
     raw_names: list[str]    # as written in the file
     type_codes: list[int]
     sweep_params: list[str] # sanitized names of the sweep parameters
@@ -117,6 +118,13 @@ lines (ASCII). It never touches data. Sanitization reuses
 For `ac`, `names` has length `ncols` with `x_name` followed by the
 `_Mag`/`_Phase` pairs.
 
+Sanitization is not injective (`.` and `:` both map to `_`, so `v(a.b` and
+`v(a:b` both give `v_a_b`), so `names` is made unique after sanitization: the
+first occurrence keeps the plain name, every later one gets a `#<column index>`
+suffix (`v_a_b`, `v_a_b#2`), and a `RuntimeWarning` naming the duplicates is
+emitted once per file. `names` is therefore always 1:1 with the data columns,
+which the `TraceSet.data` dict, the CSV header and the npz keys depend on.
+
 ### Streaming read
 
 ```python
@@ -125,6 +133,7 @@ class TraceSet:
     header: Header
     selected: list[str]                 # names in column order, x always first
     sweep_values: list[list[float]]     # per sweep, nsweepparam values (empty lists if none)
+    sweep_indices: list[int]            # original file sweep index of each kept sweep
     data: dict[str, list[np.ndarray]]   # name -> one array per sweep, native dtype
     truncated: bool                     # file ended without a final sentinel
 
@@ -137,6 +146,9 @@ def read_traces(path, names=None, sweeps=None) -> TraceSet
   nothing raises `ValueError` whose message lists the available names.
 - `sweeps`: `None` = all; otherwise a list of sweep indices to keep. Unselected
   sweeps are still scanned for sentinels but nothing is stored for them.
+  `sweep_indices` records the original index of each kept sweep, so identity
+  survives the filter: it feeds the CSV `sweep` column, the npz `<name>@<i>`
+  suffix, and the `sweep_indices` key of the summary and MCP result dicts.
 
 Algorithm (binary):
 
@@ -145,7 +157,8 @@ Algorithm (binary):
    after the sweep-parameter prefix) and `sweep_idx`. Keep a small
    `pending_params` list for the sweep-parameter prefix.
 3. For each data block: read head, `np.frombuffer(payload, dtype)`, read tail,
-   raise `ValueError` if tail != head length or if the payload is short.
+   raise `ValueError` if the tail is present but disagrees with the head; a
+   payload or tail cut short by EOF is handled as truncation, see below.
 4. Find sentinel positions in the block with `np.flatnonzero(block == sentinel)`.
    Split the block into segments between sentinels.
 5. For each segment: first consume up to `nsweepparam` values into
@@ -160,6 +173,14 @@ Algorithm (binary):
 7. On EOF with `pos > 0` or a non-empty prefix: finalize the partial sweep,
    set `truncated = True`, emit `warnings.warn`. This allows reading a file
    while the simulation is still writing it.
+
+A file being written ends anywhere, not only on a block boundary, so a block the
+file ends inside of is not corruption: when the payload is shorter than the head
+promises, or the 4-byte tail is missing entirely (fewer than 4 bytes present),
+the reader warns (`RuntimeWarning`) and yields the payload truncated down to a
+whole number of values of the header dtype, then stops. Step 7 then finalizes the
+partial sweep with `truncated = True`. A tail that is present but disagrees with
+the head, and a negative block size, are still hard `ValueError`s.
 
 No carry buffer is needed because the column of a value is determined
 arithmetically from `pos`, so points straddling blocks are handled for free.
@@ -194,7 +215,7 @@ def extract(path, names=None, sweeps=None, output="arrays",
 | output | returns | notes |
 |---|---|---|
 | `"arrays"` | `TraceSet` | default for Python callers |
-| `"csv"` | path (str) | one file at `dest`; default `dest` = `<input>_<ext>_traces.csv` beside the input. Columns: `sweep` and one column per sweep parameter (only when `nsweepparam > 0`), then x, then selected traces. Multi-sweep data are stacked row-wise, so ragged sweep lengths need no padding. Written sweep by sweep with `np.savetxt` on a stacked 2-D array per sweep. |
+| `"csv"` | path (str) | one file at `dest`; default `dest` = `<input>_<ext>_traces.csv` beside the input. Columns: `sweep` and one column per sweep parameter (only when `nsweepparam > 0`), then x, then selected traces. Multi-sweep data are stacked row-wise, so ragged sweep lengths need no padding. Written sweep by sweep with `np.savetxt`, in slices of 65536 rows: only one slice is stacked as float64 at a time, so writer memory is bounded by the slice, not by the sweep. |
 | `"npz"` | path (str) | `np.savez` at `dest`; default `<input>_<ext>_traces.npz`. Keys: `<name>` when there is one sweep, `<name>@<sweep_idx>` otherwise; plus `__sweep_values__` (2-D, shape `(nsweeps, nsweepparam)`) and `__sweep_params__` (array of str). |
 | `"summary"` | dict | per trace and sweep: `count`, `min`, `max`, `mean`, `first`, `last`, plus `x` and `y` lists of `downsample` points when `downsample` is set. JSON-serialisable (Python floats/ints/lists). |
 
@@ -206,13 +227,18 @@ are computed on the full trace before decimation.
 
 `dest` for file outputs is created or overwritten. Parent directory must exist.
 
-`extract` never converts arrays to Python lists except in `"summary"`, so
-memory stays at native width for the other forms.
+`extract` never converts arrays to Python lists except in `"summary"`, so the
+stored traces stay at native width for the other forms. CSV is the one place
+that must widen to float64 to format, and it does so one 65536-row slice at a
+time, so that widening costs a bounded amount rather than a copy of the sweep.
 
 ## mcp_server.py
 
 Uses `mcp.server.fastmcp.FastMCP`, stdio transport, server name
-`hspice-parser`. Import of `mcp` happens inside this module only, so the rest
+`hspice-parser`. `mcp` 2.x renamed that class, so the import falls back to
+`mcp.server.mcpserver.MCPServer` when `mcp.server.fastmcp` is absent, and only
+raises the "install the extra" `ImportError` when neither is importable; the
+declared requirement stays `mcp>=1.0`. Import of `mcp` happens inside this module only, so the rest
 of the package works without it. Declared in `pyproject.toml` as
 `[project.optional-dependencies] mcp = ["mcp>=1.0"]` and a script
 `hsp-mcp = "hspice_parser.mcp_server:main"`.
@@ -220,10 +246,15 @@ of the package works without it. Declared in `pyproject.toml` as
 Tools:
 
 - `list_traces(path: str) -> dict` : returns `api.list_traces`.
-- `extract(path: str, names: list[str] | None = None, sweeps: list[int] | None = None, output: str = "summary", downsample: int = 200, dest: str | None = None) -> dict`
+- `extract(path: str, names: Optional[List[str]] = None, sweeps: Optional[List[int]] = None, output: str = "summary", downsample: Optional[int] = None, dest: Optional[str] = None) -> dict`
+  (the MCP SDK evaluates the annotations at runtime, so these stay
+  `typing.Optional`/`List` rather than `X | None`.)
+  - `downsample` defaults to `None` = keep every point; the 200-point default is
+    applied only for `output="summary"`, where the result is sent inline.
+  - `output` is validated before the file is read.
   - `output` accepts `"summary"`, `"csv"`, `"npz"` only; `"arrays"` raises a
     `ValueError` with a message telling the agent to use a file form.
-  - file forms return `{"output": "csv"|"npz", "path": ..., "traces": [...], "sweeps": n, "points": [per-sweep counts]}`.
+  - file forms return `{"output": "csv"|"npz", "path": ..., "traces": [...], "sweeps": n, "sweep_indices": [...], "points": [per-sweep counts], "truncated": bool}`.
   - `"summary"` returns the summary dict.
 - Errors from `api` propagate as tool errors with their message intact so the
   agent sees the available-names list on a bad name.
@@ -283,7 +314,9 @@ Old tests in `test/test.py` are run unchanged and must still pass.
 | condition | behaviour |
 |---|---|
 | unknown post_version | `ValueError` |
-| head/tail length mismatch, short payload | `ValueError` naming the block index |
+| head/tail length mismatch, negative block size | `ValueError` naming the block index |
+| payload or tail cut short by EOF | keep whole values, `warnings.warn`, stop reading; `truncated=True` |
+| duplicate sanitized trace names | disambiguated with `#<column index>`, `warnings.warn` |
 | analysis type vs extension mismatch | `ValueError` |
 | unknown trace name | `ValueError` listing available names |
 | EOF before sentinel | finish partial sweep, `truncated=True`, `warnings.warn` |
