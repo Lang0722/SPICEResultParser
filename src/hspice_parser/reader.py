@@ -385,10 +385,9 @@ class _Collector:
         # TraceSet does not pin the buffer; otherwise hand out views into it.
         compact = self.fill < 0.9 * self.capacity
         for c in self.cols:
-            buf = self.buf[c]
+            # pop when compacting so each column's buffer is released before the next is copied
+            buf = self.buf.pop(c) if compact else self.buf[c]
             self.data[c] = [buf[a:b].copy() if compact else buf[a:b] for a, b in self.spans]
-        if compact:
-            self.buf = {}
         return truncated
 
 

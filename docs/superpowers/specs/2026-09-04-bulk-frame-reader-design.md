@@ -51,7 +51,7 @@ as a copy that releases the buffer; no concatenation. Pages of `np.empty` are
 only touched when written, so an over-estimated capacity costs virtual address
 space, not RSS, and unselected sweeps never touch pages.
 
-Capacity is an upper bound derived from the file size:
+Capacity is an estimate derived from the file size (an upper bound when all full frames carry the first block's payload size):
 
 - binary: `payload_bytes // itemsize // ncols + 1`, where
   `payload_bytes = (file_size - header_frame_bytes) - 20 * ceil(remaining / (block_payload + 20))`

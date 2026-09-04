@@ -197,7 +197,7 @@ partial sweep with `truncated = True`. A tail that is present but disagrees with
 the head, and a negative block size, are still hard `ValueError`s.
 
 Memory: one preallocated buffer per selected column, sized from the file size
-(an upper bound; `np.empty` pages are touched only when written), plus one
+(an estimate, an upper bound for uniform-block files; `np.empty` pages are touched only when written), plus one
 2 MB read buffer and one 2 MB contiguous slab in the bulk path. Sweeps are
 recorded as spans and materialised in `finish()`; nothing is concatenated. They
 are views into the column buffers when the buffers ended up nearly full; a read

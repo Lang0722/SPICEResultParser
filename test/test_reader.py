@@ -368,9 +368,9 @@ class TestBinaryRead(unittest.TestCase):
             np.testing.assert_array_equal(ts.data[name][1], sweeps[2][1][:, col])
 
     def test_bulk_buffer_is_clamped_to_remaining_file_bytes(self):
-        # A 1 MB block size makes the fixture a single ~268 KB block; unclamped, the bulk
-        # reader would allocate FRAMES_PER_CHUNK frames of that size (~69 MB). The clamp on
-        # remaining file bytes must bring the read buffer down to one frame.
+        # A 1 MB block size makes the fixture a single ~268 KB block. Without the clamp on
+        # remaining file bytes the bulk reader would allocate _MAX_CHUNK_BYTES // frame = 3
+        # frames of that size (~3 MB); the clamp must bring the read buffer down to one frame.
         path, sweeps = make_multi(self.dir, "2001", block_bytes=1 << 20)
         tracemalloc.start()
         try:
@@ -467,7 +467,8 @@ class TestBinaryRead(unittest.TestCase):
         finally:
             tracemalloc.stop()
         npts = 1500 + 977 + 2310
-        self.assertLess(peak, 2 * npts * 8 + 3 * reader._MAX_CHUNK_BYTES + 1_000_000, f"peak {peak} bytes")
+        # 200 KB slack: with the byte-cap term removed the buffer is ~271 KB and the peak ~650 KB.
+        self.assertLess(peak, 2 * npts * 8 + 3 * reader._MAX_CHUNK_BYTES + 200_000, f"peak {peak} bytes")
         for i, (_, data) in enumerate(sweeps):
             np.testing.assert_array_equal(ts.data["v_b"][i], data[:, 2])
 
