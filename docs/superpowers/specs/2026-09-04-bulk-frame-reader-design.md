@@ -1,7 +1,7 @@
 # Bulk-frame reader: preallocated columns and chunked frame parsing
 
 Date: 2026-09-04
-Status: approved design (follow-up to `2026-09-04-low-memory-reader-and-mcp-design.md`)
+Status: implemented 2026-09-04 (follow-up to `2026-09-04-low-memory-reader-and-mcp-design.md`)
 Branch: `feature/low-memory-reader`
 
 ## Goal
@@ -9,16 +9,25 @@ Branch: `feature/low-memory-reader`
 Remove the per-block Python overhead and the per-sweep concatenation transient
 from `reader.read_traces` without changing its public API or results.
 
-Measured before this work on a 490 MB single-sweep 2001 file, 20 columns:
+Measured on a 490 MB single-sweep 2001 file, 20 columns, 3.2M points, warm
+cache (the "after" rows were measured once the change landed):
 
 | case | peak RSS | time |
 |---|---|---|
-| one trace, arrays | 155 MB | 0.9 s |
-| all traces, arrays | 1,260 MB | 1.8 s |
+| before: one trace, arrays | 155 MB | 0.9 s |
+| before: all traces, arrays | 1,260 MB | 1.8 s |
 | machine ceiling: read + copy + gather | – | 0.15 s |
+| after: one trace, arrays | 95 MB | 0.12 s |
+| after: all traces, arrays | 554 MB | 0.19 s |
 
 Targets: one trace under 60 MB and about 0.3 s; all traces about 1.0x the
 selected data (~500 MB) and under 1 s. `hspiceParser.py` stays untouched.
+
+Outcome: both time targets are met with room to spare and all-traces RSS is
+close to the ~500 MB of selected data, but one trace peaks at 95 MB rather than
+under 60 MB -- the capacity derived from the file preallocates about 25 MB per
+selected column (here TIME plus the one trace) on top of the ~29 MB Python +
+numpy baseline and the two slab buffers.
 
 ## Non-goals
 

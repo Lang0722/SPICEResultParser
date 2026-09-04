@@ -162,14 +162,17 @@ Algorithm (binary):
 4. Find sentinel positions in the block with `np.flatnonzero(block == sentinel)`.
    Split the block into segments between sentinels.
 5. For each segment: first consume up to `nsweepparam` values into
-   `pending_params` if the sweep prefix is not complete. For the rest, the
-   value at segment offset `k` belongs to column `(pos + k) % ncols`. For each
-   selected column `c`, take `segment[((c - pos) % ncols)::ncols]` and append
-   the view-copy to that column's chunk list for the current sweep. Advance
-   `pos` by the segment length.
-6. On a sentinel: if the current sweep is selected, concatenate each column's
-   chunks into one array and store it; record `pending_params` as
-   `sweep_values[sweep_idx]`; reset `pos`, `pending_params`; `sweep_idx += 1`.
+   `pending_params` if the sweep prefix is not complete. The rest is a run of
+   whole points once a `carry` holding the values of an incomplete trailing
+   point from the previous segment is completed from its front; the completed
+   point and the remaining whole points are reshaped `(npts, ncols)` and each
+   selected column `c` is gathered from `rows[:, c]` straight into that
+   column's preallocated buffer. What is left over becomes the new `carry`.
+   Advance `pos` by the segment length.
+6. On a sentinel: if the current sweep is selected, store each column's slice
+   of its buffer (`buf[c][sweep_start:fill]`, a view) as that sweep's array;
+   record `pending_params` as `sweep_values[sweep_idx]`; drop an incomplete
+   `carry`; reset `pos`, `pending_params`; `sweep_idx += 1`.
 7. On EOF with `pos > 0` or a non-empty prefix: finalize the partial sweep,
    set `truncated = True`, emit `warnings.warn`. This allows reading a file
    while the simulation is still writing it.
@@ -182,13 +185,13 @@ whole number of values of the header dtype, then stops. Step 7 then finalizes th
 partial sweep with `truncated = True`. A tail that is present but disagrees with
 the head, and a negative block size, are still hard `ValueError`s.
 
-No carry buffer is needed because the column of a value is determined
-arithmetically from `pos`, so points straddling blocks are handled for free.
-
-Memory: one block plus the selected columns at native width. The per-sweep
-concatenation in step 6 transiently doubles that sweep's selected data.
-Because 9601 blocks are 8 KB, block overhead is negligible; the algorithm
-must not assume a fixed block size.
+Memory: one preallocated buffer per selected column, sized from the file size
+(an upper bound; `np.empty` pages are touched only when written), plus one
+2 MB read buffer and one 2 MB contiguous slab in the bulk path. Sweeps are views
+into the column buffers; nothing is concatenated. A read that leaves most of the
+capacity unused -- a selective `sweeps=`, or ASCII's coarser bytes-per-value
+estimate -- copies the kept sweeps out at the end and releases the buffers. See
+`2026-09-04-bulk-frame-reader-design.md` for the slab parser and fallback.
 
 Algorithm (ASCII): same state machine over a stream of floats produced by a
 line iterator that parses fixed-width fields. Lines are read one at a time;

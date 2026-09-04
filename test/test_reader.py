@@ -367,8 +367,9 @@ class TestBinaryRead(unittest.TestCase):
             np.testing.assert_array_equal(ts.data[name][1], sweeps[2][1][:, col])
 
     def test_bulk_buffer_is_clamped_for_huge_declared_blocks(self):
-        # 3 sweeps, 1 MB payload per block: the read buffer must be bounded by the byte cap,
-        # not FRAMES_PER_CHUNK * frame (which would be 256 MB here).
+        # A 1 MB block size makes the fixture a single ~268 KB block; unclamped, the bulk
+        # reader would allocate FRAMES_PER_CHUNK frames of that size (~69 MB). The clamp on
+        # remaining file bytes must bring the read buffer down to one frame.
         path, sweeps = make_multi(self.dir, "2001", block_bytes=1 << 20)
         tracemalloc.start()
         try:

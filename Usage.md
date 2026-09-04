@@ -46,9 +46,15 @@ for filename in listdir(directory):
 
 # Low-memory trace API
 
-The functions below stream the file and keep only the traces you ask for, so a
-multi-gigabyte `.tr0` costs roughly the size of the selected columns in memory.
+The functions below stream the file and keep only the traces you ask for.
 They handle binary 9601 and 2001 files and `post=2` ASCII files.
+
+Memory is bounded by what you select, not by the file: each selected trace is
+written once into a preallocated array sized from the file, and data blocks are
+parsed in 2 MB slabs. On a 490 MB, 20-trace transient file this measured
+95 MB peak RSS and 0.12 s for one trace, and 554 MB and 0.19 s for all twenty
+traces (Python + numpy alone is about 29 MB). The legacy converter needs
+roughly 85x the file size.
 
 ```python
 from hspice_parser import list_traces, extract
