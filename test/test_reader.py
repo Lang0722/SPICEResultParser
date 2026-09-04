@@ -502,5 +502,79 @@ class TestApi(unittest.TestCase):
             api.extract(self.path, output="xlsx")
 
 
+class TestFileOutputs(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.path, self.sweeps = make_multi(self.dir, "2001")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_default_dest(self):
+        self.assertEqual(api.default_dest("/x/y/test_9601.tr0", "csv"), "/x/y/test_9601_tr0_traces.csv")
+        self.assertEqual(api.default_dest("run.ac0", "npz"), "run_ac0_traces.npz")
+
+    def test_csv_single_sweep(self):
+        dest = self.dir / "single.csv"
+        out = api.extract(HERE / "test_9601.tr0", ["v(vo"], output="csv", dest=dest)
+        self.assertEqual(out, str(dest))
+        lines = dest.read_text().splitlines()
+        self.assertEqual(lines[0], "TIME,v_vo")
+        self.assertEqual(len(lines), 1 + 2605)
+        ref = read_traces(HERE / "test_9601.tr0", ["v(vo"])
+        table = np.loadtxt(dest, delimiter=",", skiprows=1)
+        np.testing.assert_array_equal(table[:, 0], ref.data["TIME"][0].astype(np.float64))
+        np.testing.assert_array_equal(table[:, 1], ref.data["v_vo"][0].astype(np.float64))
+
+    def test_csv_multi_sweep(self):
+        dest = self.dir / "multi.csv"
+        api.extract(self.path, ["v_a"], output="csv", dest=dest)
+        lines = dest.read_text().splitlines()
+        self.assertEqual(lines[0], "sweep,r1,TIME,v_a")
+        self.assertEqual(len(lines), 1 + 1500 + 977 + 2310)
+        table = np.loadtxt(dest, delimiter=",", skiprows=1)
+        np.testing.assert_array_equal(table[:1500, 0], 0)
+        np.testing.assert_array_equal(table[1500:1500 + 977, 0], 1)
+        np.testing.assert_array_equal(table[1500:1500 + 977, 1], 2000.0)
+        np.testing.assert_array_equal(table[1500:1500 + 977, 3], self.sweeps[1][1][:, 1])
+
+    def test_csv_downsampled(self):
+        dest = self.dir / "ds.csv"
+        api.extract(self.path, ["v_a"], output="csv", downsample=10, dest=dest)
+        self.assertEqual(len(dest.read_text().splitlines()), 1 + 30)
+
+    def test_default_csv_dest_is_beside_input(self):
+        out = api.extract(self.path, ["v_a"], output="csv")
+        self.assertEqual(out, str(self.dir / "multi_2001_tr0_traces.csv"))
+        self.assertTrue(Path(out).exists())
+
+    def test_npz_single_sweep(self):
+        dest = self.dir / "single.npz"
+        api.extract(HERE / "test_9601.tr0", ["v(vo"], output="npz", dest=dest)
+        with np.load(dest) as z:
+            self.assertEqual(sorted(z.files), ["TIME", "__sweep_params__", "__sweep_values__", "v_vo"])
+            ref = read_traces(HERE / "test_9601.tr0", ["v(vo"])
+            np.testing.assert_array_equal(z["v_vo"], ref.data["v_vo"][0])
+            self.assertEqual(z["v_vo"].dtype, np.dtype("<f4"))
+            self.assertEqual(z["__sweep_values__"].shape, (1, 0))
+            self.assertEqual(z["__sweep_params__"].size, 0)
+
+    def test_npz_multi_sweep(self):
+        dest = self.dir / "multi.npz"
+        api.extract(self.path, ["v_a"], output="npz", dest=dest)
+        with np.load(dest) as z:
+            self.assertEqual(sorted(z.files), sorted(
+                ["TIME@0", "TIME@1", "TIME@2", "v_a@0", "v_a@1", "v_a@2", "__sweep_params__", "__sweep_values__"]))
+            np.testing.assert_array_equal(z["v_a@2"], self.sweeps[2][1][:, 1])
+            np.testing.assert_array_equal(z["__sweep_values__"], [[1000.0], [2000.0], [3000.0]])
+            self.assertEqual(list(z["__sweep_params__"]), ["r1"])
+
+    def test_write_file_rejects_other_outputs(self):
+        ts = read_traces(self.path, ["v_a"])
+        with self.assertRaises(ValueError):
+            api.write_file(ts, "summary")
+
+
 if __name__ == "__main__":
     unittest.main()

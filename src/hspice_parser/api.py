@@ -1,6 +1,7 @@
 """User-facing API over reader.py: list traces, extract a subset, summarise, write files."""
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import numpy as np
@@ -64,6 +65,54 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None) -> dict:
     }
 
 
+def default_dest(path, output: str) -> str:
+    """<root>_<ext>_traces.<output> beside the input, e.g. run_tr0_traces.csv."""
+    root, ext = os.path.splitext(os.fspath(path))
+    return f"{root}_{ext.lstrip('.')}_traces.{output}"
+
+
+def _write_csv(ts: TraceSet, dest: str) -> None:
+    h = ts.header
+    with_lead = bool(h.nsweepparam) or len(ts.sweep_values) > 1
+    lead_names = (["sweep"] + h.sweep_params) if with_lead else []
+    with open(dest, "w", newline="") as f:
+        f.write(",".join(lead_names + ts.selected) + "\n")
+        for i, params in enumerate(ts.sweep_values):
+            arrays = [ts.data[n][i].astype(np.float64) for n in ts.selected]
+            n = arrays[0].size
+            if n == 0:
+                continue
+            lead = []
+            if with_lead:
+                lead = [np.full(n, i, dtype=np.float64)] + [np.full(n, v, dtype=np.float64) for v in params]
+            np.savetxt(f, np.column_stack(lead + arrays), delimiter=",", fmt="%.17g")
+
+
+def _write_npz(ts: TraceSet, dest: str) -> None:
+    single = len(ts.sweep_values) == 1
+    arrays = {}
+    for name in ts.selected:
+        for i, arr in enumerate(ts.data[name]):
+            arrays[name if single else f"{name}@{i}"] = arr
+    arrays["__sweep_values__"] = np.asarray(ts.sweep_values, dtype=np.float64).reshape(
+        len(ts.sweep_values), ts.header.nsweepparam)
+    arrays["__sweep_params__"] = np.asarray(ts.header.sweep_params, dtype=str)
+    with open(dest, "wb") as f:            # file object: np.savez must not append ".npz"
+        np.savez(f, **arrays)
+
+
+def write_file(ts: TraceSet, output: str, dest=None) -> str:
+    """Write a TraceSet as csv or npz; returns the path written."""
+    if output not in ("csv", "npz"):
+        raise ValueError(f"write_file supports 'csv' or 'npz', not {output!r}")
+    dest = os.fspath(dest) if dest is not None else default_dest(ts.header.path, output)
+    if output == "csv":
+        _write_csv(ts, dest)
+    else:
+        _write_npz(ts, dest)
+    return dest
+
+
 def extract(path, names=None, sweeps=None, output: str = "arrays",
             downsample: Optional[int] = None, dest=None):
     """Read selected traces and return them as arrays, a summary dict, or a written file path."""
@@ -76,4 +125,4 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
         _decimate(ts, downsample)
     if output == "arrays":
         return ts
-    raise NotImplementedError("file outputs arrive in the next task")
+    return write_file(ts, output, dest)
