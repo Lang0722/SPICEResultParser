@@ -18,6 +18,7 @@ sys.path.insert(0, str(HERE))
 import fixtures  # noqa: E402
 
 from hspice_parser.reader import read_header, read_traces  # noqa: E402
+from hspice_parser import reader  # noqa: E402
 from hspice_parser import api  # noqa: E402
 
 
@@ -311,6 +312,44 @@ class TestBinaryRead(unittest.TestCase):
         path.write_bytes(bytes(b))
         with self.assertRaisesRegex(ValueError, "block 1: negative block size"):
             read_traces(path)
+
+    def test_collector_grows_when_capacity_is_too_small(self):
+        path, sweeps = make_multi(self.dir, "2001")
+        header = read_header(path)
+        collector = reader._Collector(header, list(range(header.ncols)), None, capacity=1)
+        with open(path, "rb") as f:
+            reader._read_binary_header(f, path)
+            for block in reader._iter_binary_blocks(f, header):
+                collector.feed(block)
+        self.assertFalse(collector.finish())
+        self.assertGreaterEqual(collector.capacity, 1500 + 977 + 2310)
+        self.assertEqual(collector.sweep_indices, [0, 1, 2])
+        for col in range(7):
+            for i, (_, data) in enumerate(sweeps):
+                np.testing.assert_array_equal(collector.data[col][i], data[:, col])
+
+    def test_kept_sweeps_are_views_of_one_buffer(self):
+        path, _ = make_multi(self.dir, "2001")
+        ts = read_traces(path, ["v_a"])
+        bases = {id(arr.base) for arr in ts.data["v_a"]}
+        self.assertEqual(len(bases), 1)
+        self.assertEqual(sum(a.size for a in ts.data["v_a"]), 1500 + 977 + 2310)
+
+    def test_header_only_file_has_no_sweeps(self):
+        path = self.dir / "empty.tr0"
+        text = fixtures.header_text("2001", ["TIME", "v(a"], [1, 1], 0, 0)
+        path.write_bytes(fixtures._block(text.encode("utf-8")))
+        ts = read_traces(path)
+        self.assertEqual(ts.sweep_values, [])
+        self.assertEqual(ts.sweep_indices, [])
+        self.assertEqual(ts.data["v_a"], [])
+        self.assertFalse(ts.truncated)
+
+    def test_capacity_estimates(self):
+        # 16424 bytes of frames after a header: two 8192-byte-payload frames would be 16424 bytes
+        self.assertEqual(reader._binary_capacity(16424 + 100, 100, 8192, 20, 8), 16384 // 8 // 20 + 1)
+        self.assertEqual(reader._binary_capacity(100, 100, 8192, 20, 8), 1)
+        self.assertEqual(reader._ascii_capacity(13 * 40 + 200, 4), (13 * 40 + 200) // 13 // 4 + 1)
 
 
 class TestDuplicateNames(unittest.TestCase):

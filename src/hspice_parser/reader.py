@@ -19,6 +19,8 @@ from .hspiceParser import is_binary, parse_var_name
 _DTYPE = {"9601": np.dtype("<f4"), "2001": np.dtype("<f8"), "ascii": np.dtype("<f8")}
 _ANALYSIS_BY_TYPE_CODE = {1: "tr", 2: "ac", 3: "sw"}
 _TERMINATOR = "$&%#"
+_FRAME_OVERHEAD = 20            # 16-byte block head + 4-byte block tail
+_ASCII_BYTES_PER_VALUE = 13     # one HSPICE ASCII field; used only to bound the preallocation
 
 
 @dataclass
@@ -248,17 +250,53 @@ def resolve_columns(header: Header, names) -> List[int]:
     return sorted(chosen)
 
 
-class _Collector:
-    """State machine over the flat value stream: sweep-parameter prefix, points, sentinel."""
+def _binary_capacity(file_size: int, data_start: int, block_payload: int, ncols: int, itemsize: int) -> int:
+    """Upper bound on data points in a binary file: bytes after the header minus per-frame overhead, as values."""
+    remaining = max(0, file_size - data_start)
+    frame = max(1, block_payload) + _FRAME_OVERHEAD
+    nframes = -(-remaining // frame)
+    payload = max(0, remaining - nframes * _FRAME_OVERHEAD)
+    return payload // itemsize // ncols + 1
 
-    def __init__(self, header: Header, cols: Sequence[int], sweeps: Optional[Iterable[int]]):
+
+def _ascii_capacity(file_size: int, ncols: int) -> int:
+    """Upper bound on data points in an ASCII file (13 bytes per value; newlines only inflate it)."""
+    return file_size // _ASCII_BYTES_PER_VALUE // ncols + 1
+
+
+def _peek_block_payload(f) -> int:
+    """Declared payload size of the block at the current position (0 at EOF or if negative). Leaves f in place."""
+    head = f.read(16)
+    f.seek(-len(head), 1)
+    if len(head) < 16:
+        return 0
+    return max(0, struct.unpack("<i", head[12:16])[0])
+
+
+class _Collector:
+    """State machine over the flat value stream: sweep-parameter prefix, points, sentinel.
+
+    Kept points are written into one preallocated buffer per selected column, so a
+    finished sweep is a view into that buffer and nothing is concatenated. `capacity`
+    is an upper bound on kept points (the caller derives it from the file size); if
+    it proves too small the buffers grow with a copy. Values are consumed per
+    segment (between sentinels, after the sweep-parameter prefix); `carry` holds the
+    values of an incomplete trailing point until the next segment completes it, and
+    an incomplete point at a sentinel or at EOF is dropped.
+    """
+
+    def __init__(self, header: Header, cols: Sequence[int], sweeps: Optional[Iterable[int]], capacity: int):
         self.h = header
         self.cols = list(cols)
         self.sweeps = None if sweeps is None else set(int(s) for s in sweeps)
-        self.pos = 0                    # data values consumed in the current sweep
+        self.capacity = max(1, int(capacity))
+        self.buf = {c: np.empty(self.capacity, header.dtype) for c in self.cols}
+        self.fill = 0                           # kept points written so far, across all kept sweeps
+        self.sweep_start = 0                    # value of fill when the current sweep began
+        self.carry = np.empty(0, header.dtype)  # values of an incomplete trailing point
+        self.pos = 0                            # data values consumed in the current sweep
         self.sweep_idx = 0
         self.params: List[float] = []
-        self.chunks = {c: [] for c in self.cols}
         self.sweep_values: List[List[float]] = []
         self.sweep_indices: List[int] = []
         self.data = {c: [] for c in self.cols}
@@ -281,28 +319,47 @@ class _Collector:
             seg = seg[need:]
         if seg.size == 0:
             return
-        if self._keep():
-            ncols = self.h.ncols
-            for c in self.cols:
-                first = (c - self.pos) % ncols
-                if first < seg.size:
-                    self.chunks[c].append(seg[first::ncols].copy())   # copy: do not pin the block
         self.pos += seg.size
+        ncols = self.h.ncols
+        if self.carry.size:
+            missing = ncols - self.carry.size
+            if seg.size < missing:
+                self.carry = np.concatenate([self.carry, seg])
+                return
+            point = np.concatenate([self.carry, seg[:missing]])
+            self._write_rows(point.reshape(1, ncols))
+            seg = seg[missing:]
+        npts = seg.size // ncols
+        if npts:
+            self._write_rows(seg[:npts * ncols].reshape(npts, ncols))
+        self.carry = seg[npts * ncols:].copy()      # copy: do not pin the source block
+
+    def _write_rows(self, rows: np.ndarray) -> None:
+        if not self._keep():
+            return
+        end = self.fill + rows.shape[0]
+        if end > self.capacity:
+            self._grow(end)
+        for c in self.cols:
+            self.buf[c][self.fill:end] = rows[:, c]
+        self.fill = end
+
+    def _grow(self, needed: int) -> None:
+        new_capacity = max(needed, 2 * self.capacity)
+        for c in self.cols:
+            grown = np.empty(new_capacity, self.h.dtype)
+            grown[:self.fill] = self.buf[c][:self.fill]
+            self.buf[c] = grown             # views of finished sweeps keep referencing the old array
+        self.capacity = new_capacity
 
     def _end_sweep(self) -> None:
         if self._keep():
-            arrays = {}
             for c in self.cols:
-                chunks = self.chunks[c]
-                arrays[c] = np.concatenate(chunks) if chunks else np.empty(0, self.h.dtype)
-                chunks.clear()
-            n = min(a.size for a in arrays.values()) if arrays else 0
-            for c in self.cols:
-                arr = arrays[c]
-                # copy when trimming: a view would pin the whole concatenated array
-                self.data[c].append(arr[:n].copy() if n < arr.size else arr)
+                self.data[c].append(self.buf[c][self.sweep_start:self.fill])
             self.sweep_values.append(list(self.params))
             self.sweep_indices.append(self.sweep_idx)
+        self.sweep_start = self.fill
+        self.carry = self.carry[:0]
         self.pos = 0
         self.params = []
         self.sweep_idx += 1
@@ -341,14 +398,19 @@ def read_traces(path, names=None, sweeps=None) -> TraceSet:
         with open(path, "rb") as f:
             header = _read_binary_header(f, path)
             cols = resolve_columns(header, names)
-            collector = _Collector(header, cols, sweeps)
+            data_start = f.tell()
+            file_size = os.fstat(f.fileno()).st_size
+            capacity = _binary_capacity(file_size, data_start, _peek_block_payload(f),
+                                        header.ncols, header.dtype.itemsize)
+            collector = _Collector(header, cols, sweeps, capacity)
             for block in _iter_binary_blocks(f, header):
                 collector.feed(block)
     else:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             header = _read_ascii_header(f, path)
             cols = resolve_columns(header, names)
-            collector = _Collector(header, cols, sweeps)
+            file_size = os.fstat(f.fileno()).st_size
+            collector = _Collector(header, cols, sweeps, _ascii_capacity(file_size, header.ncols))
             for values in _iter_ascii_values(f, path):
                 collector.feed(values)
     truncated = collector.finish()
