@@ -576,5 +576,70 @@ class TestFileOutputs(unittest.TestCase):
             api.write_file(ts, "summary")
 
 
+class TestPackage(unittest.TestCase):
+    def test_exports(self):
+        import hspice_parser as hp
+
+        for name in ["convert", "Header", "TraceSet", "read_header", "read_traces",
+                     "list_traces", "extract", "write_file", "summarize"]:
+            self.assertTrue(hasattr(hp, name), name)
+
+    def test_pyproject_declares_mcp_extra_and_script(self):
+        text = (HERE.parent / "pyproject.toml").read_text()
+        self.assertIn('hsp-mcp = "hspice_parser.mcp_server:main"', text)
+        self.assertIn('mcp = ["mcp>=1.0"]', text)
+
+    def test_usage_documents_api_and_mcp(self):
+        text = (HERE.parent / "Usage.md").read_text()
+        self.assertIn("hsp-mcp", text)
+        self.assertIn("list_traces", text)
+        self.assertIn("extract(", text)
+
+
+class TestMcp(unittest.TestCase):
+    def setUp(self):
+        try:
+            import mcp  # noqa: F401
+        except ImportError:
+            self.skipTest("mcp package not installed")
+        from hspice_parser import mcp_server
+
+        self.m = mcp_server
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        if hasattr(self, "tmp"):
+            self.tmp.cleanup()
+
+    def test_tools_registered(self):
+        names = {t.name for t in asyncio.run(self.m.server.list_tools())}
+        self.assertEqual(names, {"list_traces", "extract"})
+
+    def test_list_traces_tool(self):
+        out = self.m.list_traces(str(HERE / "test_9601.tr0"))
+        self.assertEqual(out["traces"], ["v_0", "v_vo", "v_vs", "i_vs"])
+
+    def test_arrays_rejected(self):
+        with self.assertRaisesRegex(ValueError, "not available over MCP"):
+            self.m.extract(str(HERE / "test_9601.tr0"), output="arrays")
+
+    def test_summary_is_json(self):
+        out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], downsample=20)
+        json.dumps(out)
+        self.assertEqual(len(out["traces"]["v_vo"][0]["x"]), 20)
+
+    def test_csv_tool_returns_path_and_counts(self):
+        dest = self.dir / "o.csv"
+        out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="csv", dest=str(dest))
+        self.assertEqual(out["path"], str(dest))
+        self.assertEqual(out["traces"], ["TIME", "v_vo"])
+        self.assertEqual(out["sweeps"], 1)
+        self.assertEqual(out["points"], [2605])
+        self.assertFalse(out["truncated"])
+        self.assertTrue(dest.exists())
+        json.dumps(out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -43,3 +43,50 @@ for filename in listdir(directory):
     if ext[:2] in ['tr', 'sw', 'ac']: 
         import_export(full_path, output_ext)
 ```
+
+# Low-memory trace API
+
+The functions below stream the file and keep only the traces you ask for, so a
+multi-gigabyte `.tr0` costs roughly the size of the selected columns in memory.
+They handle binary 9601 and 2001 files and `post=2` ASCII files.
+
+```python
+from hspice_parser import list_traces, extract
+
+list_traces("run.tr0")
+# {'path': 'run.tr0', 'format': '2001', 'analysis': 'tr', 'x': 'TIME',
+#  'traces': ['v_out', 'v_in', 'i_vdd'], 'sweep_params': ['r1'], 'sweep_count_hint': 3}
+
+ts = extract("run.tr0", ["v(out)", "i_*"])        # names: sanitized, raw HSPICE, or glob
+ts.selected                                       # ['TIME', 'v_out', 'i_vdd']
+ts.data["v_out"][0]                               # numpy array, sweep 0, native dtype
+ts.sweep_values                                   # [[1000.0], [2000.0], [3000.0]]
+
+extract("run.tr0", ["v(out)"], output="csv")      # -> 'run_tr0_traces.csv' beside the input
+extract("run.tr0", ["v(out)"], output="npz", dest="out.npz", downsample=1000)
+extract("run.tr0", ["v(out)"], output="summary", downsample=200)   # JSON-friendly stats + points
+```
+
+`sweeps=[0, 2]` keeps only those sweeps. `downsample=N` keeps `N` evenly spaced
+points per sweep (first and last always kept). If the simulator is still writing
+the file, the partial last sweep is returned and `ts.truncated` is `True`.
+
+In AC files each variable becomes two traces (`v_vo_Mag` and `v_vo_Phase`), so the
+sanitized base name `v_vo` is not selectable on its own -- pass the raw name
+`v(vo)` or a glob such as `v_vo*` to select both.
+
+# MCP server
+
+Install the extra and register the `hsp-mcp` command with your MCP client:
+
+```
+pip install 'hspice_parser[mcp]'
+```
+
+```json
+{"mcpServers": {"hspice": {"command": "hsp-mcp"}}}
+```
+
+Tools: `list_traces(path)` and `extract(path, names, sweeps, output, downsample, dest)`.
+Over MCP `output` is `summary` (default, returns statistics and downsampled points),
+`csv`, or `npz` (writes a file and returns its path); full arrays are never sent inline.
