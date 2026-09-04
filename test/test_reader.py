@@ -366,6 +366,21 @@ class TestBinaryRead(unittest.TestCase):
             np.testing.assert_array_equal(ts.data[name][0], sweeps[0][1][:, col])
             np.testing.assert_array_equal(ts.data[name][1], sweeps[2][1][:, col])
 
+    def test_bulk_buffer_is_clamped_for_huge_declared_blocks(self):
+        # 3 sweeps, 1 MB payload per block: the read buffer must be bounded by the byte cap,
+        # not FRAMES_PER_CHUNK * frame (which would be 256 MB here).
+        path, sweeps = make_multi(self.dir, "2001", block_bytes=1 << 20)
+        tracemalloc.start()
+        try:
+            ts = read_traces(path)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, reader._MAX_CHUNK_BYTES * 3 + 1_000_000, f"peak {peak} bytes")
+        for col, name in enumerate(ts.selected):
+            for i, (_, data) in enumerate(sweeps):
+                np.testing.assert_array_equal(ts.data[name][i], data[:, col])
+
     def test_mixed_block_sizes_fall_back_to_per_block(self):
         path, sweeps = make_multi(self.dir, "2001", block_bytes=[8192, 8192, 8192, 4096, 8192, 2048])
         ts = read_traces(path)

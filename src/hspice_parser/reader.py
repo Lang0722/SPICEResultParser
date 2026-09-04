@@ -23,6 +23,7 @@ _FRAME_OVERHEAD = 20            # 16-byte block head + 4-byte block tail
 _ASCII_BYTES_PER_VALUE = 13     # one HSPICE ASCII field; used only to bound the preallocation
 
 FRAMES_PER_CHUNK = 256          # frames per bulk read: 256 * (8192 + 20) bytes ≈ 2.1 MB for HSPICE's 8 KB blocks
+_MAX_CHUNK_BYTES = 4 << 20      # cap on one bulk read buffer, whatever the declared block size
 
 
 @dataclass
@@ -280,13 +281,15 @@ def _peek_block_payload(f) -> int:
 class _Collector:
     """State machine over the flat value stream: sweep-parameter prefix, points, sentinel.
 
-    Kept points are written into one preallocated buffer per selected column, so a
-    finished sweep is a view into that buffer and nothing is concatenated. `capacity`
-    is an upper bound on kept points (the caller derives it from the file size); if
-    it proves too small the buffers grow with a copy. Values are consumed per
-    segment (between sentinels, after the sweep-parameter prefix); `carry` holds the
-    values of an incomplete trailing point until the next segment completes it, and
-    an incomplete point at a sentinel or at EOF is dropped.
+    Kept points are written into one preallocated buffer per selected column, so
+    nothing is concatenated; finished sweeps are views into those buffers, unless most
+    of the capacity went unused (a selective `sweeps=`, or an over-estimate such as
+    ASCII's bytes-per-value bound), in which case `finish()` copies the kept sweeps out
+    and releases the buffers. `capacity` is an upper bound on kept points (the caller
+    derives it from the file size); if it proves too small the buffers grow with a copy.
+    Values are consumed per segment (between sentinels, after the sweep-parameter
+    prefix); `carry` holds the values of an incomplete trailing point until the next
+    segment completes it, and an incomplete point at a sentinel or at EOF is dropped.
     """
 
     def __init__(self, header: Header, cols: Sequence[int], sweeps: Optional[Iterable[int]], capacity: int):
@@ -406,7 +409,9 @@ def _feed_bulk_frames(f, header: Header, collector: _Collector, block_payload: i
     and keep their existing semantics.
     """
     frame = block_payload + _FRAME_OVERHEAD
-    buf = bytearray(FRAMES_PER_CHUNK * frame)
+    remaining = max(0, os.fstat(f.fileno()).st_size - f.tell())
+    nframes = max(1, min(FRAMES_PER_CHUNK, _MAX_CHUNK_BYTES // frame, -(-remaining // frame)))
+    buf = bytearray(nframes * frame)
     while True:
         got = f.readinto(buf)
         if not got:
@@ -420,7 +425,8 @@ def _feed_bulk_frames(f, header: Header, collector: _Collector, block_payload: i
             bad = np.flatnonzero((heads != block_payload) | (tails != block_payload))
             stop = int(bad[0]) if bad.size else nfull
             if stop:
-                values = np.ascontiguousarray(u8[:stop, 16:16 + block_payload]).view(header.dtype).ravel()
+                # copy: the collector must never hold a view into buf across readinto calls
+                values = u8[:stop, 16:16 + block_payload].copy().view(header.dtype).ravel()
                 collector.feed(values)
                 index += stop
         if stop < nfull or got < len(buf):

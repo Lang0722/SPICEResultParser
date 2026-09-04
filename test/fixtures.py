@@ -58,6 +58,8 @@ def write_binary(path, version, raw_names, type_codes, sweeps, block_bytes=8192,
         stream = stream[:len(stream) - drop_tail]
     raw = stream.tobytes()
     sizes = list(block_bytes) if isinstance(block_bytes, (list, tuple)) else [int(block_bytes)]
+    if any(s <= 0 for s in sizes):
+        raise ValueError("block_bytes entries must be positive")
     with open(path, "wb") as f:
         f.write(_block(text.encode("utf-8")))
         offset = 0
