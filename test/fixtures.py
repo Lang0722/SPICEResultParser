@@ -40,6 +40,8 @@ def write_binary(path, version, raw_names, type_codes, sweeps, block_bytes=8192,
     ncols is the reader's column count (for AC: 1 + 2 * dependent variables).
     final_sentinel=False omits the last sweep's 1e30 terminator; drop_tail removes
     that many trailing values from the stream (to leave a partial point).
+    block_bytes: payload size per block, or a sequence of sizes cycled through
+    (to build files with non-uniform blocks).
     Returns the flat value stream that was written.
     """
     dtype = np.dtype("<f4") if version == "9601" else np.dtype("<f8")
@@ -55,10 +57,16 @@ def write_binary(path, version, raw_names, type_codes, sweeps, block_bytes=8192,
     if drop_tail:
         stream = stream[:len(stream) - drop_tail]
     raw = stream.tobytes()
+    sizes = list(block_bytes) if isinstance(block_bytes, (list, tuple)) else [int(block_bytes)]
     with open(path, "wb") as f:
         f.write(_block(text.encode("utf-8")))
-        for i in range(0, len(raw), block_bytes):
-            f.write(_block(raw[i:i + block_bytes]))
+        offset = 0
+        k = 0
+        while offset < len(raw):
+            size = sizes[k % len(sizes)]
+            f.write(_block(raw[offset:offset + size]))
+            offset += size
+            k += 1
     return stream
 
 

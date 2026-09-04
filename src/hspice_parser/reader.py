@@ -22,6 +22,8 @@ _TERMINATOR = "$&%#"
 _FRAME_OVERHEAD = 20            # 16-byte block head + 4-byte block tail
 _ASCII_BYTES_PER_VALUE = 13     # one HSPICE ASCII field; used only to bound the preallocation
 
+FRAMES_PER_CHUNK = 256          # frames per bulk read: 256 * (8192 + 20) bytes ≈ 2.1 MB for HSPICE's 8 KB blocks
+
 
 @dataclass
 class Header:
@@ -256,6 +258,8 @@ def _binary_capacity(file_size: int, data_start: int, block_payload: int, ncols:
     frame = max(1, block_payload) + _FRAME_OVERHEAD
     nframes = -(-remaining // frame)
     payload = max(0, remaining - nframes * _FRAME_OVERHEAD)
+    # Assumes every full frame carries the peeked `block_payload`; a file whose later
+    # blocks are larger under-estimates, and _Collector._grow covers the shortfall.
     return payload // itemsize // ncols + 1
 
 
@@ -372,11 +376,16 @@ class _Collector:
                 RuntimeWarning,
             )
             self._end_sweep()
+        if 2 * self.fill < self.capacity:
+            # A selective read (sweeps=) or a badly over-estimated capacity left most of the
+            # buffer unused; copy the kept sweeps out so the TraceSet does not pin it.
+            for c in self.cols:
+                self.data[c] = [arr.copy() for arr in self.data[c]]
+            self.buf = {}
         return truncated
 
 
-def _iter_binary_blocks(f, header: Header) -> Iterator[np.ndarray]:
-    index = 1
+def _iter_binary_blocks(f, header: Header, index: int = 1) -> Iterator[np.ndarray]:
     while True:
         payload = _read_block(f, index, header.dtype.itemsize)
         if payload is None:
@@ -385,6 +394,38 @@ def _iter_binary_blocks(f, header: Header) -> Iterator[np.ndarray]:
             raise ValueError(f"block {index}: {len(payload)} bytes is not a multiple of {header.dtype.itemsize}")
         yield np.frombuffer(payload, header.dtype)
         index += 1
+
+
+def _feed_bulk_frames(f, header: Header, collector: _Collector, block_payload: int, index: int) -> int:
+    """Feed uniform, well-framed blocks of `block_payload` bytes to the collector in large slabs.
+
+    Frames are validated vectorially (head size and tail size both equal to
+    `block_payload`). Returns the index of the first block not consumed, with f
+    positioned at its head, so the per-block reader can finish the file: the short
+    last block, odd-sized blocks, corruption, or a truncated file all end up there
+    and keep their existing semantics.
+    """
+    frame = block_payload + _FRAME_OVERHEAD
+    buf = bytearray(FRAMES_PER_CHUNK * frame)
+    while True:
+        got = f.readinto(buf)
+        if not got:
+            return index
+        nfull = got // frame
+        stop = 0
+        if nfull:
+            u8 = np.frombuffer(buf, np.uint8, count=nfull * frame).reshape(nfull, frame)
+            heads = u8[:, 12:16].copy().view("<i4").ravel()
+            tails = u8[:, frame - 4:frame].copy().view("<i4").ravel()
+            bad = np.flatnonzero((heads != block_payload) | (tails != block_payload))
+            stop = int(bad[0]) if bad.size else nfull
+            if stop:
+                values = np.ascontiguousarray(u8[:stop, 16:16 + block_payload]).view(header.dtype).ravel()
+                collector.feed(values)
+                index += stop
+        if stop < nfull or got < len(buf):
+            f.seek(-(got - stop * frame), 1)
+            return index
 
 
 def read_traces(path, names=None, sweeps=None) -> TraceSet:
@@ -400,10 +441,14 @@ def read_traces(path, names=None, sweeps=None) -> TraceSet:
             cols = resolve_columns(header, names)
             data_start = f.tell()
             file_size = os.fstat(f.fileno()).st_size
-            capacity = _binary_capacity(file_size, data_start, _peek_block_payload(f),
+            block_payload = _peek_block_payload(f)
+            capacity = _binary_capacity(file_size, data_start, block_payload,
                                         header.ncols, header.dtype.itemsize)
             collector = _Collector(header, cols, sweeps, capacity)
-            for block in _iter_binary_blocks(f, header):
+            index = 1
+            if block_payload > 0 and block_payload % header.dtype.itemsize == 0:
+                index = _feed_bulk_frames(f, header, collector, block_payload, index)
+            for block in _iter_binary_blocks(f, header, index):
                 collector.feed(block)
     else:
         with open(path, "r", encoding="utf-8", errors="replace") as f:

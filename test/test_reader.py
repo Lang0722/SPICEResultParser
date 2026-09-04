@@ -331,6 +331,8 @@ class TestBinaryRead(unittest.TestCase):
     def test_kept_sweeps_are_views_of_one_buffer(self):
         path, _ = make_multi(self.dir, "2001")
         ts = read_traces(path, ["v_a"])
+        for arr in ts.data["v_a"]:
+            self.assertIsNotNone(arr.base)
         bases = {id(arr.base) for arr in ts.data["v_a"]}
         self.assertEqual(len(bases), 1)
         self.assertEqual(sum(a.size for a in ts.data["v_a"]), 1500 + 977 + 2310)
@@ -350,6 +352,57 @@ class TestBinaryRead(unittest.TestCase):
         self.assertEqual(reader._binary_capacity(16424 + 100, 100, 8192, 20, 8), 16384 // 8 // 20 + 1)
         self.assertEqual(reader._binary_capacity(100, 100, 8192, 20, 8), 1)
         self.assertEqual(reader._ascii_capacity(13 * 40 + 200, 4), (13 * 40 + 200) // 13 // 4 + 1)
+
+    def test_bulk_path_with_tiny_chunks(self):
+        path, sweeps = make_multi(self.dir, "2001")
+        original = reader.FRAMES_PER_CHUNK
+        reader.FRAMES_PER_CHUNK = 3
+        self.addCleanup(setattr, reader, "FRAMES_PER_CHUNK", original)
+        ts = read_traces(path, ["v_c", "i_f"], sweeps=[0, 2])
+        self.assertEqual(ts.sweep_indices, [0, 2])
+        self.assertEqual(ts.sweep_values, [[1000.0], [3000.0]])
+        self.assertFalse(ts.truncated)
+        for name, col in (("TIME", 0), ("v_c", 3), ("i_f", 6)):
+            np.testing.assert_array_equal(ts.data[name][0], sweeps[0][1][:, col])
+            np.testing.assert_array_equal(ts.data[name][1], sweeps[2][1][:, col])
+
+    def test_mixed_block_sizes_fall_back_to_per_block(self):
+        path, sweeps = make_multi(self.dir, "2001", block_bytes=[8192, 8192, 8192, 4096, 8192, 2048])
+        ts = read_traces(path)
+        self.assertEqual(ts.sweep_indices, [0, 1, 2])
+        for col, name in enumerate(ts.selected):
+            for i, (_, data) in enumerate(sweeps):
+                np.testing.assert_array_equal(ts.data[name][i], data[:, col])
+
+    def test_corruption_deep_in_a_chunk_names_the_block(self):
+        path, _ = make_multi(self.dir, "9601")
+        b = bytearray(path.read_bytes())
+        n0 = struct.unpack("<i", b[12:16])[0]
+        off = 20 + n0 + 4 * (8192 + 20)          # head of data block 5
+        size = struct.unpack("<i", b[off + 12:off + 16])[0]
+        self.assertEqual(size, 8192)
+        tail = off + 16 + size
+        b[tail:tail + 4] = struct.pack("<i", size + 4)
+        path.write_bytes(bytes(b))
+        with self.assertRaisesRegex(ValueError, "block 5: tail length"):
+            read_traces(path)
+
+    def test_bulk_and_sample_files_agree_on_block_boundaries(self):
+        # test_9601.tr0 has six 8192-byte blocks and one short block: bulk path then per-block hand-off.
+        ts = read_traces(HERE / "test_9601.tr0")
+        with open(HERE / "data_dict_9601.pickle", "rb") as f:
+            old = pickle.load(f)
+        np.testing.assert_array_equal(ts.data["i_vs"][0].astype(np.float64), np.asarray(old["i_vs"][0]))
+
+    def test_selective_sweeps_do_not_pin_the_whole_buffer(self):
+        path, sweeps = make_multi(self.dir, "2001")
+        ts = read_traces(path, ["v_a"], sweeps=[1])
+        self.assertEqual(ts.sweep_indices, [1])
+        for name in ("TIME", "v_a"):
+            arr = ts.data[name][0]
+            self.assertIsNone(arr.base)                 # owns its memory: the file-sized buffer is released
+            self.assertEqual(arr.size, 977)
+        np.testing.assert_array_equal(ts.data["v_a"][0], sweeps[1][1][:, 1])
 
 
 class TestDuplicateNames(unittest.TestCase):
@@ -455,7 +508,8 @@ class TestSelection(unittest.TestCase):
         _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
         selected_bytes = 2 * npoints * 4                                 # TIME + v_7 as float32
-        self.assertLess(peak, 3 * selected_bytes + 1_000_000, f"peak {peak} bytes")
+        chunk_bytes = reader.FRAMES_PER_CHUNK * (8192 + 20)              # one bulk read buffer
+        self.assertLess(peak, selected_bytes + 3 * chunk_bytes + 1_000_000, f"peak {peak} bytes")
         self.assertEqual(ts.selected, ["TIME", "v_7"])
         np.testing.assert_array_equal(ts.data["v_7"][0], expected)
 
