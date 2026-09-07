@@ -40,6 +40,8 @@ def _tool_errors(fn):
             raise
         except _REPORTED as exc:
             raise ToolError(str(exc)) from exc
+        except Exception as exc:                 # unexpected: still better than a bare "Error executing tool"
+            raise ToolError(f"{type(exc).__name__}: {exc}") from exc
     wrapper.__name__ = fn.__name__
     wrapper.__doc__ = fn.__doc__
     wrapper.__annotations__ = fn.__annotations__
@@ -72,8 +74,9 @@ def extract(path: str, names: Optional[List[str]] = None, sweeps: Optional[List[
             evenly spaced x/y points; "csv" or "npz" write a file and return its path;
             "png" writes a plot image (one line per trace per sweep) and returns its path
             and pixel size. "arrays" is not available over MCP.
-    downsample: evenly spaced points kept per sweep (summary points, or csv/npz/png rows);
-            None keeps every point, except for "summary", which defaults to 200.
+    downsample: evenly spaced points kept per sweep. None keeps every point for csv and
+            npz. "summary" defaults to 200 and never returns more than 20000 points in
+            total; "png" draws at most 5000 points per line whatever downsample says.
     dest: output file path for csv/npz/png; default is beside the input file.
     xrange: [min, max] on the x variable (TIME, FREQ, sweep variable); only rows inside
             the closed interval are kept, for every output.

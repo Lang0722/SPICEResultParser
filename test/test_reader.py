@@ -904,8 +904,35 @@ class TestApi(unittest.TestCase):
         api.SUMMARY_MAX_POINTS = 100
         self.addCleanup(setattr, api, "SUMMARY_MAX_POINTS", original)
         out = api.extract(self.path, ["v_a"], output="summary", downsample=10_000_000)
-        self.assertEqual(len(out["traces"]["v_a"][2]["x"]), 100)
+        self.assertEqual(len(out["traces"]["v_a"][2]["x"]), 100 // 3)     # budget shared by 3 sweeps
         self.assertEqual(out["traces"]["v_a"][2]["count"], 2310)
+
+    def test_summary_json_has_no_nan_tokens(self):
+        d = np.arange(12.0).reshape(6, 2)
+        d[2, 1] = np.nan
+        sweeps = [([0.0, 10.0], d), ([1.0, 11.0], d), ([2.0, 12.0], np.empty((0, 2)))]
+        path = self.dir / "ragged.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(a", "p0", "p1"], [1, 1], sweeps,
+                              final_sentinel=False, drop_tail=1)
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            out = api.extract(path, output="summary", downsample=100)
+        json.dumps(out, allow_nan=False)                        # strict JSON must accept it
+        self.assertEqual(out["sweep_values"][2], [2.0, None])
+        self.assertIsNone(out["traces"]["v_a"][0]["y"][2])
+        self.assertIsNone(out["traces"]["v_a"][0]["min"])      # NaN poisons the statistics too
+
+    def test_summary_cap_is_a_total_budget(self):
+        original = api.SUMMARY_MAX_POINTS
+        api.SUMMARY_MAX_POINTS = 60                             # 2 traces x 3 sweeps -> 10 points each
+        self.addCleanup(setattr, api, "SUMMARY_MAX_POINTS", original)
+        out = api.extract(self.path, ["v_a", "v_b"], output="summary", downsample=1000)
+        sizes = [len(e["x"]) for name in ("v_a", "v_b") for e in out["traces"][name]]
+        self.assertEqual(sizes, [10] * 6)
+
+    def test_default_caps(self):
+        self.assertEqual(api.SUMMARY_MAX_POINTS, 20000)
+        self.assertEqual(api.PLOT_MAX_POINTS, 5000)
 
 class TestFileOutputs(unittest.TestCase):
     def setUp(self):
@@ -1108,6 +1135,30 @@ class TestFileOutputs(unittest.TestCase):
         self.assertEqual(first.get_xdata()[0], ts.data["TIME"][0][0])
         self.assertEqual(first.get_xdata()[-1], ts.data["TIME"][0][-1])
 
+    def test_npz_trace_names_that_collide_with_savez_parameters(self):
+        d = np.arange(12.0).reshape(4, 3)
+        path = self.dir / "names.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "file", "allow_pickle"], [1, 1, 1], [([], d)])
+        dest = self.dir / "names.npz"
+        api.extract(path, output="npz", dest=dest)
+        with np.load(dest) as z:
+            self.assertEqual(set(z.files), {"TIME", "file", "allow_pickle", "__sweep_values__", "__sweep_params__"})
+            np.testing.assert_array_equal(z["allow_pickle"], d[:, 2])
+            self.assertEqual(z["__sweep_values__"].shape, (1, 0))
+
+    def test_csv_header_quotes_names_with_commas(self):
+        import csv
+        d = np.arange(8.0).reshape(4, 2)
+        path = self.dir / "diff.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(a,b"], [1, 1], [([], d)])
+        dest = self.dir / "diff.csv"
+        ts = api.extract(path)
+        self.assertIn(",", ts.selected[1])
+        api.extract(path, output="csv", dest=dest)
+        rows = list(csv.reader(dest.read_text().splitlines()))
+        self.assertEqual(rows[0], ts.selected)
+        self.assertTrue(all(len(r) == 2 for r in rows))
+
 class TestPackage(unittest.TestCase):
     def test_exports(self):
         import hspice_parser as hp
@@ -1218,6 +1269,15 @@ class TestMcp(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "must be one of"):
             asyncio.run(self.m.server.call_tool("extract", {"path": str(HERE / "test_9601.tr0"),
                                                              "output": "xlsx"}))
+
+    def test_unexpected_errors_carry_their_type(self):
+        original = self.m.api.list_traces
+        def boom(path):
+            raise KeyError("boom")
+        self.m.api.list_traces = boom
+        self.addCleanup(setattr, self.m.api, "list_traces", original)
+        with self.assertRaisesRegex(self.m.ToolError, "KeyError: 'boom'"):
+            self.m.list_traces("whatever")
 
 if __name__ == "__main__":
     unittest.main()

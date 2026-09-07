@@ -1,8 +1,11 @@
 """User-facing API over reader.py: list traces, extract a subset, summarise, write files."""
 from __future__ import annotations
 
+import csv
+import math
 import os
-from typing import Optional, Sequence, Tuple
+import zipfile
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -64,19 +67,31 @@ def _decimate(ts: TraceSet, downsample: int) -> None:
             ts.data[name][i] = ts.data[name][i][idx]
 
 
-SUMMARY_MAX_POINTS = 20000      # cap on x/y points serialised per trace and sweep, whatever downsample says
+SUMMARY_MAX_POINTS = 20000      # cap on x/y points serialised in one summary, over all traces and sweeps
+
+
+def _json_float(v) -> Optional[float]:
+    """float, or None for NaN and infinities (strict JSON has no token for them)."""
+    v = float(v)
+    return v if math.isfinite(v) else None
+
+
+def _json_floats(arr) -> List[Optional[float]]:
+    return [_json_float(v) for v in np.asarray(arr, dtype=np.float64).tolist()]
 
 
 def summarize(ts: TraceSet, downsample: Optional[int] = None) -> dict:
     """JSON-serialisable statistics per trace and sweep; stats use the full trace, points are decimated.
 
     Points are emitted only when downsample is given, and never more than SUMMARY_MAX_POINTS
-    per trace and sweep (a summary is for looking at, not for moving data).
+    in total: the budget is shared evenly by the (trace, sweep) series (a summary is for
+    looking at, not for moving data). NaN and infinities are emitted as null.
     """
     h = ts.header
     x = ts.data[h.x_name]
     if downsample is not None:
-        downsample = min(downsample, SUMMARY_MAX_POINTS)
+        series = max(1, (len(ts.selected) - 1) * len(ts.sweep_values))
+        downsample = min(downsample, max(2, SUMMARY_MAX_POINTS // series))
     traces = {}
     for name in ts.selected[1:]:
         per_sweep = []
@@ -84,18 +99,18 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None) -> dict:
             a = np.asarray(arr, dtype=np.float64)
             entry = {"count": int(a.size)}
             if a.size:
-                entry.update(min=float(a.min()), max=float(a.max()), mean=float(a.mean()),
-                             first=float(a[0]), last=float(a[-1]))
+                entry.update(min=_json_float(a.min()), max=_json_float(a.max()), mean=_json_float(a.mean()),
+                             first=_json_float(a[0]), last=_json_float(a[-1]))
                 if downsample is not None:
                     idx = decimation_indices(a.size, downsample)
                     xs, ys = (x[i], a) if idx is None else (x[i][idx], a[idx])
-                    entry["x"] = np.asarray(xs, dtype=np.float64).tolist()
-                    entry["y"] = ys.tolist()
+                    entry["x"] = _json_floats(xs)
+                    entry["y"] = _json_floats(ys)
             per_sweep.append(entry)
         traces[name] = per_sweep
     return {
         "path": h.path, "format": h.version, "analysis": h.analysis, "x": h.x_name,
-        "sweep_params": h.sweep_params, "sweep_values": ts.sweep_values,
+        "sweep_params": h.sweep_params, "sweep_values": [_json_floats(v) for v in ts.sweep_values],
         "sweeps": len(ts.sweep_values), "sweep_indices": list(ts.sweep_indices),
         "truncated": ts.truncated, "traces": traces,
     }
@@ -115,7 +130,7 @@ def _write_csv(ts: TraceSet, dest: str) -> None:
     with_lead = bool(h.nsweepparam) or len(ts.sweep_values) > 1
     lead_names = (["sweep"] + h.sweep_params) if with_lead else []
     with open(dest, "w", newline="") as f:
-        f.write(",".join(lead_names + ts.selected) + "\n")
+        csv.writer(f, lineterminator="\n").writerow(lead_names + ts.selected)   # quotes names containing ","
         for i, params in enumerate(ts.sweep_values):
             n = ts.data[ts.selected[0]][i].size
             sweep_id = ts.sweep_indices[i]
@@ -141,8 +156,12 @@ def _write_npz(ts: TraceSet, dest: str) -> None:
         sweep_values[i, :len(values)] = values
     arrays["__sweep_values__"] = sweep_values
     arrays["__sweep_params__"] = np.asarray(ts.header.sweep_params, dtype=str)
-    with open(dest, "wb") as f:            # file object: np.savez must not append ".npz"
-        np.savez(f, **arrays)
+    # Written entry by entry rather than via np.savez(**arrays): trace names such as
+    # "file" or "allow_pickle" would collide with savez's own parameters.
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
+        for key, arr in arrays.items():
+            with zf.open(key + ".npy", "w", force_zip64=True) as member:
+                np.save(member, np.asarray(arr))
 
 
 MAX_LEGEND_ENTRIES = 24
@@ -161,8 +180,8 @@ def make_figure(ts: TraceSet, yrange: Optional[Tuple[float, float]] = None, titl
     """A matplotlib Figure with one line per trace per sweep; log x axis for AC results.
 
     Lines longer than PLOT_MAX_POINTS are decimated to evenly spaced points (first and
-    last kept) before drawing; a spike narrower than the stride can be missed. Pass a
-    larger explicit `downsample` to `extract`, or plot a narrower `xrange`, to see it.
+    last kept) before drawing, so a spike narrower than the stride can be missed. Plot a
+    narrower `xrange` around it, or raise `api.PLOT_MAX_POINTS`, to see it.
     """
     Figure = _require_matplotlib()
     h = ts.header
