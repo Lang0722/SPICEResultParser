@@ -15,12 +15,40 @@ except ImportError:
     except ImportError as exc:  # pragma: no cover
         raise ImportError("MCP support needs the optional dependency: pip install 'hspice_parser[mcp]'") from exc
 
+try:
+    from mcp.server.mcpserver.exceptions import ToolError
+except ImportError:
+    try:
+        from mcp.server.fastmcp.exceptions import ToolError
+    except ImportError:  # pragma: no cover
+        ToolError = ValueError
+
 from . import api
 
 server = FastMCP("hspice-parser")
 
+_REPORTED = (ValueError, OSError, ImportError)   # errors whose text the client should see
+
+
+def _tool_errors(fn):
+    """The mcp server forwards only ToolError text to the client; anything else becomes a bare
+    'Error executing tool'. Re-raise the errors we mean the agent to read."""
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ToolError:
+            raise
+        except _REPORTED as exc:
+            raise ToolError(str(exc)) from exc
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    wrapper.__annotations__ = fn.__annotations__
+    wrapper.__wrapped__ = fn
+    return wrapper
+
 
 @server.tool()
+@_tool_errors
 def list_traces(path: str) -> dict:
     """List trace names in an HSPICE .tr*/.sw*/.ac* result file (binary 9601/2001 or ASCII).
 
@@ -31,6 +59,7 @@ def list_traces(path: str) -> dict:
 
 
 @server.tool()
+@_tool_errors
 def extract(path: str, names: Optional[List[str]] = None, sweeps: Optional[List[int]] = None,
             output: str = "summary", downsample: Optional[int] = None, dest: Optional[str] = None,
             xrange: Optional[List[float]] = None, yrange: Optional[List[float]] = None) -> dict:

@@ -529,6 +529,59 @@ class TestBinaryRead(unittest.TestCase):
                                 np.testing.assert_array_equal(a, b)
 
 
+    def test_incomplete_point_is_dropped_at_a_sweep_boundary(self):
+        # Sweep 0 ends with 3 stray values before its sentinel; sweep 1 must start clean.
+        path, _ = make_multi(self.dir, "2001")
+        header = read_header(path)
+        c = reader._Collector(header, list(range(7)), None, capacity=8)
+        sweep0 = [1000.0] + list(range(14)) + [90.0, 91.0, 92.0] + [1e30]
+        sweep1 = [2000.0] + [float(v) for v in range(100, 107)] + [1e30]
+        c.feed(np.array(sweep0 + sweep1, dtype=np.float64))
+        self.assertFalse(c.finish())
+        self.assertEqual([a.size for a in c.data[0]], [2, 1])
+        np.testing.assert_array_equal(np.stack([c.data[k][1] for k in range(7)], axis=1)[0],
+                                      np.arange(100.0, 107.0))
+        np.testing.assert_array_equal(np.stack([c.data[k][0] for k in range(7)], axis=1),
+                                      np.arange(14.0).reshape(2, 7))
+
+    def test_partial_sweep_parameter_prefix_is_padded_with_nan(self):
+        names = ["TIME", "v(a", "p0", "p1"]
+        d = np.arange(12.0).reshape(6, 2)
+        sweeps = [([0.0, 10.0], d), ([1.0, 11.0], d), ([2.0, 12.0], np.empty((0, 2)))]
+        path = self.dir / "ragged.tr0"
+        fixtures.write_binary(path, "2001", names, [1, 1], sweeps, final_sentinel=False, drop_tail=1)
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            ts = read_traces(path)
+        self.assertTrue(ts.truncated)
+        self.assertEqual(ts.sweep_values[:2], [[0.0, 10.0], [1.0, 11.0]])
+        self.assertEqual(ts.sweep_values[2][0], 2.0)
+        self.assertTrue(np.isnan(ts.sweep_values[2][1]))
+        self.assertEqual(ts.data["v_a"][2].size, 0)
+
+    def test_nan_values_do_not_hide_the_sentinel(self):
+        d1 = np.arange(21.0).reshape(3, 7)
+        d1[1, 3] = np.nan
+        d2 = np.arange(100.0, 114.0).reshape(2, 7)
+        path = self.dir / "nan.tr0"
+        fixtures.write_binary(path, "2001", MULTI_NAMES, [1, 1, 1, 1, 1, 8, 8], [([1.0], d1), ([2.0], d2)])
+        ts = read_traces(path)
+        self.assertEqual(ts.sweep_values, [[1.0], [2.0]])
+        np.testing.assert_array_equal(ts.data["v_c"][0], d1[:, 3])      # NaN compares equal here
+        np.testing.assert_array_equal(ts.data["TIME"][1], d2[:, 0])
+
+    def test_resolve_columns_is_fast_for_wide_headers(self):
+        import time
+        header = read_header(make_multi(self.dir, "2001")[0])
+        names = ["TIME"] + [f"v_{i}" for i in range(20000)]
+        wide = reader.Header(path=header.path, is_binary=True, version="2001", analysis="tr", ncols=len(names),
+                             nsweepparam=0, sweep_count_hint=0, x_name="TIME", names=names,
+                             raw_names=names, col_raw_names=names, type_codes=[1] * len(names), sweep_params=[])
+        t = time.perf_counter()
+        cols = reader.resolve_columns(wide, [f"v_{i}" for i in range(0, 20000, 2)])
+        self.assertEqual(len(cols), 10001)
+        self.assertLess(time.perf_counter() - t, 1.0)
+
 class TestDuplicateNames(unittest.TestCase):
     """`.` and `:` both sanitize to `_`, so distinct HSPICE names can collide."""
 
@@ -713,6 +766,18 @@ class TestAsciiRead(unittest.TestCase):
         self.assertEqual(ts.data["TIME"][0].size, 7)
 
 
+    def test_batching_does_not_change_ascii_results(self):
+        path, sweeps = make_ascii(self.dir)
+        full = read_traces(path)
+        original = reader.ASCII_BATCH_VALUES
+        reader.ASCII_BATCH_VALUES = 7                      # not a multiple of the column count
+        self.addCleanup(setattr, reader, "ASCII_BATCH_VALUES", original)
+        small = read_traces(path)
+        self.assertEqual(full.sweep_values, small.sweep_values)
+        for name in full.selected:
+            for a, b in zip(full.data[name], small.data[name]):
+                np.testing.assert_array_equal(a, b)
+
 class TestApi(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -833,6 +898,14 @@ class TestApi(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "yrange"):
                 api.extract(self.dir / "missing.tr0", yrange=bad)
 
+
+    def test_summary_points_are_capped(self):
+        original = api.SUMMARY_MAX_POINTS
+        api.SUMMARY_MAX_POINTS = 100
+        self.addCleanup(setattr, api, "SUMMARY_MAX_POINTS", original)
+        out = api.extract(self.path, ["v_a"], output="summary", downsample=10_000_000)
+        self.assertEqual(len(out["traces"]["v_a"][2]["x"]), 100)
+        self.assertEqual(out["traces"]["v_a"][2]["count"], 2310)
 
 class TestFileOutputs(unittest.TestCase):
     def setUp(self):
@@ -983,6 +1056,58 @@ class TestFileOutputs(unittest.TestCase):
         self.assertEqual(len(fig.axes[0].get_lines()), 2)
 
 
+    def test_csv_lead_column_without_sweep_params(self):
+        d = np.arange(12.0).reshape(4, 3)
+        path = self.dir / "nosp.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(a", "v(b"], [1, 1, 1], [([], d), ([], d + 100)])
+        dest = self.dir / "nosp.csv"
+        api.extract(path, output="csv", dest=dest)
+        lines = dest.read_text().splitlines()
+        self.assertEqual(lines[0], "sweep,TIME,v_a,v_b")
+        self.assertEqual(len(lines), 9)
+        self.assertTrue(lines[-1].startswith("1,"))
+
+    def test_npz_survives_partial_sweep_parameter_prefix(self):
+        names = ["TIME", "v(a", "p0", "p1"]
+        d = np.arange(12.0).reshape(6, 2)
+        sweeps = [([0.0, 10.0], d), ([1.0, 11.0], d), ([2.0, 12.0], np.empty((0, 2)))]
+        path = self.dir / "ragged.tr0"
+        fixtures.write_binary(path, "2001", names, [1, 1], sweeps, final_sentinel=False, drop_tail=1)
+        dest = self.dir / "ragged.npz"
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            api.extract(path, output="npz", dest=dest)
+        with np.load(dest) as z:
+            sv = z["__sweep_values__"]
+        self.assertEqual(sv.shape, (3, 2))
+        self.assertEqual(sv[2, 0], 2.0)
+        self.assertTrue(np.isnan(sv[2, 1]))
+
+    def test_figure_applies_yrange(self):
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest("matplotlib not installed")
+        ts = read_traces(self.path, ["v_a"])
+        fig = api.make_figure(ts, yrange=(-1.0, 1.0))
+        self.assertEqual(fig.axes[0].get_ylim(), (-1.0, 1.0))
+
+    def test_figure_decimates_long_traces(self):
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest("matplotlib not installed")
+        original = api.PLOT_MAX_POINTS
+        api.PLOT_MAX_POINTS = 50
+        self.addCleanup(setattr, api, "PLOT_MAX_POINTS", original)
+        ts = read_traces(self.path, ["v_a"])
+        fig = api.make_figure(ts)
+        sizes = [line.get_xdata().size for line in fig.axes[0].get_lines()]
+        self.assertEqual(sizes, [50, 50, 50])
+        first = fig.axes[0].get_lines()[0]
+        self.assertEqual(first.get_xdata()[0], ts.data["TIME"][0][0])
+        self.assertEqual(first.get_xdata()[-1], ts.data["TIME"][0][-1])
+
 class TestPackage(unittest.TestCase):
     def test_exports(self):
         import hspice_parser as hp
@@ -1028,11 +1153,11 @@ class TestMcp(unittest.TestCase):
         self.assertEqual(out["traces"], ["v_0", "v_vo", "v_vs", "i_vs"])
 
     def test_arrays_rejected(self):
-        with self.assertRaisesRegex(ValueError, "not available over MCP"):
+        with self.assertRaisesRegex(self.m.ToolError, "not available over MCP"):
             self.m.extract(str(HERE / "test_9601.tr0"), output="arrays")
 
     def test_bad_output_rejected_before_reading(self):
-        with self.assertRaisesRegex(ValueError, "summary"):
+        with self.assertRaisesRegex(self.m.ToolError, "summary"):
             self.m.extract(str(HERE / "test_9601.tr0"), output="xlsx")
 
     def test_summary_is_json(self):
@@ -1082,9 +1207,17 @@ class TestMcp(unittest.TestCase):
         self.assertEqual(len(dest.read_text().splitlines()), 11)
 
     def test_bad_range_rejected_before_reading(self):
-        with self.assertRaisesRegex(ValueError, "xrange"):
+        with self.assertRaisesRegex(self.m.ToolError, "xrange"):
             self.m.extract(str(self.dir / "missing.tr0"), output="csv", xrange=[1.0])
 
+
+    def test_error_text_reaches_the_client(self):
+        with self.assertRaisesRegex(Exception, "available traces"):
+            asyncio.run(self.m.server.call_tool("extract", {"path": str(HERE / "test_9601.tr0"),
+                                                             "names": ["nope"], "output": "csv"}))
+        with self.assertRaisesRegex(Exception, "must be one of"):
+            asyncio.run(self.m.server.call_tool("extract", {"path": str(HERE / "test_9601.tr0"),
+                                                             "output": "xlsx"}))
 
 if __name__ == "__main__":
     unittest.main()

@@ -64,15 +64,24 @@ def _decimate(ts: TraceSet, downsample: int) -> None:
             ts.data[name][i] = ts.data[name][i][idx]
 
 
+SUMMARY_MAX_POINTS = 20000      # cap on x/y points serialised per trace and sweep, whatever downsample says
+
+
 def summarize(ts: TraceSet, downsample: Optional[int] = None) -> dict:
-    """JSON-serialisable statistics per trace and sweep; stats use the full trace, points are decimated."""
+    """JSON-serialisable statistics per trace and sweep; stats use the full trace, points are decimated.
+
+    Points are emitted only when downsample is given, and never more than SUMMARY_MAX_POINTS
+    per trace and sweep (a summary is for looking at, not for moving data).
+    """
     h = ts.header
     x = ts.data[h.x_name]
+    if downsample is not None:
+        downsample = min(downsample, SUMMARY_MAX_POINTS)
     traces = {}
     for name in ts.selected[1:]:
         per_sweep = []
         for i, arr in enumerate(ts.data[name]):
-            a = arr.astype(np.float64)
+            a = np.asarray(arr, dtype=np.float64)
             entry = {"count": int(a.size)}
             if a.size:
                 entry.update(min=float(a.min()), max=float(a.max()), mean=float(a.mean()),
@@ -80,7 +89,7 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None) -> dict:
                 if downsample is not None:
                     idx = decimation_indices(a.size, downsample)
                     xs, ys = (x[i], a) if idx is None else (x[i][idx], a[idx])
-                    entry["x"] = xs.astype(np.float64).tolist()
+                    entry["x"] = np.asarray(xs, dtype=np.float64).tolist()
                     entry["y"] = ys.tolist()
             per_sweep.append(entry)
         traces[name] = per_sweep
@@ -127,14 +136,17 @@ def _write_npz(ts: TraceSet, dest: str) -> None:
     for name in ts.selected:
         for i, arr in enumerate(ts.data[name]):
             arrays[name if single else f"{name}@{ts.sweep_indices[i]}"] = arr
-    arrays["__sweep_values__"] = np.asarray(ts.sweep_values, dtype=np.float64).reshape(
-        len(ts.sweep_values), ts.header.nsweepparam)
+    sweep_values = np.full((len(ts.sweep_values), ts.header.nsweepparam), np.nan)
+    for i, values in enumerate(ts.sweep_values):
+        sweep_values[i, :len(values)] = values
+    arrays["__sweep_values__"] = sweep_values
     arrays["__sweep_params__"] = np.asarray(ts.header.sweep_params, dtype=str)
     with open(dest, "wb") as f:            # file object: np.savez must not append ".npz"
         np.savez(f, **arrays)
 
 
 MAX_LEGEND_ENTRIES = 24
+PLOT_MAX_POINTS = 5000          # points drawn per line; a 1200 px wide figure cannot show more
 
 
 def _require_matplotlib():
@@ -146,7 +158,12 @@ def _require_matplotlib():
 
 
 def make_figure(ts: TraceSet, yrange: Optional[Tuple[float, float]] = None, title: Optional[str] = None):
-    """A matplotlib Figure with one line per trace per sweep; log x axis for AC results."""
+    """A matplotlib Figure with one line per trace per sweep; log x axis for AC results.
+
+    Lines longer than PLOT_MAX_POINTS are decimated to evenly spaced points (first and
+    last kept) before drawing; a spike narrower than the stride can be missed. Pass a
+    larger explicit `downsample` to `extract`, or plot a narrower `xrange`, to see it.
+    """
     Figure = _require_matplotlib()
     h = ts.header
     fig = Figure(figsize=(10, 6), dpi=120)
@@ -158,7 +175,11 @@ def make_figure(ts: TraceSet, yrange: Optional[Tuple[float, float]] = None, titl
             if multi:
                 params = ", ".join(f"{p}={v:g}" for p, v in zip(h.sweep_params, ts.sweep_values[i]))
                 label = f"{name} [{params or ts.sweep_indices[i]}]"
-            ax.plot(ts.data[h.x_name][i], y, linewidth=1, label=label)
+            x = ts.data[h.x_name][i]
+            idx = decimation_indices(y.size, PLOT_MAX_POINTS)
+            if idx is not None:
+                x, y = x[idx], y[idx]
+            ax.plot(x, y, linewidth=1, label=label)
     if h.analysis == "ac":
         ax.set_xscale("log")
     if yrange is not None:

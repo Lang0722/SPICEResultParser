@@ -10,7 +10,7 @@ import os
 import struct
 import warnings
 from dataclasses import dataclass
-from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -190,9 +190,14 @@ def _read_ascii_header(f, path: str) -> Header:
     return _build_header(path, False, "ascii", nauto, nprobe, nsweepparam, sweep_count, tokens)
 
 
+ASCII_BATCH_VALUES = 65536      # values per array handed to the collector; keeps per-line overhead out
+
+
 def _iter_ascii_values(f, path: str) -> Iterator[np.ndarray]:
-    """One float64 array per non-empty data line. Field width follows the old module's rule."""
+    """float64 arrays of about ASCII_BATCH_VALUES values each (line boundaries are not
+    significant to the stream). Field width follows the old module's rule."""
     width = None
+    pending: List[float] = []
     for line in f:
         line = line.strip()
         if not line:
@@ -202,7 +207,12 @@ def _iter_ascii_values(f, path: str) -> Iterator[np.ndarray]:
             if exponent < 0:
                 raise ValueError(f"{path}: cannot determine ASCII field width from first data line")
             width = exponent + 4
-        yield np.array([float(line[i:i + width]) for i in range(0, len(line), width)], dtype=np.float64)
+        pending.extend(float(line[i:i + width]) for i in range(0, len(line), width))
+        if len(pending) >= ASCII_BATCH_VALUES:
+            yield np.array(pending, dtype=np.float64)
+            pending = []
+    if pending:
+        yield np.array(pending, dtype=np.float64)
 
 
 def read_header(path) -> Header:
@@ -236,12 +246,15 @@ def resolve_columns(header: Header, names) -> List[int]:
         return list(range(header.ncols))
     if isinstance(names, str):
         names = [names]
+    by_name: Dict[str, List[int]] = {}
+    for i, n in enumerate(header.names):
+        by_name.setdefault(n, []).append(i)
+    by_raw: Dict[str, List[int]] = {}
+    for i, raw in enumerate(header.col_raw_names):
+        by_raw.setdefault(raw, []).append(i)
     chosen = {0}
     for req in names:
-        hits = [i for i, n in enumerate(header.names) if n == req]
-        if not hits:
-            bare = req.rstrip(")")
-            hits = [i for i, r in enumerate(header.col_raw_names) if r == bare]
+        hits = by_name.get(req) or by_raw.get(req[:-1] if req.endswith(")") else req)
         if not hits:
             hits = [i for i, n in enumerate(header.names) if fnmatch.fnmatchcase(n, req)]
         if not hits:
@@ -295,6 +308,7 @@ class _Collector:
 
     def __init__(self, header: Header, cols: Sequence[int], sweeps: Optional[Iterable[int]], capacity: int):
         self.h = header
+        self.sentinel = header.sentinel
         self.cols = list(cols)
         self.sweeps = None if sweeps is None else set(int(s) for s in sweeps)
         self.capacity = max(1, int(capacity))
@@ -314,8 +328,13 @@ class _Collector:
         return self.sweeps is None or self.sweep_idx in self.sweeps
 
     def feed(self, arr: np.ndarray) -> None:
+        if arr.size:
+            hi = arr.max()
+            if hi == hi and hi < self.sentinel:     # no NaN present and nothing reaches the sentinel
+                self._segment(arr)
+                return
         start = 0
-        for s in np.flatnonzero(arr == self.h.sentinel):
+        for s in np.flatnonzero(arr == self.sentinel):
             self._segment(arr[start:s])
             self._end_sweep()
             start = s + 1
@@ -364,7 +383,8 @@ class _Collector:
     def _end_sweep(self) -> None:
         if self._keep():
             self.spans.append((self.sweep_start, self.fill))
-            self.sweep_values.append(list(self.params))
+            missing = self.h.nsweepparam - len(self.params)     # a file cut inside the parameter prefix
+            self.sweep_values.append(list(self.params) + [float("nan")] * missing)
             self.sweep_indices.append(self.sweep_idx)
         self.sweep_start = self.fill
         self.carry = self.carry[:0]
