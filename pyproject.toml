@@ -13,6 +13,7 @@ dependencies = ["numpy", "scipy"]
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.0"]
+plot = ["matplotlib>=3.5"]
 
 [project.scripts]
 hsp-parser = "hspice_parser:convert"

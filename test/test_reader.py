@@ -799,6 +799,41 @@ class TestApi(unittest.TestCase):
             api.extract(self.path, ["v_a"], downsample=1)
 
 
+    def _x_window(self):
+        x0 = self.sweeps[0][1][:, 0]
+        return float(np.percentile(x0, 10)), float(np.percentile(x0, 60))
+
+    def test_xrange_selects_rows_in_every_sweep(self):
+        lo, hi = self._x_window()
+        ts = api.extract(self.path, ["v_a"], xrange=(lo, hi))
+        for i, (_, data) in enumerate(self.sweeps):
+            mask = (data[:, 0] >= lo) & (data[:, 0] <= hi)
+            self.assertGreater(int(mask.sum()), 0)
+            self.assertLess(int(mask.sum()), data.shape[0])
+            np.testing.assert_array_equal(ts.data["TIME"][i], data[mask, 0])
+            np.testing.assert_array_equal(ts.data["v_a"][i], data[mask, 1])
+
+    def test_summary_counts_follow_xrange(self):
+        lo, hi = self._x_window()
+        out = api.extract(self.path, ["v_a"], output="summary", xrange=(lo, hi))
+        for i, (_, data) in enumerate(self.sweeps):
+            mask = (data[:, 0] >= lo) & (data[:, 0] <= hi)
+            self.assertEqual(out["traces"]["v_a"][i]["count"], int(mask.sum()))
+
+    def test_yrange_does_not_change_arrays(self):
+        plain = api.extract(self.path, ["v_a"])
+        clipped = api.extract(self.path, ["v_a"], yrange=(0.0, 0.5))
+        for i in range(3):
+            np.testing.assert_array_equal(plain.data["v_a"][i], clipped.data["v_a"][i])
+
+    def test_ranges_are_validated_before_reading(self):
+        for bad in [(1.0, 0.0), (1.0,), "0,1", (0.0, "a")]:
+            with self.assertRaisesRegex(ValueError, "xrange"):
+                api.extract(self.dir / "missing.tr0", xrange=bad)
+            with self.assertRaisesRegex(ValueError, "yrange"):
+                api.extract(self.dir / "missing.tr0", yrange=bad)
+
+
 class TestFileOutputs(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -909,6 +944,45 @@ class TestFileOutputs(unittest.TestCase):
             api.write_file(ts, "summary")
 
 
+    def test_csv_rows_follow_xrange(self):
+        x0 = self.sweeps[0][1][:, 0]
+        lo, hi = float(np.percentile(x0, 10)), float(np.percentile(x0, 60))
+        dest = self.dir / "window.csv"
+        api.extract(self.path, ["v_a"], output="csv", dest=dest, xrange=(lo, hi))
+        lines = dest.read_text().splitlines()
+        expected = sum(int(((d[:, 0] >= lo) & (d[:, 0] <= hi)).sum()) for _, d in self.sweeps)
+        self.assertEqual(lines[0], "sweep,r1,TIME,v_a")
+        self.assertEqual(len(lines), 1 + expected)
+
+    def test_png_default_dest(self):
+        self.assertEqual(api.default_dest("run.tr0", "png"), "run_tr0_traces.png")
+
+    def test_png_written(self):
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest("matplotlib not installed")
+        x0 = self.sweeps[0][1][:, 0]
+        lo, hi = float(np.percentile(x0, 10)), float(np.percentile(x0, 60))
+        dest = self.dir / "plot.png"
+        out = api.extract(self.path, ["v_a", "i_e"], output="png", dest=dest,
+                          xrange=(lo, hi), yrange=(-1.0, 1.0))
+        self.assertEqual(out, str(dest))
+        data = dest.read_bytes()
+        self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertGreater(len(data), 1000)
+
+    def test_png_ac_uses_log_axis(self):
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest("matplotlib not installed")
+        ts = read_traces(HERE / "test_9601.ac0", ["v(vo)"])
+        fig = api.make_figure(ts)
+        self.assertEqual(fig.axes[0].get_xscale(), "log")
+        self.assertEqual(len(fig.axes[0].get_lines()), 2)
+
+
 class TestPackage(unittest.TestCase):
     def test_exports(self):
         import hspice_parser as hp
@@ -977,6 +1051,39 @@ class TestMcp(unittest.TestCase):
         self.assertFalse(out["truncated"])
         self.assertTrue(dest.exists())
         json.dumps(out)
+
+
+    def test_png_tool_returns_path_and_size(self):
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest("matplotlib not installed")
+        dest = self.dir / "o.png"
+        ref = read_traces(HERE / "test_9601.tr0")
+        x = ref.data["TIME"][0]
+        lo, hi = float(x[100]), float(x[900])
+        out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="png", dest=str(dest),
+                             xrange=[lo, hi], yrange=[-2.0, 2.0])
+        self.assertEqual(out["output"], "png")
+        self.assertEqual(out["path"], str(dest))
+        self.assertEqual(out["points"], [int(((x >= lo) & (x <= hi)).sum())])   # 802: a repeated time point
+        self.assertEqual(len(out["size"]), 2)
+        self.assertTrue(all(isinstance(v, int) and v > 0 for v in out["size"]))
+        self.assertTrue(dest.exists())
+        json.dumps(out)
+
+    def test_csv_tool_applies_xrange(self):
+        dest = self.dir / "w.csv"
+        ref = read_traces(HERE / "test_9601.tr0")
+        x = ref.data["TIME"][0]
+        out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="csv", dest=str(dest),
+                             xrange=[float(x[10]), float(x[19])])
+        self.assertEqual(out["points"], [10])
+        self.assertEqual(len(dest.read_text().splitlines()), 11)
+
+    def test_bad_range_rejected_before_reading(self):
+        with self.assertRaisesRegex(ValueError, "xrange"):
+            self.m.extract(str(self.dir / "missing.tr0"), output="csv", xrange=[1.0])
 
 
 if __name__ == "__main__":

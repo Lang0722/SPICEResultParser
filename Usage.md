@@ -73,6 +73,13 @@ ts.sweep_indices                                  # original sweep index of each
 extract("run.tr0", ["v(out)"], output="csv")      # -> 'run_tr0_traces.csv' beside the input
 extract("run.tr0", ["v(out)"], output="npz", dest="out.npz", downsample=1000)
 extract("run.tr0", ["v(out)"], output="summary", downsample=200)   # JSON-friendly stats + points
+
+# Region of interest: xrange keeps only rows with lo <= x <= hi (any output);
+# yrange sets the plot's vertical limits (png only). png needs matplotlib:
+# pip install 'hspice_parser[plot]'
+extract("run.tr0", ["v(out)"], xrange=(1e-9, 5e-9), output="csv", dest="window.csv")
+extract("run.tr0", ["v(out)", "v(in)"], xrange=(1e-9, 5e-9), yrange=(0, 1.2), output="png")
+#   -> 'run_tr0_traces.png': one line per trace per sweep, log x axis for AC files
 ```
 
 `sweeps=[0, 2]` keeps only those sweeps. `downsample=N` keeps `N` evenly spaced
@@ -99,12 +106,15 @@ pip install 'hspice_parser[mcp]'
 {"mcpServers": {"hspice": {"command": "hsp-mcp"}}}
 ```
 
-Tools: `list_traces(path)` and `extract(path, names, sweeps, output, downsample, dest)`.
+Tools: `list_traces(path)` and `extract(path, names, sweeps, output, downsample, dest, xrange, yrange)`.
 Over MCP `output` is `summary` (default, returns statistics and downsampled points),
-`csv`, or `npz` (writes a file and returns its path); full arrays are never sent inline.
+`csv`, `npz` (write a file and return its path), or `png` (writes a plot and returns its
+path and pixel size); full arrays are never sent inline. `xrange=[lo, hi]` restricts
+every output to the rows whose x value lies in that closed interval; `yrange=[lo, hi]`
+sets the plot's vertical axis limits and is ignored by the other outputs.
 
 `downsample` is optional over MCP: left unset it defaults to 200 points per sweep
 for `summary`, and to no decimation at all for `csv` and `npz`, which keep every
-point. `dest` names the output file for `csv`/`npz`; it is not restricted to the
+point. `dest` names the output file for `csv`/`npz`/`png`; it is not restricted to the
 input's directory, so the agent can write to any path the server process can
-reach. Leave it unset to write `<input>_<ext>_traces.<csv|npz>` beside the input.
+reach. Leave it unset to write `<input>_<ext>_traces.<csv|npz|png>` beside the input.

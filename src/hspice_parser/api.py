@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
 from .reader import TraceSet, read_header, read_traces
 
-OUTPUTS = ("arrays", "csv", "npz", "summary")
+OUTPUTS = ("arrays", "csv", "npz", "summary", "png")
 
 
 def list_traces(path) -> dict:
@@ -27,6 +27,32 @@ def decimation_indices(n: int, downsample: Optional[int]):
     if downsample < 2:
         raise ValueError("downsample must be at least 2")
     return np.unique(np.linspace(0, n - 1, downsample).round().astype(np.intp))
+
+
+def validate_range(name: str, value) -> Optional[Tuple[float, float]]:
+    """Normalise an (lo, hi) pair to floats; None passes through."""
+    if value is None:
+        return None
+    try:
+        lo, hi = (float(v) for v in value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a pair of numbers (min, max), not {value!r}") from None
+    if lo > hi:
+        raise ValueError(f"{name} min must not exceed max: {value!r}")
+    return lo, hi
+
+
+def _apply_xrange(ts: TraceSet, xrange: Tuple[float, float]) -> None:
+    """Keep, in every sweep, only the rows whose x value lies inside the closed interval."""
+    lo, hi = xrange
+    x_name = ts.header.x_name
+    for i in range(len(ts.sweep_values)):
+        x = ts.data[x_name][i]
+        mask = (x >= lo) & (x <= hi)
+        if mask.all():
+            continue
+        for name in ts.selected:
+            ts.data[name][i] = ts.data[name][i][mask]
 
 
 def _decimate(ts: TraceSet, downsample: int) -> None:
@@ -108,10 +134,58 @@ def _write_npz(ts: TraceSet, dest: str) -> None:
         np.savez(f, **arrays)
 
 
-def write_file(ts: TraceSet, output: str, dest=None) -> str:
-    """Write a TraceSet as csv or npz; returns the path written."""
-    if output not in ("csv", "npz"):
-        raise ValueError(f"write_file supports 'csv' or 'npz', not {output!r}")
+MAX_LEGEND_ENTRIES = 24
+
+
+def _require_matplotlib():
+    try:
+        from matplotlib.figure import Figure
+    except ImportError as exc:
+        raise ImportError("output='png' needs the optional dependency: pip install 'hspice_parser[plot]'") from exc
+    return Figure
+
+
+def make_figure(ts: TraceSet, yrange: Optional[Tuple[float, float]] = None, title: Optional[str] = None):
+    """A matplotlib Figure with one line per trace per sweep; log x axis for AC results."""
+    Figure = _require_matplotlib()
+    h = ts.header
+    fig = Figure(figsize=(10, 6), dpi=120)
+    ax = fig.add_subplot(111)
+    multi = len(ts.sweep_values) > 1
+    for name in ts.selected[1:]:
+        for i, y in enumerate(ts.data[name]):
+            label = name
+            if multi:
+                params = ", ".join(f"{p}={v:g}" for p, v in zip(h.sweep_params, ts.sweep_values[i]))
+                label = f"{name} [{params or ts.sweep_indices[i]}]"
+            ax.plot(ts.data[h.x_name][i], y, linewidth=1, label=label)
+    if h.analysis == "ac":
+        ax.set_xscale("log")
+    if yrange is not None:
+        ax.set_ylim(*yrange)
+    ax.set_xlabel(h.x_name)
+    ax.grid(True, alpha=0.3)
+    if 0 < len(ax.get_lines()) <= MAX_LEGEND_ENTRIES:
+        ax.legend(fontsize="small")
+    ax.set_title(title if title is not None else os.path.basename(h.path))
+    return fig
+
+
+def plot(ts: TraceSet, dest=None, yrange: Optional[Tuple[float, float]] = None,
+         title: Optional[str] = None) -> str:
+    """Write the traces as a PNG image; returns the path written. Needs matplotlib."""
+    dest = os.fspath(dest) if dest is not None else default_dest(ts.header.path, "png")
+    fig = make_figure(ts, validate_range("yrange", yrange), title)
+    fig.savefig(dest, format="png")
+    return dest
+
+
+def write_file(ts: TraceSet, output: str, dest=None, yrange=None) -> str:
+    """Write a TraceSet as csv, npz or png; returns the path written. yrange applies to png only."""
+    if output not in ("csv", "npz", "png"):
+        raise ValueError(f"write_file supports 'csv', 'npz' or 'png', not {output!r}")
+    if output == "png":
+        return plot(ts, dest, yrange)
     dest = os.fspath(dest) if dest is not None else default_dest(ts.header.path, output)
     if output == "csv":
         _write_csv(ts, dest)
@@ -121,17 +195,29 @@ def write_file(ts: TraceSet, output: str, dest=None) -> str:
 
 
 def extract(path, names=None, sweeps=None, output: str = "arrays",
-            downsample: Optional[int] = None, dest=None):
-    """Read selected traces and return them as arrays, a summary dict, or a written file path."""
+            downsample: Optional[int] = None, dest=None,
+            xrange: Optional[Sequence[float]] = None, yrange: Optional[Sequence[float]] = None):
+    """Read selected traces and return them as arrays, a summary dict, or a written file path.
+
+    xrange=(lo, hi) keeps only the rows whose x value (TIME, FREQ or the sweep
+    variable) lies in the closed interval; it applies to every output. yrange=(lo, hi)
+    sets the vertical axis limits of the png plot and is ignored by other outputs.
+    """
     if output not in OUTPUTS:
         raise ValueError(f"output must be one of {OUTPUTS}, not {output!r}")
     if downsample is not None and downsample < 2:
         raise ValueError("downsample must be at least 2")
+    xrange = validate_range("xrange", xrange)
+    yrange = validate_range("yrange", yrange)
+    if output == "png":
+        _require_matplotlib()
     ts = read_traces(path, names, sweeps)
+    if xrange is not None:
+        _apply_xrange(ts, xrange)
     if output == "summary":
         return summarize(ts, downsample)
     if downsample is not None:
         _decimate(ts, downsample)
     if output == "arrays":
         return ts
-    return write_file(ts, output, dest)
+    return write_file(ts, output, dest, yrange)
