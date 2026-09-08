@@ -2,6 +2,12 @@
 
 Welcome to the hspiceParser GitHub page. hspiceParser aims to be the final word in parsing hSpice output files, building on a long legacy of programs built by other circuit designers.
 
+This fork of [HMC-ACE/hspiceParser](https://github.com/HMC-ACE/hspiceParser) adds a
+**low-memory streaming reader**, a **trace-selection API** (arrays, CSV, npz, summary,
+PNG plot, x/y region) and an **MCP server** so AI agents can query result files. The
+original converter is untouched and still available. See
+[Low-memory reader, API and MCP server](#low-memory-reader-api-and-mcp-server) below.
+
 The main goals of hspiceParser are:
 
 1. **Very simple installation** - Easy to set up and use
@@ -17,19 +23,20 @@ If you've ever Googled "hSpice output format" and been frustrated at the result,
 Run the following command in your terminal:
 
 ```bash
-pixi add hspice_parser --git https://github.com/HMC-ACE/hspiceParser --branch main
-
-pixi add hspice_parser --git https://github.com/HMC-ACE/hspiceParser --tag latest
+pixi add hspice_parser --git https://github.com/Lang0722/hspiceParser --branch feature/low-memory-reader
 ```
 
 ### Using pip
 You can also install hspiceParser using pip:
 
 ```bash
-pip install git+https://github.com/HMC-ACE/hspiceParser.git@main
+pip install "git+https://github.com/Lang0722/hspiceParser.git@feature/low-memory-reader"
+# optional extras: [mcp] for the MCP server, [plot] for PNG output
+pip install "hspice_parser[mcp,plot] @ git+https://github.com/Lang0722/hspiceParser.git@feature/low-memory-reader"
 ```
 
-After installation, you can use the `hsp-parser` command from your terminal.
+After installation, you can use the `hsp-parser` (legacy converter) and `hsp-mcp`
+(MCP server) commands from your terminal.
 
 ### Quick Download
 
@@ -41,7 +48,55 @@ wget https://raw.githubusercontent.com/HMC-ACE/hspiceParser/main/src/hspice_pars
 
 ### Requirements
 
-The instruction above enable most of hSpiceParser’s functionality, but some output formats require additional Python libraries.  The Parser file only relies on built-in Python 3.4+ functions to produce .m, .csv and Pickle files. The parser can also produce Matlab .mat files, but it requires that you have Scipy and Numpy installed on your machine to do so.
+The legacy converter (`hspiceParser.py`) relies only on built-in Python 3.4+ functions to
+produce .m, .csv and Pickle files; Matlab .mat output additionally needs Scipy and Numpy.
+The streaming reader and API need Python 3.9+ and numpy; the MCP server needs the `mcp`
+package (`[mcp]` extra) and PNG output needs matplotlib (`[plot]` extra).
+
+## Low-memory reader, API and MCP server
+
+The legacy converter loads the whole file into Python floats (about 85x the file size in
+memory) and converts every trace. The streaming reader keeps only the traces you ask for:
+
+| 490 MB transient file, 20 traces, 3.2 M points | peak RSS | time |
+|---|---|---|
+| one trace | 92 MB | 0.07 s |
+| all 20 traces | 554 MB | 0.16 s |
+| legacy converter (62 MB file) | 5.3 GB | 238 s |
+
+Python + numpy alone account for about 29 MB of that.
+
+```python
+from hspice_parser import list_traces, extract
+
+list_traces("run.tr0")                              # header only: trace names, x variable, sweeps
+ts = extract("run.tr0", ["v(out)", "i_*"])          # numpy arrays, one per trace per sweep
+extract("run.tr0", ["v(out)"], output="csv")        # or "npz", "summary", "png"
+extract("run.tr0", ["v(out)"], xrange=(1e-9, 5e-9), yrange=(0, 1.2), output="png")
+```
+
+`xrange` keeps only the rows inside an x window (time, frequency or sweep variable);
+`yrange` sets the plot's vertical limits; `sweeps=[...]` selects sweeps; `downsample=N`
+keeps N evenly spaced points. Binary 9601 and 2001 files and `post=2` ASCII files are
+supported, including multi-sweep and AC results. A file that the simulator is still
+writing is read up to its last complete point and flagged `truncated`.
+
+### MCP server for agents
+
+```bash
+pip install "hspice_parser[mcp,plot] @ git+https://github.com/Lang0722/hspiceParser.git@feature/low-memory-reader"
+```
+
+```json
+{"mcpServers": {"hspice": {"command": "hsp-mcp"}}}
+```
+
+Tools: `list_traces(path)` and `extract(path, names, sweeps, output, downsample, dest,
+xrange, yrange)`. Over MCP `output` is `summary` (statistics plus a bounded number of
+downsampled points), `csv`, `npz` or `png`; full arrays are never sent inline.
+
+Design notes live in `docs/superpowers/specs/`; the full API is described in
+[Usage.md](Usage.md).
 
 ## Documentation
 
