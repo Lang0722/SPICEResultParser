@@ -73,12 +73,20 @@ list_traces("run.tr0")                              # header only: trace names, 
 ts = extract("run.tr0", ["v(out)", "i_*"])          # numpy arrays, one per trace per sweep
 extract("run.tr0", ["v(out)"], output="csv")        # or "npz", "summary", "png"
 extract("run.tr0", ["v(out)"], xrange=(1e-9, 5e-9), yrange=(0, 1.2), output="png")
+
+# Nutmeg rawfiles (ngspice / SPICE3 .raw) are read the same way; one file can hold
+# several plots, selected by index.
+list_traces("rc.raw")["plots"]                      # ['Transient Analysis', 'AC Analysis', ...]
+extract("rc.raw", ["v(out)"], plot=1, output="png") # the AC plot: log x axis, Mag + Phase
 ```
 
-`xrange` keeps only the rows inside an x window (time, frequency or sweep variable);
-`yrange` sets the plot's vertical limits; `sweeps=[...]` selects sweeps; `downsample=N`
-keeps N evenly spaced points. Binary 9601 and 2001 files and `post=2` ASCII files are
-supported, including multi-sweep and AC results. A file that the simulator is still
+`xrange` keeps only the rows inside an x window (time, frequency or sweep variable) and
+is applied while the file streams, so peak memory follows the window, not the column
+length: a 10% window over the 490 MB file above reads all twenty traces at 136 MB peak
+RSS instead of 555 MB. `yrange` sets the plot's vertical limits; `sweeps=[...]` selects
+sweeps; `downsample=N` keeps N evenly spaced points. Binary 9601 and 2001 files and `post=2` ASCII files are
+supported, including multi-sweep and AC results, as are Nutmeg rawfiles (ngspice /
+SPICE3 `.raw`) in both binary and ASCII form. A file that the simulator is still
 writing is read up to its last complete point and flagged `truncated`.
 
 ### MCP server for agents
@@ -91,9 +99,11 @@ pip install "hspice_parser[mcp,plot] @ git+https://github.com/Lang0722/hspicePar
 {"mcpServers": {"hspice": {"command": "hsp-mcp"}}}
 ```
 
-Tools: `list_traces(path)` and `extract(path, names, sweeps, output, downsample, dest,
-xrange, yrange)`. Over MCP `output` is `summary` (statistics plus a bounded number of
-downsampled points), `csv`, `npz` or `png`; full arrays are never sent inline.
+Tools: `list_traces(path, plot)` and `extract(path, names, sweeps, output, downsample,
+dest, xrange, yrange, plot)`, on HSPICE result files and Nutmeg rawfiles alike. Over MCP
+`output` is `summary` (statistics plus a bounded number of downsampled points), `csv`,
+`npz` or `png`; full arrays are never sent inline. `plot` picks one plot of a Nutmeg
+rawfile.
 
 Design notes live in `docs/superpowers/specs/`; the full API is described in
 [Usage.md](Usage.md).
@@ -101,7 +111,7 @@ Design notes live in `docs/superpowers/specs/`; the full API is described in
 ## Documentation
 
 - **Usage Guide**: See [Usage.md](Usage.md) for examples and detailed usage instructions
-- **Output Formats**: See [hSpice_output.md](hSpice_output.md) for documentation on supported hSpice output file formats (9601, 2001, and ASCII)
+- **Output Formats**: See [hSpice_output.md](hSpice_output.md) for documentation on supported hSpice output file formats (9601, 2001, and ASCII), and [nutmeg_output.md](nutmeg_output.md) for the Nutmeg rawfile format (ngspice / SPICE3 `.raw`)
 
 ## Contributing
 

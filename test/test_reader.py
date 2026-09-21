@@ -2,6 +2,7 @@
 import asyncio
 import json
 import pickle
+import re
 import shutil
 import struct
 import sys
@@ -766,6 +767,62 @@ class TestAsciiRead(unittest.TestCase):
         self.assertEqual(ts.data["TIME"][0].size, 7)
 
 
+    def test_chunk_size_does_not_change_ascii_results(self):
+        # 13 bytes is one field, 52 one point, 66 one line of the fixture: every chunk size
+        # must give the same values, whether it splits a field, a point or a line.
+        full = read_traces(self.path)
+        original = reader.ASCII_CHUNK_BYTES
+        self.addCleanup(setattr, reader, "ASCII_CHUNK_BYTES", original)
+        for chunk in (7, 13, 52, 66, 4096):
+            reader.ASCII_CHUNK_BYTES = chunk
+            small = read_traces(self.path)
+            self.assertEqual(small.sweep_values, full.sweep_values, chunk)
+            self.assertEqual(small.sweep_indices, full.sweep_indices, chunk)
+            self.assertFalse(small.truncated, chunk)
+            for name in full.selected:
+                for a, b in zip(full.data[name], small.data[name]):
+                    np.testing.assert_array_equal(a, b, err_msg=f"chunk {chunk}")
+
+    def test_crlf_line_endings(self):
+        full = read_traces(self.path)
+        crlf = self.dir / "crlf.tr0"
+        crlf.write_bytes(self.path.read_bytes().replace(b"\n", b"\r\n"))
+        original = reader.ASCII_CHUNK_BYTES
+        self.addCleanup(setattr, reader, "ASCII_CHUNK_BYTES", original)
+        for chunk in (7, 4096):
+            reader.ASCII_CHUNK_BYTES = chunk
+            ts = read_traces(crlf)
+            self.assertEqual(ts.selected, full.selected)
+            self.assertEqual(ts.sweep_values, full.sweep_values)
+            self.assertFalse(ts.truncated)
+            for name in full.selected:
+                for a, b in zip(full.data[name], ts.data[name]):
+                    np.testing.assert_array_equal(a, b, err_msg=f"chunk {chunk}")
+
+    def test_junk_field_names_the_file(self):
+        lines = self.path.read_text().splitlines()
+        lines[6] = lines[6][:13] + "X" * 13 + lines[6][26:]    # a field that is not a number
+        self.path.write_text("\n".join(lines) + "\n")
+        original = reader.ASCII_CHUNK_BYTES
+        self.addCleanup(setattr, reader, "ASCII_CHUNK_BYTES", original)
+        for chunk in (7, 4096):
+            reader.ASCII_CHUNK_BYTES = chunk
+            with self.assertRaisesRegex(ValueError, "non-numeric field"):
+                read_traces(self.path)
+            with self.assertRaisesRegex(ValueError, re.escape(str(self.path))):
+                read_traces(self.path)
+
+    def test_file_cut_mid_field(self):
+        text = self.path.read_text().rstrip("\n")
+        self.path.write_text(text[:-7])                  # the final sentinel is now a part field
+        with self.assertWarns(RuntimeWarning):
+            ts = read_traces(self.path)
+        self.assertTrue(ts.truncated)
+        self.assertEqual(len(ts.sweep_values), 2)
+        self.assertEqual(ts.data["TIME"][0].size, 7)
+        self.assertEqual(ts.data["TIME"][1].size, 5)     # the partial field is dropped, not parsed
+        np.testing.assert_allclose(ts.data["v_a"][1], self.sweeps[1][1][:, 1], rtol=1e-6)
+
     def test_batching_does_not_change_ascii_results(self):
         path, sweeps = make_ascii(self.dir)
         full = read_traces(path)
@@ -792,6 +849,7 @@ class TestApi(unittest.TestCase):
         self.assertEqual(info, {
             "path": str(HERE / "test_9601.tr0"), "format": "9601", "analysis": "tr", "x": "TIME",
             "traces": ["v_0", "v_vo", "v_vs", "i_vs"], "sweep_params": [], "sweep_count_hint": 0,
+            "plot": 0, "plots": [],
         })
         info = api.list_traces(self.path)
         self.assertEqual(info["sweep_params"], ["r1"])
@@ -1159,6 +1217,123 @@ class TestFileOutputs(unittest.TestCase):
         self.assertEqual(rows[0], ts.selected)
         self.assertTrue(all(len(r) == 2 for r in rows))
 
+class TestXrangeWhileReading(unittest.TestCase):
+    """read_traces(xrange=...) must equal reading everything and cutting afterwards."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def assert_matches_post_hoc_cut(self, path, lo, hi, **kw):
+        """The windowed read equals the full read masked with the same closed interval."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            full = read_traces(path, **kw)
+            win = read_traces(path, xrange=(lo, hi), **kw)
+        self.assertEqual(win.selected, full.selected)
+        self.assertEqual(win.sweep_indices, full.sweep_indices)
+        self.assertEqual(win.sweep_values, full.sweep_values)
+        self.assertEqual(win.truncated, full.truncated)
+        x = full.header.x_name
+        for i in range(len(full.sweep_values)):
+            mask = (full.data[x][i] >= lo) & (full.data[x][i] <= hi)
+            for name in full.selected:
+                np.testing.assert_array_equal(win.data[name][i], full.data[name][i][mask],
+                                              err_msg=f"{path} {name} sweep {i}")
+        return full, win
+
+    def middle_window(self, path, **kw):
+        """A window that keeps some but not all rows of the first sweep."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            x = read_traces(path, **kw).data[read_header(path).x_name][0]
+        return float(np.percentile(x, 20)), float(np.percentile(x, 70))
+
+    def test_sample_files(self):
+        for name in ("test_9601.tr0", "test_2001.tr0", "test_9601.sw0", "test_9601.ac0"):
+            path = HERE / name
+            lo, hi = self.middle_window(path)
+            _, win = self.assert_matches_post_hoc_cut(path, lo, hi)
+            self.assertGreater(win.data[win.selected[0]][0].size, 0)
+
+    def test_multi_sweep_and_selective_sweeps(self):
+        for version in ("9601", "2001"):
+            path, sweeps = make_multi(self.dir, version)
+            lo, hi = self.middle_window(path)
+            _, win = self.assert_matches_post_hoc_cut(path, lo, hi)
+            self.assertEqual(len(win.sweep_values), 3)
+            self.assert_matches_post_hoc_cut(path, lo, hi, sweeps=[0, 2])
+            self.assert_matches_post_hoc_cut(path, lo, hi, names=["v_a"], sweeps=[1])
+
+    def test_ascii(self):
+        path, _ = make_ascii(self.dir)
+        lo, hi = self.middle_window(path)
+        self.assert_matches_post_hoc_cut(path, lo, hi)
+        self.assert_matches_post_hoc_cut(path, lo, hi, names=["v_a"], sweeps=[1])
+
+    def test_truncated_file(self):
+        path, _ = make_multi(self.dir, "2001", final_sentinel=False, drop_tail=3)
+        lo, hi = self.middle_window(path)
+        _, win = self.assert_matches_post_hoc_cut(path, lo, hi)
+        self.assertTrue(win.truncated)
+
+    def test_window_covering_everything_matches_no_window(self):
+        path, _ = make_multi(self.dir, "2001")
+        plain = read_traces(path, ["v_a"])
+        wide = read_traces(path, ["v_a"], xrange=(-1e30, 1e30))
+        self.assertEqual(wide.sweep_indices, plain.sweep_indices)
+        for i in range(3):
+            for name in plain.selected:
+                np.testing.assert_array_equal(wide.data[name][i], plain.data[name][i])
+
+    def test_empty_window_keeps_the_sweeps_with_empty_arrays(self):
+        path, _ = make_multi(self.dir, "2001")
+        ts = read_traces(path, ["v_a"], xrange=(2.0, 3.0))       # x is in [0, 1)
+        self.assertEqual(ts.sweep_indices, [0, 1, 2])
+        self.assertEqual(ts.sweep_values, [[1000.0], [2000.0], [3000.0]])
+        self.assertFalse(ts.truncated)
+        for i in range(3):
+            for name in ts.selected:
+                self.assertEqual(ts.data[name][i].size, 0)
+
+    def test_window_boundaries_are_inclusive(self):
+        path, sweeps = make_multi(self.dir, "2001")
+        x = sweeps[0][1][:, 0]
+        lo, hi = float(np.sort(x)[5]), float(np.sort(x)[9])
+        ts = read_traces(path, ["v_a"], sweeps=[0], xrange=(lo, hi))
+        got = np.sort(ts.data["TIME"][0])
+        self.assertEqual(got.size, 5)
+        self.assertEqual(got[0], lo)
+        self.assertEqual(got[-1], hi)
+
+    def test_memory_follows_the_window(self):
+        rng = np.random.default_rng(17)
+        npoints, ncols = 200_000, 20
+        data = rng.random((npoints, ncols))
+        data[:, 0] = np.arange(npoints) * 1e-12
+        path = self.dir / "wide.tr0"
+        fixtures.write_binary(path, "2001", ["TIME"] + [f"v({i}" for i in range(ncols - 1)],
+                              [1] * ncols, [([], data)])
+        lo, hi = 0.0, float(data[npoints // 20, 0])              # 5% of the rows
+        del data
+        original = reader.FRAMES_PER_CHUNK
+        reader.FRAMES_PER_CHUNK = 8                              # ~66 KB: isolate the buffers
+        self.addCleanup(setattr, reader, "FRAMES_PER_CHUNK", original)
+        peaks = []
+        for xrange in (None, (lo, hi)):
+            tracemalloc.start()
+            tracemalloc.reset_peak()
+            ts = read_traces(path, ["v(7"], xrange=xrange)
+            _, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            peaks.append(peak)
+        self.assertEqual(ts.data["v_7"][0].size, npoints // 20 + 1)
+        self.assertLess(peaks[1], 0.25 * peaks[0], f"windowed {peaks[1]} vs full {peaks[0]} bytes")
+
+
 class TestPackage(unittest.TestCase):
     def test_exports(self):
         import hspice_parser as hp
@@ -1272,7 +1447,7 @@ class TestMcp(unittest.TestCase):
 
     def test_unexpected_errors_carry_their_type(self):
         original = self.m.api.list_traces
-        def boom(path):
+        def boom(path, plot=0):
             raise KeyError("boom")
         self.m.api.list_traces = boom
         self.addCleanup(setattr, self.m.api, "list_traces", original)

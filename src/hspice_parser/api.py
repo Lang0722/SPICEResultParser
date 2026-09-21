@@ -14,12 +14,16 @@ from .reader import TraceSet, read_header, read_traces
 OUTPUTS = ("arrays", "csv", "npz", "summary", "png")
 
 
-def list_traces(path) -> dict:
-    """Trace names and file facts from the header only."""
-    h = read_header(path)
+def list_traces(path, plot: int = 0) -> dict:
+    """Trace names and file facts from the header only.
+
+    plot selects one plot of a Nutmeg rawfile; "plots" lists every plot in it (HSPICE: []).
+    """
+    h = read_header(path, plot)
     return {
         "path": h.path, "format": h.version, "analysis": h.analysis, "x": h.x_name,
         "traces": h.names[1:], "sweep_params": h.sweep_params, "sweep_count_hint": h.sweep_count_hint,
+        "plot": h.plot, "plots": h.plot_names,
     }
 
 
@@ -43,19 +47,6 @@ def validate_range(name: str, value) -> Optional[Tuple[float, float]]:
     if lo > hi:
         raise ValueError(f"{name} min must not exceed max: {value!r}")
     return lo, hi
-
-
-def _apply_xrange(ts: TraceSet, xrange: Tuple[float, float]) -> None:
-    """Keep, in every sweep, only the rows whose x value lies inside the closed interval."""
-    lo, hi = xrange
-    x_name = ts.header.x_name
-    for i in range(len(ts.sweep_values)):
-        x = ts.data[x_name][i]
-        mask = (x >= lo) & (x <= hi)
-        if mask.all():
-            continue
-        for name in ts.selected:
-            ts.data[name][i] = ts.data[name][i][mask]
 
 
 def _decimate(ts: TraceSet, downsample: int) -> None:
@@ -109,7 +100,8 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None) -> dict:
             per_sweep.append(entry)
         traces[name] = per_sweep
     return {
-        "path": h.path, "format": h.version, "analysis": h.analysis, "x": h.x_name,
+        "path": h.path, "format": h.version, "plot": h.plot, "plots": h.plot_names,
+        "analysis": h.analysis, "x": h.x_name,
         "sweep_params": h.sweep_params, "sweep_values": [_json_floats(v) for v in ts.sweep_values],
         "sweeps": len(ts.sweep_values), "sweep_indices": list(ts.sweep_indices),
         "truncated": ts.truncated, "traces": traces,
@@ -236,12 +228,16 @@ def write_file(ts: TraceSet, output: str, dest=None, yrange=None) -> str:
 
 def extract(path, names=None, sweeps=None, output: str = "arrays",
             downsample: Optional[int] = None, dest=None,
-            xrange: Optional[Sequence[float]] = None, yrange: Optional[Sequence[float]] = None):
+            xrange: Optional[Sequence[float]] = None, yrange: Optional[Sequence[float]] = None,
+            plot: int = 0):
     """Read selected traces and return them as arrays, a summary dict, or a written file path.
 
     xrange=(lo, hi) keeps only the rows whose x value (TIME, FREQ or the sweep
-    variable) lies in the closed interval; it applies to every output. yrange=(lo, hi)
+    variable) lies in the closed interval; the window is applied while the file streams,
+    so peak memory follows the window rather than the column length, and it applies to
+    every output. yrange=(lo, hi)
     sets the vertical axis limits of the png plot and is ignored by other outputs.
+    plot selects one plot of a Nutmeg rawfile (0-based); see list_traces for the list.
     """
     if output not in OUTPUTS:
         raise ValueError(f"output must be one of {OUTPUTS}, not {output!r}")
@@ -251,9 +247,7 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
     yrange = validate_range("yrange", yrange)
     if output == "png":
         _require_matplotlib()
-    ts = read_traces(path, names, sweeps)
-    if xrange is not None:
-        _apply_xrange(ts, xrange)
+    ts = read_traces(path, names, sweeps, plot, xrange)
     if output == "summary":
         return summarize(ts, downsample)
     if downsample is not None:

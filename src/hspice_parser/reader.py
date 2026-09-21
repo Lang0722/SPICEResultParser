@@ -9,14 +9,15 @@ import fnmatch
 import os
 import struct
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from .hspiceParser import is_binary, parse_var_name
 
-_DTYPE = {"9601": np.dtype("<f4"), "2001": np.dtype("<f8"), "ascii": np.dtype("<f8")}
+_DTYPE = {"9601": np.dtype("<f4"), "2001": np.dtype("<f8"), "ascii": np.dtype("<f8"),
+          "nutmeg": np.dtype("<f8")}
 _ANALYSIS_BY_TYPE_CODE = {1: "tr", 2: "ac", 3: "sw"}
 _TERMINATOR = "$&%#"
 _FRAME_OVERHEAD = 20            # 16-byte block head + 4-byte block tail
@@ -24,14 +25,17 @@ _ASCII_BYTES_PER_VALUE = 13     # one HSPICE ASCII field; used only to bound the
 
 FRAMES_PER_CHUNK = 256          # frames per bulk read: 256 * (8192 + 20) bytes ≈ 2.1 MB for HSPICE's 8 KB blocks
 _MAX_CHUNK_BYTES = 4 << 20      # cap on one bulk read buffer; blocks whose frame exceeds it take the per-block path
+WINDOW_CAPACITY = 1 << 14       # points preallocated per column when an x window is set: the
+                                # file size says nothing about how many rows fall inside it,
+                                # so start small and let the buffers grow
 
 
 @dataclass
 class Header:
     path: str
     is_binary: bool
-    version: str            # "9601" | "2001" | "ascii"
-    analysis: str           # "tr" | "sw" | "ac"
+    version: str            # "9601" | "2001" | "ascii" | "nutmeg"
+    analysis: str           # "tr" | "sw" | "ac" (Nutmeg adds "op", "noise", "other")
     ncols: int              # values per point in the data stream
     nsweepparam: int
     sweep_count_hint: int   # token after "Reserved."; informational only
@@ -41,6 +45,8 @@ class Header:
     col_raw_names: List[str]  # raw name per data column (AC repeats each dependent name twice)
     type_codes: List[int]
     sweep_params: List[str]
+    plot_names: List[str] = field(default_factory=list)   # Nutmeg: Plotname of every plot; HSPICE: []
+    plot: int = 0                                         # Nutmeg: index of the plot described here
 
     @property
     def dtype(self) -> np.dtype:
@@ -171,17 +177,21 @@ def _read_binary_header(f, path: str) -> Header:
 
 
 def _read_ascii_header(f, path: str) -> Header:
-    """Consume the ASCII header lines, leaving f positioned at the first data line."""
-    first = f.readline()
+    """Consume the ASCII header lines of a file opened in binary mode, leaving f at the
+    first data line (so its position is a byte offset the data reader can rely on)."""
+    def readline() -> str:
+        return f.readline().decode("utf-8", errors="replace")
+
+    first = readline()
     if not first:
         raise ValueError(f"{path}: empty file")
     nauto, nprobe, nsweepparam = int(first[0:4]), int(first[4:8]), int(first[8:12])
-    f.readline()                                  # copyright line
-    third = f.readline()
+    readline()                                    # copyright line
+    third = readline()
     sweep_count = int(third.split()[-1])
-    text = f.readline()
+    text = readline()
     while _TERMINATOR not in text:
-        more = f.readline()
+        more = readline()
         if not more:
             raise ValueError(f"{path}: header terminator {_TERMINATOR} not found")
         text += more
@@ -191,38 +201,97 @@ def _read_ascii_header(f, path: str) -> Header:
 
 
 ASCII_BATCH_VALUES = 65536      # values per array handed to the collector; keeps per-line overhead out
+ASCII_CHUNK_BYTES = 128 << 10   # bytes per read of the data section, converted in one numpy call.
+                                # Read time is flat from about 32 KB up, while each chunk costs
+                                # roughly 2.5x its size transiently, so a small chunk is free:
+                                # 1 MB cost 13 MB more peak RSS than 128 KB on a 50 MB file.
+_BLANKS = b" \t\r\n\x0b\x0c"    # deleted from every chunk: fields never contain whitespace
+
+
+def _ascii_field_width(data: bytes, path: str, final: bool) -> Optional[int]:
+    """Field width from the first data line: the offset of its exponent marker plus four
+    (the old module's rule). None while no complete non-empty line has arrived yet."""
+    start = 0
+    while True:
+        end = data.find(b"\n", start)
+        if end < 0 and not final:
+            return None                           # the first line is still incomplete
+        line = (data[start:] if end < 0 else data[start:end]).strip()
+        if line:
+            exponent = line.find(b"E")
+            if exponent < 0:
+                raise ValueError(f"{path}: cannot determine ASCII field width from first data line")
+            return exponent + 4
+        if end < 0:
+            return None                           # nothing but blank lines: no values to read
+        start = end + 1
+
+
+def _ascii_fields(flat: bytes, n: int, width: int, path: str) -> Iterator[np.ndarray]:
+    """Convert n fixed-width fields at once, handed out in ASCII_BATCH_VALUES slices."""
+    fields = np.frombuffer(flat, dtype=f"S{width}", count=n)
+    try:
+        values = fields.astype(np.float64)
+    except ValueError as exc:
+        raise ValueError(f"{path}: data section holds a non-numeric field ({exc})") from None
+    for start in range(0, n, ASCII_BATCH_VALUES):
+        yield values[start:start + ASCII_BATCH_VALUES]
 
 
 def _iter_ascii_values(f, path: str) -> Iterator[np.ndarray]:
-    """float64 arrays of about ASCII_BATCH_VALUES values each (line boundaries are not
-    significant to the stream). Field width follows the old module's rule."""
+    """float64 arrays of at most ASCII_BATCH_VALUES values each (line boundaries are not
+    significant to the stream).
+
+    The data section is read in ASCII_CHUNK_BYTES chunks, stripped of every whitespace byte
+    in one C call (which also absorbs CRLF endings), and converted as fixed-width fields by
+    numpy: nothing is parsed a value at a time. A field split across two chunks is carried
+    over; a partial field at the end of the file is dropped, as a half-written value.
+    """
     width = None
-    pending: List[float] = []
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
+    carry = b""                                   # bytes of a field split across chunks
+    head = b""                                    # chunks held back until the width is known
+    while True:
+        chunk = f.read(ASCII_CHUNK_BYTES)
+        if not chunk:
+            break
         if width is None:
-            exponent = line.find("E")
-            if exponent < 0:
-                raise ValueError(f"{path}: cannot determine ASCII field width from first data line")
-            width = exponent + 4
-        pending.extend(float(line[i:i + width]) for i in range(0, len(line), width))
-        if len(pending) >= ASCII_BATCH_VALUES:
-            yield np.array(pending, dtype=np.float64)
-            pending = []
-    if pending:
-        yield np.array(pending, dtype=np.float64)
+            head += chunk
+            width = _ascii_field_width(head, path, final=False)
+            if width is None:
+                continue
+            chunk, head = head, b""
+        flat = carry + chunk.translate(None, _BLANKS)
+        n = len(flat) // width
+        carry = flat[n * width:]
+        if n:
+            yield from _ascii_fields(flat, n, width, path)
+    if width is None and head:                    # the whole section arrived in one short read
+        width = _ascii_field_width(head, path, final=True)
+        if width is not None:
+            flat = head.translate(None, _BLANKS)
+            n = len(flat) // width
+            if n:
+                yield from _ascii_fields(flat, n, width, path)
 
 
-def read_header(path) -> Header:
-    """Parse only the header. Never touches data."""
+def _reject_plot(path: str, plot: int) -> None:
+    if int(plot):
+        raise ValueError(f"{path}: plot={plot} applies to Nutmeg rawfiles only; an HSPICE file holds one plot")
+
+
+def read_header(path, plot: int = 0) -> Header:
+    """Parse only the header. Never touches data.
+
+    plot selects one plot of a Nutmeg rawfile (0-based); HSPICE files hold a single plot.
+    """
+    from . import nutmeg          # imported here: nutmeg.py builds on this module
+
     path = os.fspath(path)
-    if is_binary(path):
-        with open(path, "rb") as f:
-            return _read_binary_header(f, path)
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        return _read_ascii_header(f, path)
+    if nutmeg.is_nutmeg(path):
+        return nutmeg.read_nutmeg_header(path, plot)
+    _reject_plot(path, plot)
+    with open(path, "rb") as f:
+        return _read_binary_header(f, path) if is_binary(path) else _read_ascii_header(f, path)
 
 
 @dataclass
@@ -239,8 +308,9 @@ def resolve_columns(header: Header, names) -> List[int]:
     """Column indices to keep, sorted, always including column 0.
 
     Each entry of names matches, in order of preference: an exact sanitized name
-    (v_vo), a raw HSPICE name with optional closing paren (v(vo) or v(vo, which
-    for AC selects both _Mag and _Phase), or an fnmatch glob on sanitized names (v_*).
+    (v_vo), a raw name with optional closing paren (v(vo) or v(vo, which for AC
+    selects both _Mag and _Phase; HSPICE raw names have no closing paren, Nutmeg's
+    do), or an fnmatch glob on sanitized names (v_*).
     """
     if names is None:
         return list(range(header.ncols))
@@ -254,7 +324,9 @@ def resolve_columns(header: Header, names) -> List[int]:
         by_raw.setdefault(raw, []).append(i)
     chosen = {0}
     for req in names:
-        hits = by_name.get(req) or by_raw.get(req[:-1] if req.endswith(")") else req)
+        hits = by_name.get(req) or by_raw.get(req)
+        if not hits and req.endswith(")"):
+            hits = by_raw.get(req[:-1])
         if not hits:
             hits = [i for i, n in enumerate(header.names) if fnmatch.fnmatchcase(n, req)]
         if not hits:
@@ -306,10 +378,12 @@ class _Collector:
     segment completes it, and an incomplete point at a sentinel or at EOF is dropped.
     """
 
-    def __init__(self, header: Header, cols: Sequence[int], sweeps: Optional[Iterable[int]], capacity: int):
+    def __init__(self, header: Header, cols: Sequence[int], sweeps: Optional[Iterable[int]],
+                 capacity: int, xrange: Optional[Tuple[float, float]] = None):
         self.h = header
         self.sentinel = header.sentinel
         self.cols = list(cols)
+        self.xrange = xrange                    # closed x window; rows outside are never stored
         self.sweeps = None if sweeps is None else set(int(s) for s in sweeps)
         self.capacity = max(1, int(capacity))
         self.buf = {c: np.empty(self.capacity, header.dtype) for c in self.cols}
@@ -365,6 +439,14 @@ class _Collector:
     def _write_rows(self, rows: np.ndarray) -> None:
         if not self._keep():
             return
+        if self.xrange is not None:
+            lo, hi = self.xrange
+            x = rows[:, 0]
+            mask = (x >= lo) & (x <= hi)
+            if not mask.all():
+                if not mask.any():
+                    return
+                rows = rows[mask]
         end = self.fill + rows.shape[0]
         if end > self.capacity:
             self._grow(end)
@@ -457,13 +539,22 @@ def _feed_bulk_frames(f, header: Header, collector: _Collector, block_payload: i
             return index
 
 
-def read_traces(path, names=None, sweeps=None) -> TraceSet:
-    """Stream a result file, keeping only the requested columns and sweeps.
+def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None) -> TraceSet:
+    """Stream a result file, keeping only the requested columns, sweeps and x window.
 
     names: None for all, else a list of trace names (see resolve_columns). Column 0 is always kept.
     sweeps: None for all, else sweep indices to keep.
+    plot: which plot of a Nutmeg rawfile to read (0-based); HSPICE files hold a single plot.
+    xrange: None, or a validated (lo, hi) pair. Rows whose x value falls outside the closed
+            interval are dropped as the file streams, so memory follows the window, not the
+            column length. A sweep with no rows inside is kept, with empty arrays.
     """
+    from . import nutmeg          # imported here: nutmeg.py builds on this module
+
     path = os.fspath(path)
+    if nutmeg.is_nutmeg(path):
+        return nutmeg.read_nutmeg_traces(path, names, sweeps, plot, xrange)
+    _reject_plot(path, plot)
     if is_binary(path):
         with open(path, "rb") as f:
             header = _read_binary_header(f, path)
@@ -473,7 +564,9 @@ def read_traces(path, names=None, sweeps=None) -> TraceSet:
             block_payload = _peek_block_payload(f)
             capacity = _binary_capacity(file_size, data_start, block_payload,
                                         header.ncols, header.dtype.itemsize)
-            collector = _Collector(header, cols, sweeps, capacity)
+            if xrange is not None:
+                capacity = min(capacity, WINDOW_CAPACITY)
+            collector = _Collector(header, cols, sweeps, capacity, xrange)
             index = 1
             frame = block_payload + _FRAME_OVERHEAD
             if block_payload > 0 and block_payload % header.dtype.itemsize == 0 and frame <= _MAX_CHUNK_BYTES:
@@ -481,11 +574,14 @@ def read_traces(path, names=None, sweeps=None) -> TraceSet:
             for block in _iter_binary_blocks(f, header, index):
                 collector.feed(block)
     else:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        with open(path, "rb") as f:
             header = _read_ascii_header(f, path)
             cols = resolve_columns(header, names)
             file_size = os.fstat(f.fileno()).st_size
-            collector = _Collector(header, cols, sweeps, _ascii_capacity(file_size, header.ncols))
+            capacity = _ascii_capacity(file_size, header.ncols)
+            if xrange is not None:
+                capacity = min(capacity, WINDOW_CAPACITY)
+            collector = _Collector(header, cols, sweeps, capacity, xrange)
             for values in _iter_ascii_values(f, path):
                 collector.feed(values)
     truncated = collector.finish()

@@ -1,7 +1,8 @@
-"""Generators for synthetic HSPICE result files used by test_reader.py.
+"""Generators for synthetic result files used by test_reader.py and test_nutmeg.py.
 
-Layout follows hSpice_output.md and the sample files in test/: each block is
-12 endian bytes + int32 size + payload + int32 size.
+HSPICE layout follows hSpice_output.md and the sample files in test/: each block is
+12 endian bytes + int32 size + payload + int32 size. Nutmeg layout follows
+nutmeg_output.md.
 """
 import math
 import struct
@@ -98,3 +99,56 @@ def write_ascii(path, raw_names, type_codes, sweeps, per_line=5):
             fields = [fortran(v) for v in values]
             for i in range(0, len(fields), per_line):
                 f.write("".join(fields[i:i + per_line]) + "\n")
+
+
+def write_nutmeg(path, plots, binary=True, unknown_points=False, batch_layout=False):
+    """Write a Nutmeg rawfile (ngspice / SPICE3 .raw) with one or more plots.
+
+    plots: list of (plotname, raw_names, data, complex) or
+           (plotname, raw_names, data, complex, dimensions); data has shape
+           (npoints, nvars) and is complex128 when complex is True.
+    binary=True writes a "Binary:" section, False a "Values:" section.
+    unknown_points=True writes the placeholder "No. Points: 0       " that ngspice
+    leaves in the header while a run is still going.
+    batch_layout=True writes the ASCII layout of ngspice batch mode: the point index
+    followed by two tabs, and no blank line between points.
+    Returns the list of data arrays as written.
+    """
+    written = []
+    with open(path, "wb") as f:
+        for entry in plots:
+            plotname, raw_names, data, is_complex = entry[:4]
+            dimensions = entry[4] if len(entry) > 4 else None
+            data = np.ascontiguousarray(data, dtype=np.complex128 if is_complex else np.float64)
+            npoints, nvars = data.shape
+            if nvars != len(raw_names):
+                raise ValueError(f"{nvars} data columns but {len(raw_names)} names")
+            written.append(data)
+            head = ["Title: fixture", "Date: Mon Sep 21 00:00:00  2026",
+                    "Command: fixture", f"Plotname: {plotname}",
+                    "Flags: complex" if is_complex else "Flags: real",
+                    f"No. Variables: {nvars}",
+                    "No. Points: 0       " if unknown_points else f"No. Points: {npoints}"]
+            if dimensions:
+                head.append("Dimensions: " + ",".join(str(d) for d in dimensions))
+            head.append("Variables:")
+            head += [f"\t{i}\t{name}\tvoltage" for i, name in enumerate(raw_names)]
+            head.append("Binary:" if binary else "Values:")
+            f.write(("\n".join(head) + "\n").encode("utf-8"))
+            if binary:
+                f.write(data.astype("<c16" if is_complex else "<f8").tobytes())
+            else:
+                for p in range(npoints):
+                    lines = []
+                    for v in range(nvars):
+                        value = data[p, v]
+                        text = (f"{value.real:.15e},{value.imag:.15e}" if is_complex
+                                else f"{float(value):.15e}")
+                        if v:
+                            lead = "\t"
+                        else:
+                            lead = f"{p}\t\t" if batch_layout else f" {p}\t"
+                        lines.append(lead + text)
+                    tail = "\n" if batch_layout else "\n\n"      # batch mode writes no blank line
+                    f.write(("\n".join(lines) + tail).encode("utf-8"))
+    return written

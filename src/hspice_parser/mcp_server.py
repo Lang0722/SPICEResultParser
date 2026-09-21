@@ -51,23 +51,30 @@ def _tool_errors(fn):
 
 @server.tool()
 @_tool_errors
-def list_traces(path: str) -> dict:
-    """List trace names in an HSPICE .tr*/.sw*/.ac* result file (binary 9601/2001 or ASCII).
+def list_traces(path: str, plot: int = 0) -> dict:
+    """List trace names in an HSPICE .tr*/.sw*/.ac* result file (binary 9601/2001 or ASCII)
+    or a Nutmeg rawfile (ngspice / SPICE3 .raw, binary or ASCII).
 
     Reads only the header, so it is cheap on any file size. Returns the x variable
     name, the trace names to pass to `extract`, and the sweep parameter names.
+
+    plot: which plot of a Nutmeg rawfile to describe (0-based). A rawfile can hold
+          several plots; "plots" in the result names them all, and "plot" echoes the
+          index described. HSPICE files hold a single plot and report "plots": [].
     """
-    return api.list_traces(path)
+    return api.list_traces(path, plot)
 
 
 @server.tool()
 @_tool_errors
 def extract(path: str, names: Optional[List[str]] = None, sweeps: Optional[List[int]] = None,
             output: str = "summary", downsample: Optional[int] = None, dest: Optional[str] = None,
-            xrange: Optional[List[float]] = None, yrange: Optional[List[float]] = None) -> dict:
-    """Extract selected traces from an HSPICE result file with memory bounded by the selection.
+            xrange: Optional[List[float]] = None, yrange: Optional[List[float]] = None,
+            plot: int = 0) -> dict:
+    """Extract selected traces from an HSPICE result file or a Nutmeg rawfile
+    (ngspice / SPICE3 .raw, binary or ASCII) with memory bounded by the selection.
 
-    names: trace names from list_traces (v_out), raw HSPICE names (v(out)), or globs (v_*);
+    names: trace names from list_traces (v_out), raw names (v(out)), or globs (v_*);
            None selects everything. The x variable is always included.
     sweeps: sweep indices to keep; None keeps all.
     output: "summary" returns per-trace count/min/max/mean/first/last plus `downsample`
@@ -79,8 +86,12 @@ def extract(path: str, names: Optional[List[str]] = None, sweeps: Optional[List[
             total; "png" draws at most 5000 points per line whatever downsample says.
     dest: output file path for csv/npz/png; default is beside the input file.
     xrange: [min, max] on the x variable (TIME, FREQ, sweep variable); only rows inside
-            the closed interval are kept, for every output.
+            the closed interval are kept, for every output. The window is applied while
+            the file streams, so a narrow window on a huge file is cheap in memory: use
+            it rather than reading everything.
     yrange: [min, max] vertical axis limits for the png plot; ignored by other outputs.
+    plot: which plot of a Nutmeg rawfile to read (0-based); see list_traces for the list.
+          Ignored for HSPICE files, which hold a single plot.
     """
     if output == "arrays":
         raise ValueError("output='arrays' is not available over MCP; use 'summary', 'csv', 'npz' or 'png'")
@@ -90,8 +101,8 @@ def extract(path: str, names: Optional[List[str]] = None, sweeps: Optional[List[
     yrange = api.validate_range("yrange", yrange)
     if output == "summary":
         return api.extract(path, names, sweeps, "summary", 200 if downsample is None else downsample,
-                           xrange=xrange)
-    ts = api.extract(path, names, sweeps, "arrays", downsample, xrange=xrange)
+                           xrange=xrange, plot=plot)
+    ts = api.extract(path, names, sweeps, "arrays", downsample, xrange=xrange, plot=plot)
     written = api.write_file(ts, output, dest, yrange)
     x = ts.header.x_name
     result = {
