@@ -1387,7 +1387,7 @@ class TestMcp(unittest.TestCase):
             self.m.extract(str(HERE / "test_9601.tr0"), output="xlsx")
 
     def test_summary_is_json(self):
-        out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], downsample=20)
+        out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="summary", downsample=20)
         json.dumps(out)
         self.assertEqual(len(out["traces"]["v_vo"][0]["x"]), 20)
 

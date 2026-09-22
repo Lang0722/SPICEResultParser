@@ -166,15 +166,26 @@ pip install 'hspice_parser[mcp]'
 
 Tools: `list_traces(path, plot)` and `extract(path, names, sweeps, output, downsample, dest, xrange, yrange, plot)`,
 on HSPICE result files and Nutmeg rawfiles alike (`plot` picks one plot of a rawfile).
-Over MCP `output` is `summary` (default, returns statistics and downsampled points),
-`csv`, `npz` (write a file and return its path), or `png` (writes a plot and returns its
-path and pixel size); full arrays are never sent inline. `xrange=[lo, hi]` restricts
+Over MCP `output` is `text` (default), `summary` (statistics and downsampled points as
+JSON with exact floats), `csv`, `npz` (write a file and return its path), or `png`
+(writes a plot and returns its path and pixel size); full arrays are never sent inline.
+
+`text` is written for an agent to read: a header (`transient | x: time | 522 points
+(20 shown)`, plus `in k sweeps` and the plot name when there are several), for an AC
+plot a legend that traces are split into `_Mag`/`_Phase` (degrees), a `trace min max`
+table over every point, then one table per sweep with x once and one column per
+trace, `downsample` evenly spaced rows (first and last kept, at most 500 rows in
+total). Values are rounded to 6 significant digits; NaN and infinity print as `nan`/
+`inf`; a truncated file says so on its first line; a nested `.dc` sweep that ngspice
+writes flat is split into one table per run of the inner variable. The same rendering
+is `hspice_parser.mcp_server.format_text(ts, points=20)` for any `TraceSet`, and the
+module imports without the `mcp` package (only `hsp-mcp` itself needs it). `xrange=[lo, hi]` restricts
 every output to the rows whose x value lies in that closed interval, and is applied
 while the file streams, so a narrow window on a huge file is cheap; `yrange=[lo, hi]`
 sets the plot's vertical axis limits and is ignored by the other outputs.
 
-`downsample` is optional over MCP: left unset it defaults to 200 points per sweep
-for `summary`, and to no decimation at all for `csv` and `npz`, which keep every
-point. `dest` names the output file for `csv`/`npz`/`png`; it is not restricted to the
+`downsample` is optional over MCP: left unset it defaults to 20 rows per sweep for
+`text`, 200 points per sweep for `summary`, and to no decimation at all for `csv` and
+`npz`, which keep every point. `dest` names the output file for `csv`/`npz`/`png`; it is not restricted to the
 input's directory, so the agent can write to any path the server process can
 reach. Leave it unset to write `<input>_<ext>_traces.<csv|npz|png>` beside the input.

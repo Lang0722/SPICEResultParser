@@ -859,6 +859,161 @@ class TestApi(unittest.TestCase):
         self.assertTrue(dest.stat().st_size > 0)
 
 
+class TestFormatText(unittest.TestCase):
+    """mcp_server.format_text: the agent-readable rendering; runs without the mcp package."""
+
+    def setUp(self):
+        from hspice_parser import mcp_server
+
+        self.m = mcp_server
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def text(self, path, names=None, points=20, **kw):
+        return self.m.format_text(api.extract(path, names, output="arrays", **kw), points)
+
+    def test_importable_without_mcp(self):
+        import importlib
+        import subprocess
+
+        code = ("import sys; sys.modules['mcp'] = None\n"
+                "from hspice_parser import mcp_server as m\n"
+                "assert m.server is None and m.FastMCP is None\n"
+                "assert m.format_text is not None and callable(m.extract)\n"
+                "try:\n    m.main()\nexcept ImportError as e:\n    assert 'hspice_parser[mcp]' in str(e)\n"
+                "else:\n    raise SystemExit('main() should refuse to start')\n")
+        src = Path(importlib.import_module("hspice_parser").__file__).parent.parent
+        subprocess.run([sys.executable, "-c", code], check=True, cwd=str(src))
+
+    def test_dc_plot(self):
+        t = self.text(BIN, ["v(out)"], plot=2)
+        lines = t.splitlines()
+        self.assertEqual(lines[0], "dc sweep | x: v_v-sweep | 5 points | plot 2: DC transfer characteristic "
+                                   "(file has 3 plots)")
+        self.assertNotIn("shown", lines[0])
+        self.assertEqual(lines[2].split(), ["trace", "min", "max"])
+        self.assertEqual(lines[3].split(), ["v_out", "0", "1"])
+        self.assertEqual(lines[5].split(), ["v_v-sweep", "v_out"])
+        self.assertEqual(lines[7].split(), ["0.25", "0.25"])
+        self.assertEqual(len(lines), 11)
+        self.assertEqual(t.count("v_v-sweep"), 2)   # header and column heading, never per trace
+
+    def test_points_keeps_first_and_last(self):
+        t = self.text(ASCII, ["v_out"], points=3)
+        lines = t.splitlines()
+        self.assertTrue(lines[0].startswith("transient | x: time | 80 points (3 shown)"))
+        rows = [l.split() for l in lines[-3:]]
+        self.assertEqual([r[0] for r in rows], ["0", "9.2e-09", "2e-08"])   # x[0], x[40], x[79]
+
+    def test_ac_plot(self):
+        t = self.text(BIN, ["v(out)"], plot=1, points=6)
+        lines = t.splitlines()
+        self.assertTrue(lines[0].startswith("ac | x: frequency | 46 points (6 shown)"))
+        self.assertEqual(lines[1], self.m.AC_LEGEND)
+        self.assertEqual(lines[7].split(), ["frequency", "v_out_Mag", "v_out_Phase"])
+        self.assertEqual(lines[8].split()[0], "1")
+        self.assertEqual(lines[-1].split()[0], "1e+09")
+
+    def test_one_plot_file_names_no_plot(self):
+        t = self.text(HERE / "test_9601.tr0", ["v_vo"], points=2)
+        self.assertNotIn("plot", t.splitlines()[0])
+        self.assertTrue(t.startswith("transient | x: TIME | "))
+
+    def test_sweeps_with_a_parameter(self):
+        sweeps = []
+        rng = np.random.default_rng(5)
+        for n, r in ((150, 1000.0), (97, 2000.0), (231, 3000.0)):
+            data = rng.random((n, 2))
+            data[:, 0] = np.linspace(0, 1e-6, n)
+            sweeps.append(([r], data))
+        path = self.dir / "ms.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(a", "r1"], [1, 1], sweeps)
+        t = self.text(path, points=3)
+        lines = t.splitlines()
+        self.assertEqual(lines[0], "transient | x: TIME | 478 points in 3 sweeps (9 shown)")
+        self.assertEqual(lines[3].split()[0], "v_a[0]")
+        self.assertEqual(lines[5].split()[0], "v_a[2]")
+        self.assertEqual([l for l in lines if l.startswith("--")],
+                         ["-- sweep 0: r1=1000 --", "-- sweep 1: r1=2000 --", "-- sweep 2: r1=3000 --"])
+        self.assertEqual(lines[-1].split()[0], "1e-06")
+        # one sweep kept: plain table, no sweep labels
+        one = self.text(path, points=3, sweeps=[2])
+        self.assertTrue(one.startswith("transient | x: TIME | 231 points (3 shown)"))
+        self.assertNotIn("--", one)
+        self.assertNotIn("[", one)
+
+    def test_flat_nested_sweep_is_split_on_x_restarts(self):
+        x = np.tile(np.linspace(0, 0.8, 5), 3)
+        y = np.concatenate([x[:5] * k for k in (1, 2, 3)])
+        path = self.dir / "nested.raw"
+        fixtures.write_nutmeg(path, [("DC transfer characteristic", ["v(v-sweep)", "i(v1)"],
+                                      np.c_[x, y], False)])
+        t = self.text(path, points=3)
+        lines = t.splitlines()
+        self.assertEqual(lines[0], "dc sweep | x: v_v-sweep | 15 points (9 shown)")
+        self.assertEqual(lines[3].split(), ["i_v1", "0", "2.4"])
+        heads = [i for i, l in enumerate(lines) if l.startswith("--")]
+        self.assertEqual([lines[i] for i in heads],
+                         [f"-- run {j} of 3 (x restarts) --" for j in (1, 2, 3)])
+        for i, k in zip(heads, (1, 2, 3)):
+            self.assertEqual(lines[i + 2].split(), ["0", "0"])
+            self.assertEqual(lines[i + 4].split(), ["0.8", self.m._num(0.8 * k)])
+
+    def test_random_x_is_not_split(self):
+        from test_reader import make_multi
+
+        path, _ = make_multi(self.dir, "2001")
+        t = self.text(path, ["v_a"], points=3)
+        self.assertNotIn("run ", t)
+        self.assertEqual(t.count("-- sweep"), 3)
+
+    def test_nan_inf_and_negative_zero(self):
+        data = np.array([[0.0, -0.0], [1e-9, float("nan")], [2e-9, float("inf")]])
+        path = self.dir / "nan.raw"
+        fixtures.write_nutmeg(path, [("Transient Analysis", ["time", "v(out)"], data, False)])
+        lines = self.text(path).splitlines()
+        self.assertEqual(lines[3].split(), ["v_out", "nan", "nan"])
+        self.assertEqual(lines[6].split(), ["0", "0"])
+        self.assertEqual(lines[7].split(), ["1e-09", "nan"])
+        self.assertEqual(lines[8].split(), ["2e-09", "inf"])
+        self.assertEqual(self.m._num(float("-inf")), "-inf")
+        self.assertEqual(self.m._num(0.30000000000000004), "0.3")
+        self.assertEqual(self.m._num(-0.0009999999999999998), "-0.001")
+
+    def test_truncated_file_says_so_first(self):
+        data = np.arange(10 * 2, dtype=np.float64).reshape(10, 2)
+        path = self.dir / "trunc.raw"
+        fixtures.write_nutmeg(path, [("Transient Analysis", ["time", "v(a)"], data, False)])
+        raw = path.read_bytes()
+        path.write_bytes(raw[:len(raw) - (2 * 8 + 3)])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            t = self.text(path)
+        lines = t.splitlines()
+        self.assertEqual(lines[0], self.m.TRUNCATED_LINE)
+        self.assertEqual(lines[1], "transient | x: time | 8 points")
+
+    def test_empty_window(self):
+        t = self.text(ASCII, ["v_out"], xrange=(5, 6))
+        self.assertEqual(t, "transient | x: time | 0 points | plot 0: Transient Analysis (file has 3 plots)\n"
+                            "no points in the selected x window")
+
+    def test_row_cap(self):
+        t = self.text(HERE / "test_9601.tr0", ["v_vo"], points=10 ** 6)
+        self.assertIn(f"({self.m.TEXT_MAX_ROWS} shown)", t.splitlines()[0])
+        self.assertEqual(len(t.splitlines()), 6 + self.m.TEXT_MAX_ROWS)
+
+    def test_only_x(self):
+        t = self.text(ASCII, [], points=2)
+        lines = t.splitlines()
+        self.assertTrue(lines[0].startswith("transient | x: time | 80 points (2 shown) | plot 0"))
+        self.assertEqual(lines[2].split(), ["time"])
+        self.assertEqual(len(lines), 5)
+
+
 class TestMcp(unittest.TestCase):
     """Item 12."""
 
@@ -882,6 +1037,18 @@ class TestMcp(unittest.TestCase):
         self.assertEqual(out["plots"], PLOT_NAMES)
         self.assertEqual(out["traces"], ["v_in", "v_out", "i_v1"])
         json.dumps(out)
+
+    def test_extract_tool_defaults_to_text(self):
+        out = self.m.extract(str(BIN), ["v(out)"], plot=2)
+        self.assertIsInstance(out, str)
+        self.assertTrue(out.startswith("dc sweep | x: v_v-sweep | 5 points"))
+        self.assertIn("(6 shown)", self.m.extract(str(BIN), ["v(out)"], plot=1, downsample=6))
+        tools = {t.name: t for t in asyncio.run(self.m.server.list_tools())}
+        schema = getattr(tools["extract"], "inputSchema", None) or tools["extract"].input_schema
+        self.assertEqual(schema["properties"]["output"]["default"], "text")
+        result = asyncio.run(self.m.server.call_tool("extract", {"path": str(BIN), "names": ["v(out)"], "plot": 2}))
+        content = getattr(result, "content", None) or (result[0] if isinstance(result, tuple) else result)
+        self.assertTrue(content[0].text.startswith("dc sweep | x: v_v-sweep"))
 
     def test_extract_tool_reaches_the_ac_plot(self):
         out = self.m.extract(str(BIN), ["v(out)"], output="summary", downsample=10, plot=1)
@@ -918,8 +1085,10 @@ class TestDocs(unittest.TestCase):
         text = (HERE.parent / "nutmeg_output.md").read_text()
         for token in ("Plotname", "Binary:", "Values:", "Dimensions"):
             self.assertIn(token, text)
-        self.assertIn("Nutmeg", (HERE.parent / "Usage.md").read_text())
-        self.assertIn("Nutmeg", (HERE.parent / "README.md").read_text())
+        for doc in ("Usage.md", "README.md"):
+            text = (HERE.parent / doc).read_text()
+            self.assertIn("Nutmeg", text)
+            self.assertIn("`text`", text)
 
 
 if __name__ == "__main__":

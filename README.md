@@ -101,9 +101,12 @@ pip install "hspice_parser[mcp,plot] @ git+https://github.com/Lang0722/hspicePar
 
 Tools: `list_traces(path, plot)` and `extract(path, names, sweeps, output, downsample,
 dest, xrange, yrange, plot)`, on HSPICE result files and Nutmeg rawfiles alike. Over MCP
-`output` is `summary` (statistics plus a bounded number of downsampled points), `csv`,
-`npz` or `png`; full arrays are never sent inline. `plot` picks one plot of a Nutmeg
-rawfile.
+`output` is `text` (default: a readable report, per-trace min/max then a table with x
+once and one column per trace, rounded to 6 significant digits), `summary` (the same as
+JSON with exact floats plus a bounded number of downsampled points), `csv`, `npz` or
+`png`; full arrays are never sent inline. `plot` picks one plot of a Nutmeg rawfile.
+`hspice_parser.mcp_server.format_text(ts, points)` renders that text for any
+`TraceSet` and needs no `mcp` package.
 
 Design notes live in `docs/superpowers/specs/`; the full API is described in
 [Usage.md](Usage.md).
