@@ -1,10 +1,11 @@
 [project]
-name = "hspice_parser"
+name = "spice_result_parser"
 version = "0.1.0"
-description = "A parser for HSPICE simulation output files."
+description = "A low-memory parser for HSPICE and Nutmeg (ngspice/SPICE3) simulation result files, with an MCP server for agents."
 readme = "README.md"
 requires-python = ">= 3.9"
 license = {file = "LICENSE"}
+license-files = ["LICENSE", "LICENSE.MIT"]
 authors = [
     {name = "Gonzalez, Raffa", email = "rcgonzalez@g.hmc.edu"},
     {name = "Spencer, Matthew", email = "mespence@gmail.com"}
@@ -16,12 +17,12 @@ mcp = ["mcp>=1.0"]
 plot = ["matplotlib>=3.5"]
 
 [project.scripts]
-hsp-parser = "hspice_parser:convert"
-hsp-mcp = "hspice_parser.mcp_server:main"
+srp-parser = "spice_result_parser:convert"
+srp-mcp = "spice_result_parser.mcp_server:main"
 
 [build-system]
 build-backend = "hatchling.build"
 requires = ["hatchling"]
 
 [tool.hatchling.build.targets.wheel]
-packages = ["src/hspice_parser"]
+packages = ["src/spice_result_parser"]

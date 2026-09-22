@@ -1,7 +1,7 @@
-"""MCP server exposing hspice_parser to agents over stdio.
+"""MCP server exposing spice_result_parser to agents over stdio.
 
-Install the extra first: pip install 'hspice_parser[mcp]'. Then register the
-command `hsp-mcp` with your MCP client.
+Install the extra first: pip install 'spice_result_parser[mcp]'. Then register the
+command `srp-mcp` with your MCP client.
 
 The module imports without the mcp package: `format_text`, the agent-readable
 rendering of a trace selection, and the tool functions stay usable as plain
@@ -252,5 +252,5 @@ def _png_size(path: str):
 
 def main() -> None:
     if server is None:
-        raise ImportError("MCP support needs the optional dependency: pip install 'hspice_parser[mcp]'")
+        raise ImportError("MCP support needs the optional dependency: pip install 'spice_result_parser[mcp]'")
     server.run()   # stdio transport

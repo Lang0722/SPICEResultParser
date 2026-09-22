@@ -5,7 +5,7 @@
 
 # Overview
 
-The hspiceParser is made to convert hSpice DC, AC and transient simulation output files (*.swX, *.acX, *.trX) to file types that are readable by common mathematical software. It is capable of reading the 9601 and 2001 binary formats, the ASCII file format, and the measure file format. The parser can generate CSV files, matlab files containing ASCII strings in arrays, which are given the suffix “.m”, and Python Pickle files. Downloading Scipy and Numpy allows it to produce Matlab binary files in 
+SPICEResultParser is made to convert hSpice DC, AC and transient simulation output files (*.swX, *.acX, *.trX) to file types that are readable by common mathematical software. It is capable of reading the 9601 and 2001 binary formats, the ASCII file format, and the measure file format. The parser can generate CSV files, matlab files containing ASCII strings in arrays, which are given the suffix “.m”, and Python Pickle files. Downloading Scipy and Numpy allows it to produce Matlab binary files in 
 the .mat format.
 
 hSpice simulations report arrays of values of electrical variables that correspond to an independent variable specified by the simulation command (.dc, .ac or .tr).  It is possible to write simulation commands that repeat the simulation with slight variations, referred to as an inner sweep, and the repeated copies of the electrical variables that result are called sweeps. It is also possible to repeat the simulation command using a different syntax called an ‘alter’.  Each alteration created by an alter will produce a separate output file: eg: a transient simulation might produce a tr0 file on its first alter and a tr1 file on its second alter. Details of these commands can be found in the hSpice command reference.
@@ -28,11 +28,11 @@ For help do:
 
 `python hSpice_parser.py -h` or `python hSpice_parser.py --help`
 
-The hSpiceParser function can be imported into your own Python scripts. If there were multiple hSpice files in a folder that you wanted to parse all at once, you could use the script below:
+The converter function can be imported into your own Python scripts. If there were multiple hSpice files in a folder that you wanted to parse all at once, you could use the script below:
 
 ```python
 from os import path, listdir
-from hspiceParser import import_export
+from spice_result_parser.hspiceParser import import_export
 
 directory = 'path/to/files'  # this code assumes that this directory only contains compatible files.
 output_ext = 'pickle'
@@ -68,7 +68,7 @@ trace and 67 MB for all four. ASCII is parsed in 128 KB chunks split in bulk, so
 cost is the text-to-float conversion, not the file size.
 
 ```python
-from hspice_parser import list_traces, extract
+from spice_result_parser import list_traces, extract
 
 list_traces("run.tr0")
 # {'path': 'run.tr0', 'format': '2001', 'analysis': 'tr', 'x': 'TIME',
@@ -87,7 +87,7 @@ extract("run.tr0", ["v(out)"], output="summary", downsample=200)   # JSON-friend
 
 # Region of interest: xrange keeps only rows with lo <= x <= hi (any output);
 # yrange sets the plot's vertical limits (png only). png needs matplotlib:
-# pip install 'hspice_parser[plot]'
+# pip install 'spice_result_parser[plot]'
 extract("run.tr0", ["v(out)"], xrange=(1e-9, 5e-9), output="csv", dest="window.csv")
 extract("run.tr0", ["v(out)", "v(in)"], xrange=(1e-9, 5e-9), yrange=(0, 1.2), output="png")
 #   -> 'run_tr0_traces.png': one line per trace per sweep, log x axis for AC files
@@ -154,14 +154,14 @@ column, UTF-16 header), and files written with `set appendwrite`.
 
 # MCP server
 
-Install the extra and register the `hsp-mcp` command with your MCP client:
+Install the extra and register the `srp-mcp` command with your MCP client:
 
 ```
-pip install 'hspice_parser[mcp]'
+pip install 'spice_result_parser[mcp]'
 ```
 
 ```json
-{"mcpServers": {"hspice": {"command": "hsp-mcp"}}}
+{"mcpServers": {"hspice": {"command": "srp-mcp"}}}
 ```
 
 Tools: `list_traces(path, plot)` and `extract(path, names, sweeps, output, downsample, dest, xrange, yrange, plot)`,
@@ -178,8 +178,8 @@ trace, `downsample` evenly spaced rows (first and last kept, at most 500 rows in
 total). Values are rounded to 6 significant digits; NaN and infinity print as `nan`/
 `inf`; a truncated file says so on its first line; a nested `.dc` sweep that ngspice
 writes flat is split into one table per run of the inner variable. The same rendering
-is `hspice_parser.mcp_server.format_text(ts, points=20)` for any `TraceSet`, and the
-module imports without the `mcp` package (only `hsp-mcp` itself needs it). `xrange=[lo, hi]` restricts
+is `spice_result_parser.mcp_server.format_text(ts, points=20)` for any `TraceSet`, and the
+module imports without the `mcp` package (only `srp-mcp` itself needs it). `xrange=[lo, hi]` restricts
 every output to the rows whose x value lies in that closed interval, and is applied
 while the file streams, so a narrow window on a huge file is cheap; `yrange=[lo, hi]`
 sets the plot's vertical axis limits and is ignored by the other outputs.

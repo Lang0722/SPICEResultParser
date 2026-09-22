@@ -164,7 +164,7 @@ def _require_matplotlib():
     try:
         from matplotlib.figure import Figure
     except ImportError as exc:
-        raise ImportError("output='png' needs the optional dependency: pip install 'hspice_parser[plot]'") from exc
+        raise ImportError("output='png' needs the optional dependency: pip install 'spice_result_parser[plot]'") from exc
     return Figure
 
 

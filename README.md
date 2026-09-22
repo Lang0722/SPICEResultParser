@@ -1,6 +1,8 @@
-# hspiceParser
+# SPICEResultParser
 
-Welcome to the hspiceParser GitHub page. hspiceParser aims to be the final word in parsing hSpice output files, building on a long legacy of programs built by other circuit designers.
+Welcome to the SPICEResultParser GitHub page. SPICEResultParser reads the result files
+written by circuit simulators -- HSPICE `.tr*/.sw*/.ac*` and Nutmeg `.raw` (ngspice,
+SPICE3, Xyce) -- and hands the traces to Python, to files, or to an AI agent.
 
 This fork of [HMC-ACE/hspiceParser](https://github.com/HMC-ACE/hspiceParser) adds a
 **low-memory streaming reader**, a **trace-selection API** (arrays, CSV, npz, summary,
@@ -8,10 +10,10 @@ PNG plot, x/y region) and an **MCP server** so AI agents can query result files.
 original converter is untouched and still available. See
 [Low-memory reader, API and MCP server](#low-memory-reader-api-and-mcp-server) below.
 
-The main goals of hspiceParser are:
+The main goals of SPICEResultParser are:
 
 1. **Very simple installation** - Easy to set up and use
-2. **Support for a wide variety of output formats** - Compatible with multiple hSpice formats
+2. **Support for a wide variety of output formats** - HSPICE 9601/2001/ASCII and Nutmeg rawfiles, binary or ASCII
 3. **Thorough documentation** - Clear explanations of what the parser is doing
 
 If you've ever Googled "hSpice output format" and been frustrated at the result, then we're hoping this project helps.
@@ -23,27 +25,27 @@ If you've ever Googled "hSpice output format" and been frustrated at the result,
 Run the following command in your terminal:
 
 ```bash
-pixi add hspice_parser --git https://github.com/Lang0722/hspiceParser --branch feature/low-memory-reader
+pixi add spice_result_parser --git https://github.com/Lang0722/SPICEResultParser --branch feature/low-memory-reader
 ```
 
 ### Using pip
-You can also install hspiceParser using pip:
+You can also install SPICEResultParser using pip:
 
 ```bash
-pip install "git+https://github.com/Lang0722/hspiceParser.git@feature/low-memory-reader"
+pip install "git+https://github.com/Lang0722/SPICEResultParser.git@feature/low-memory-reader"
 # optional extras: [mcp] for the MCP server, [plot] for PNG output
-pip install "hspice_parser[mcp,plot] @ git+https://github.com/Lang0722/hspiceParser.git@feature/low-memory-reader"
+pip install "spice_result_parser[mcp,plot] @ git+https://github.com/Lang0722/SPICEResultParser.git@feature/low-memory-reader"
 ```
 
-After installation, you can use the `hsp-parser` (legacy converter) and `hsp-mcp`
+After installation, you can use the `srp-parser` (legacy converter) and `srp-mcp`
 (MCP server) commands from your terminal.
 
 ### Quick Download
 
-You can download hspiceParser directly from [here](https://github.com/HMC-ACE/hspiceParser/blob/main/src/hspice_parser/hspiceParser.py), or run the following terminal command:
+You can download the legacy converter directly from [here](https://github.com/HMC-ACE/hspiceParser/blob/main/src/spice_result_parser/hspiceParser.py), or run the following terminal command:
 
 ```bash
-wget https://raw.githubusercontent.com/HMC-ACE/hspiceParser/main/src/hspice_parser/hspiceParser.py
+wget https://raw.githubusercontent.com/HMC-ACE/hspiceParser/main/src/spice_result_parser/hspiceParser.py
 ```
 
 ### Requirements
@@ -67,7 +69,7 @@ memory) and converts every trace. The streaming reader keeps only the traces you
 Python + numpy alone account for about 29 MB of that.
 
 ```python
-from hspice_parser import list_traces, extract
+from spice_result_parser import list_traces, extract
 
 list_traces("run.tr0")                              # header only: trace names, x variable, sweeps
 ts = extract("run.tr0", ["v(out)", "i_*"])          # numpy arrays, one per trace per sweep
@@ -92,11 +94,11 @@ writing is read up to its last complete point and flagged `truncated`.
 ### MCP server for agents
 
 ```bash
-pip install "hspice_parser[mcp,plot] @ git+https://github.com/Lang0722/hspiceParser.git@feature/low-memory-reader"
+pip install "spice_result_parser[mcp,plot] @ git+https://github.com/Lang0722/SPICEResultParser.git@feature/low-memory-reader"
 ```
 
 ```json
-{"mcpServers": {"hspice": {"command": "hsp-mcp"}}}
+{"mcpServers": {"hspice": {"command": "srp-mcp"}}}
 ```
 
 Tools: `list_traces(path, plot)` and `extract(path, names, sweeps, output, downsample,
@@ -105,11 +107,19 @@ dest, xrange, yrange, plot)`, on HSPICE result files and Nutmeg rawfiles alike. 
 once and one column per trace, rounded to 6 significant digits), `summary` (the same as
 JSON with exact floats plus a bounded number of downsampled points), `csv`, `npz` or
 `png`; full arrays are never sent inline. `plot` picks one plot of a Nutmeg rawfile.
-`hspice_parser.mcp_server.format_text(ts, points)` renders that text for any
+`spice_result_parser.mcp_server.format_text(ts, points)` renders that text for any
 `TraceSet` and needs no `mcp` package.
 
 Design notes live in `docs/superpowers/specs/`; the full API is described in
 [Usage.md](Usage.md).
+
+## License
+
+SPICEResultParser is distributed under the **GNU General Public License v3.0**
+([LICENSE](LICENSE)). It is a fork of [HMC-ACE/hspiceParser](https://github.com/HMC-ACE/hspiceParser),
+which is MIT licensed, Copyright (c) 2021 HMC-ACE; that notice is kept in
+[LICENSE.MIT](LICENSE.MIT) and continues to cover the original code, including the
+legacy converter `src/spice_result_parser/hspiceParser.py`.
 
 ## Documentation
 

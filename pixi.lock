@@ -72,7 +72,7 @@ packages:
   size: 155907
   timestamp: 1759649036195
 - conda: .
-  name: hspice_parser
+  name: spice_result_parser
   version: 0.1.0
   build: pyh4616a5c_0
   subdir: noarch

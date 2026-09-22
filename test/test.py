@@ -6,7 +6,7 @@ import pickle
 import unittest as ut
 from pathlib import Path
 
-from hspice_parser.hspiceParser import (
+from spice_result_parser.hspiceParser import (
     break_by_sweep,
     general_make_dict,
     get_from_ext,

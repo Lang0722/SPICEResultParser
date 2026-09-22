@@ -21,9 +21,9 @@ sys.path.insert(0, str(HERE))
 
 import fixtures  # noqa: E402
 
-from hspice_parser.reader import read_header, read_traces  # noqa: E402
-from hspice_parser import api  # noqa: E402
-from hspice_parser import nutmeg  # noqa: E402
+from spice_result_parser.reader import read_header, read_traces  # noqa: E402
+from spice_result_parser import api  # noqa: E402
+from spice_result_parser import nutmeg  # noqa: E402
 
 BIN = HERE / "nutmeg_rc_bin.raw"
 ASCII = HERE / "nutmeg_rc_ascii.raw"
@@ -863,7 +863,7 @@ class TestFormatText(unittest.TestCase):
     """mcp_server.format_text: the agent-readable rendering; runs without the mcp package."""
 
     def setUp(self):
-        from hspice_parser import mcp_server
+        from spice_result_parser import mcp_server
 
         self.m = mcp_server
         self.tmp = tempfile.TemporaryDirectory()
@@ -880,12 +880,12 @@ class TestFormatText(unittest.TestCase):
         import subprocess
 
         code = ("import sys; sys.modules['mcp'] = None\n"
-                "from hspice_parser import mcp_server as m\n"
+                "from spice_result_parser import mcp_server as m\n"
                 "assert m.server is None and m.FastMCP is None\n"
                 "assert m.format_text is not None and callable(m.extract)\n"
-                "try:\n    m.main()\nexcept ImportError as e:\n    assert 'hspice_parser[mcp]' in str(e)\n"
+                "try:\n    m.main()\nexcept ImportError as e:\n    assert 'spice_result_parser[mcp]' in str(e)\n"
                 "else:\n    raise SystemExit('main() should refuse to start')\n")
-        src = Path(importlib.import_module("hspice_parser").__file__).parent.parent
+        src = Path(importlib.import_module("spice_result_parser").__file__).parent.parent
         subprocess.run([sys.executable, "-c", code], check=True, cwd=str(src))
 
     def test_dc_plot(self):
@@ -1022,7 +1022,7 @@ class TestMcp(unittest.TestCase):
             import mcp  # noqa: F401
         except ImportError:
             self.skipTest("mcp package not installed")
-        from hspice_parser import mcp_server
+        from spice_result_parser import mcp_server
 
         self.m = mcp_server
         self.tmp = tempfile.TemporaryDirectory()

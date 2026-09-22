@@ -19,9 +19,9 @@ sys.path.insert(0, str(HERE))
 
 import fixtures  # noqa: E402
 
-from hspice_parser.reader import read_header, read_traces  # noqa: E402
-from hspice_parser import reader  # noqa: E402
-from hspice_parser import api  # noqa: E402
+from spice_result_parser.reader import read_header, read_traces  # noqa: E402
+from spice_result_parser import reader  # noqa: E402
+from spice_result_parser import api  # noqa: E402
 
 
 class TestHeader(unittest.TestCase):
@@ -114,7 +114,7 @@ class TestFixtures(unittest.TestCase):
             self.assertAlmostEqual(float(fixtures.fortran(v)), v, delta=abs(v) * 1e-6)
 
     def test_binary_fixture_readable_by_old_parser(self):
-        from hspice_parser.hspiceParser import parse_header, read_binary_signal_file
+        from spice_result_parser.hspiceParser import parse_header, read_binary_signal_file
 
         rng = np.random.default_rng(1)
         sweeps = [([1000.0], rng.random((11, 4))), ([2000.0], rng.random((6, 4)))]
@@ -150,7 +150,7 @@ class TestFixtures(unittest.TestCase):
         self.assertNotEqual(stream[-1], 1e30)
 
     def test_ascii_fixture_readable_by_old_parser(self):
-        from hspice_parser.hspiceParser import signal_file_ascii_read
+        from spice_result_parser.hspiceParser import signal_file_ascii_read
 
         rng = np.random.default_rng(2)
         sweeps = [([1000.0], rng.uniform(-1, 1, (7, 4))), ([2000.0], rng.uniform(-1, 1, (5, 4)))]
@@ -218,7 +218,7 @@ class TestBinaryRead(unittest.TestCase):
 
     def test_ac_9601_matches_old_ac_path(self):
         # data_dict_ac_9601.pickle was produced through the "tr" path and is wrong; use the live ac path.
-        from hspice_parser.hspiceParser import read_binary_signal_file, write_to_dict
+        from spice_result_parser.hspiceParser import read_binary_signal_file, write_to_dict
 
         header_str, blocks = read_binary_signal_file(str(HERE / "test_9601.ac0"))
         old, _, _, _ = write_to_dict(blocks, header_str, "ac")
@@ -727,7 +727,7 @@ class TestAsciiRead(unittest.TestCase):
         self.assertEqual(h.dtype, np.dtype("<f8"))
 
     def test_matches_old_ascii_reader(self):
-        from hspice_parser.hspiceParser import signal_file_ascii_read
+        from spice_result_parser.hspiceParser import signal_file_ascii_read
 
         old = signal_file_ascii_read(str(self.path))
         ts = read_traces(self.path)
@@ -1336,7 +1336,7 @@ class TestXrangeWhileReading(unittest.TestCase):
 
 class TestPackage(unittest.TestCase):
     def test_exports(self):
-        import hspice_parser as hp
+        import spice_result_parser as hp
 
         for name in ["convert", "Header", "TraceSet", "read_header", "read_traces",
                      "list_traces", "extract", "write_file", "summarize"]:
@@ -1344,12 +1344,12 @@ class TestPackage(unittest.TestCase):
 
     def test_pyproject_declares_mcp_extra_and_script(self):
         text = (HERE.parent / "pyproject.toml").read_text()
-        self.assertIn('hsp-mcp = "hspice_parser.mcp_server:main"', text)
+        self.assertIn('srp-mcp = "spice_result_parser.mcp_server:main"', text)
         self.assertIn('mcp = ["mcp>=1.0"]', text)
 
     def test_usage_documents_api_and_mcp(self):
         text = (HERE.parent / "Usage.md").read_text()
-        self.assertIn("hsp-mcp", text)
+        self.assertIn("srp-mcp", text)
         self.assertIn("list_traces", text)
         self.assertIn("extract(", text)
 
@@ -1360,7 +1360,7 @@ class TestMcp(unittest.TestCase):
             import mcp  # noqa: F401
         except ImportError:
             self.skipTest("mcp package not installed")
-        from hspice_parser import mcp_server
+        from spice_result_parser import mcp_server
 
         self.m = mcp_server
         self.tmp = tempfile.TemporaryDirectory()
