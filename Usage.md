@@ -1,48 +1,23 @@
 # Usage
 
-`hSpiceParser <filename> <output format>`
-* Converts an hSpice output file in 9601, 2001 or ASCII format specified by <filename> to an output format specified by <output format>.
+SPICEResultParser reads HSPICE DC, AC and transient result files (`*.swX`, `*.acX`,
+`*.trX`) in the 9601 and 2001 binary formats and the `post=2` ASCII format, HSPICE
+measure files (`*.mtX`, `*.msX`, `*.maX`), and Nutmeg rawfiles (ngspice / SPICE3 `.raw`).
+It returns numpy arrays, writes CSV, npz or PNG files, and serves agents over MCP.
 
-# Overview
+HSPICE simulations report arrays of values of electrical variables that correspond to an
+independent variable specified by the simulation command (.dc, .ac or .tr). It is
+possible to write simulation commands that repeat the simulation with slight variations,
+referred to as an inner sweep, and the repeated copies of the electrical variables that
+result are called sweeps. It is also possible to repeat the simulation command using a
+different syntax called an 'alter'. Each alteration created by an alter will produce a
+separate output file: eg: a transient simulation might produce a tr0 file on its first
+alter and a tr1 file on its second alter. Details of these commands can be found in the
+HSPICE command reference.
 
-SPICEResultParser is made to convert hSpice DC, AC and transient simulation output files (*.swX, *.acX, *.trX) to file types that are readable by common mathematical software. It is capable of reading the 9601 and 2001 binary formats, the ASCII file format, and the measure file format. The parser can generate CSV files, matlab files containing ASCII strings in arrays, which are given the suffix “.m”, and Python Pickle files. Downloading Scipy and Numpy allows it to produce Matlab binary files in 
-the .mat format.
-
-hSpice simulations report arrays of values of electrical variables that correspond to an independent variable specified by the simulation command (.dc, .ac or .tr).  It is possible to write simulation commands that repeat the simulation with slight variations, referred to as an inner sweep, and the repeated copies of the electrical variables that result are called sweeps. It is also possible to repeat the simulation command using a different syntax called an ‘alter’.  Each alteration created by an alter will produce a separate output file: eg: a transient simulation might produce a tr0 file on its first alter and a tr1 file on its second alter. Details of these commands can be found in the hSpice command reference.
-
-If there are multiple sweeps in the input file and the CSV option is selected, the parser will create a folder of CSV files named according to the value of the swept variable. The use of both the “.m” and pickle option will result in a single file that contains all of the sweeps. The pickle option saves a python dictionary with the variable names from the hSpice file as the keys, and the corresponding values for each variable stored in a two dimensional list with the first dimension corresponding to the sweep index and the second corresponding to the values of the variable throughout the simulation. The “.m” and “.mat” is organized in the same way as the pickle output but in the appropriate object
-
-# Usage Examples
-
-To use the parser do:
-
-`python hSpice_parser.py <hspice file path> <parser output format>`
-
-For example if the file is in the same directory as the parser, named test.tr0, and I want the CSV option. Then I would do:
-
-`python hSpice_parser.py test.tr0 csv`
-
-This will produce a file named `test_tr0.csv` in the same directory as the `test.tr0` file. If test.tr0 has sweeps in it, then a folder called `test_tr0_csv` containing a csv for each sweep will appear in the same directory as `test.tr0`.
-
-For help do:
-
-`python hSpice_parser.py -h` or `python hSpice_parser.py --help`
-
-The converter function can be imported into your own Python scripts. If there were multiple hSpice files in a folder that you wanted to parse all at once, you could use the script below:
-
-```python
-from os import path, listdir
-from spice_result_parser.hspiceParser import import_export
-
-directory = 'path/to/files'  # this code assumes that this directory only contains compatible files.
-output_ext = 'pickle'
-
-for filename in listdir(directory):
-    full_path = path.join(directory, filename)
-    _, ext = path.splitext(full_path)
-    if ext[:2] in ['tr', 'sw', 'ac']: 
-        import_export(full_path, output_ext)
-```
+The original hspiceParser converter (`.m`, `.mat` and pickle output) is not part of this
+package; it remains available from
+[HMC-ACE/hspiceParser](https://github.com/HMC-ACE/hspiceParser).
 
 # Low-memory trace API
 
@@ -54,8 +29,8 @@ Memory is bounded by what you select, not by the file: each selected trace is
 written once into a preallocated array sized from the file, and data blocks are
 parsed in 2 MB slabs. On a 490 MB, 20-trace transient file this measured
 95 MB peak RSS and 0.12 s for one trace, and 554 MB and 0.19 s for all twenty
-traces (Python + numpy alone is about 29 MB). The legacy converter needs
-roughly 85x the file size.
+traces (Python + numpy alone is about 29 MB). The original upstream converter
+needs roughly 85x the file size.
 
 `post=2` ASCII files are read in 128 KB chunks whose fixed-width fields are converted
 by one numpy call each, never a value at a time: a 50 MB, 1 M point, 4-trace file
@@ -111,6 +86,50 @@ In AC files each variable becomes two traces (`v_vo_Mag` and `v_vo_Phase`), so t
 sanitized base name `v_vo` is not selectable on its own -- pass the raw name
 `v(vo)` or a glob such as `v_vo*` to select both.
 
+## AC results: `ac_format`
+
+HSPICE writes each complex AC value as a (real, imaginary) pair; Nutmeg rawfiles store
+complex numbers. `ac_format` chooses what every complex variable becomes, for both:
+
+| `ac_format` | traces | meaning |
+|---|---|---|
+| `"magphase"` (default) | `v_vo_Mag`, `v_vo_Phase` | linear magnitude, phase in degrees |
+| `"db"` | `v_vo_dB`, `v_vo_Phase` | 20 log10 of the magnitude (a zero is `-inf`), phase in degrees |
+| `"realimag"` | `v_vo_Re`, `v_vo_Im` | the real and imaginary parts |
+
+```python
+list_traces("run.ac0", ac_format="db")["traces"]   # ['v_vo_dB', 'v_vo_Phase', ...]
+extract("run.ac0", ["v(vo)"], ac_format="db", output="png")
+extract("run.ac0", ["v_vo_Phase"])                 # one half: both stored parts are read to compute it
+```
+
+`read_header`, `read_traces`, `list_traces` and `extract` all take it; files without
+complex data ignore it. Phase is `atan2(im, re)` in degrees, wrapped to (-180, 180].
+
+## Measure files
+
+`.measure` results go to `run.mt0` (transient), `run.ms0` (dc) or `run.ma0` (ac). They
+hold one row per simulation -- per sweep point, Monte Carlo sample or temperature --
+with one column per measure, then `temper` and `alter#`. A swept run adds an `index`
+column and the swept parameters in front.
+
+```python
+from spice_result_parser import read_measures
+
+ms = read_measures("run.mt0")                 # every column
+ms = read_measures("run.mt0", ["tpd*"])       # measures by name or glob
+ms.names                                      # ['index', 'vdd', 'tpd_rise', 'tpd_fall']
+ms.params                                     # ['vdd']: kept by every selection, as is index
+ms.values["tpd_rise"]                         # float64 array, one value per row
+ms.failed                                     # {'tpd_fall': 2}: rows written as `failed`, now NaN
+ms.rows, ms.title
+```
+
+A file that ends part-way through a row keeps its complete rows, with a
+`RuntimeWarning`. Passing a measure file to `read_traces` or `list_traces` raises a
+`ValueError` that points to `read_measures`.
+
+
 ## Nutmeg rawfiles
 
 A file whose first bytes are `Title:` is read as a Nutmeg rawfile (the `.raw` format
@@ -161,19 +180,20 @@ pip install 'spice_result_parser[mcp]'
 ```
 
 ```json
-{"mcpServers": {"hspice": {"command": "srp-mcp"}}}
+{"mcpServers": {"spice": {"command": "srp-mcp"}}}
 ```
 
-Tools: `list_traces(path, plot)` and `extract(path, names, sweeps, output, downsample, dest, xrange, yrange, plot)`,
-on HSPICE result files and Nutmeg rawfiles alike (`plot` picks one plot of a rawfile).
+Tools: `list_traces(path, plot, ac_format)`, `extract(path, names, sweeps, output, downsample, dest, xrange,
+yrange, plot, ac_format)` and `read_measures(path, names, rows)`, on HSPICE result files and Nutmeg
+rawfiles alike (`plot` picks one plot of a rawfile, `ac_format` names AC traces as above).
 Over MCP `output` is `text` (default), `summary` (statistics and downsampled points as
 JSON with exact floats), `csv`, `npz` (write a file and return its path), or `png`
 (writes a plot and returns its path and pixel size); full arrays are never sent inline.
 
 `text` is written for an agent to read: a header (`transient | x: time | 522 points
 (20 shown)`, plus `in k sweeps` and the plot name when there are several), for an AC
-plot a legend that traces are split into `_Mag`/`_Phase` (degrees), a `trace min max`
-table over every point, then one table per sweep with x once and one column per
+plot a legend naming what the two columns of each complex trace hold (per `ac_format`),
+a `trace min max` table over every point (NaN values skipped), then one table per sweep with x once and one column per
 trace, `downsample` evenly spaced rows (first and last kept, at most 500 rows in
 total). Values are rounded to 6 significant digits; NaN and infinity print as `nan`/
 `inf`; a truncated file says so on its first line; a nested `.dc` sweep that ngspice
@@ -189,3 +209,10 @@ sets the plot's vertical axis limits and is ignored by the other outputs.
 `npz`, which keep every point. `dest` names the output file for `csv`/`npz`/`png`; it is not restricted to the
 input's directory, so the agent can write to any path the server process can
 reach. Leave it unset to write `<input>_<ext>_traces.<csv|npz|png>` beside the input.
+
+`read_measures` returns text for a measure file: `measures | 12 rows | params: vdd`,
+a `failed:` line naming each measure that failed and in how many rows, then a table
+with one column per kept measure (failed values print as `failed`). `rows` (default
+20, at most 500) evenly spaced rows are shown; when rows are dropped a `min max mean`
+table over every row comes first. The same rendering is
+`spice_result_parser.mcp_server.format_measures(ms, rows=20)` for any `MeasureSet`.

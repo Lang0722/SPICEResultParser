@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This document describes the 9601 and 2001 binary formats for hSpice .ac*, .sw*, and .tr* output files. This is a companion document to the user manual for hspiceParser, a Python script that parses the 9601 and 2001 versions of the hSpice binary or ASCII output files. While there are other hSpice parsers (eg: [Matlab hSpice ToolBox](https://www.cppsim.com/download_hspice_tools.html)) and documents that describe the hSpice binary output (eg: [Gaw Data File Formats](https://www.rvq.fr/linux/gawfmt.php)), we wanted to make both another parser and another description of the hSpice
+This document describes the 9601 and 2001 binary formats for hSpice .ac*, .sw*, and .tr* output files. This is a companion document to SPICEResultParser (originally hspiceParser), a Python package that parses the 9601 and 2001 versions of the hSpice binary or ASCII output files. While there are other hSpice parsers (eg: [Matlab hSpice ToolBox](https://www.cppsim.com/download_hspice_tools.html)) and documents that describe the hSpice binary output (eg: [Gaw Data File Formats](https://www.rvq.fr/linux/gawfmt.php)), we wanted to make both another parser and another description of the hSpice
 binary output format. For more information on our reasoning for making this document, read this <link to other document>.
 
 
@@ -98,6 +98,7 @@ The data blocks follow the header block and contain the actual simulation result
 	- For 2001: `1e+30`
 	- This value is present even if there are no sweeps.
 - A single sweep may span multiple data blocks. The blocks are simply concatenated; the logical data stream continues across block boundaries.
+- In an AC file (`.ac*`) every variable after the frequency is complex and takes two values per point, its *real* part then its *imaginary* part: `HERTZ_0, re v(vo)_0, im v(vo)_0, ...`. Magnitude and phase are not stored; SPICEResultParser computes them (see `ac_format` in Usage.md). The sample `test/test_9601.ac0`, an RC low-pass, shows it: its second value per variable heads toward zero, not toward -90, at high frequency, and branch currents have negative first values.
 
 **Summary of the data block structure:**
 

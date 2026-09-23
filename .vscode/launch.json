@@ -15,7 +15,8 @@
             "name": "Python: Debug Tests",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/test/test.py",
+            "module": "unittest",
+            "args": ["discover", "-s", "test", "-p", "test_*.py"],
             "console": "integratedTerminal",
             "env": {
                 "PYTHONPATH": "${workspaceFolder}/src"

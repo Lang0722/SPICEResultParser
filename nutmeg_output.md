@@ -105,6 +105,8 @@ never read the data.
   `time` -> `time`. Both spellings select a trace.
 - A complex plot expands each dependent variable into `<name>_Mag` and `<name>_Phase`
   (degrees), the same layout as an HSPICE AC file; column 0 keeps its real part only.
+  `ac_format="db"` gives `<name>_dB` and `<name>_Phase`, `ac_format="realimag"`
+  `<name>_Re` and `<name>_Im`.
 - A usable `Dimensions` line (two or more entries whose product is `No. Points`) splits
   the points into `n1` sweeps; the inner dimensions are flattened together. Otherwise
   there is one sweep. Nutmeg files carry no sweep parameter values, so `sweep_values`

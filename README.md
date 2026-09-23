@@ -1,13 +1,15 @@
 # SPICEResultParser
 
 Welcome to the SPICEResultParser GitHub page. SPICEResultParser reads the result files
-written by circuit simulators -- HSPICE `.tr*/.sw*/.ac*` and Nutmeg `.raw` (ngspice,
-SPICE3, Xyce) -- and hands the traces to Python, to files, or to an AI agent.
+written by circuit simulators -- HSPICE `.tr*/.sw*/.ac*` and measure files `.mt*/.ms*/.ma*`,
+and Nutmeg `.raw` (ngspice, SPICE3, Xyce) -- and hands the results to Python, to files, or
+to an AI agent.
 
-This fork of [HMC-ACE/hspiceParser](https://github.com/HMC-ACE/hspiceParser) adds a
-**low-memory streaming reader**, a **trace-selection API** (arrays, CSV, npz, summary,
-PNG plot, x/y region) and an **MCP server** so AI agents can query result files. The
-original converter is untouched and still available. See
+This fork of [HMC-ACE/hspiceParser](https://github.com/HMC-ACE/hspiceParser) replaces the
+original converter with a **low-memory streaming reader**, a **trace-selection API**
+(arrays, CSV, npz, summary, PNG plot, x/y region) and an **MCP server** so AI agents can
+query result files. The original converter (`.m`, `.mat` and pickle output) is no longer
+part of this package; it remains available from the upstream repository. See
 [Low-memory reader, API and MCP server](#low-memory-reader-api-and-mcp-server) below.
 
 The main goals of SPICEResultParser are:
@@ -37,34 +39,24 @@ pip install "git+https://github.com/Lang0722/SPICEResultParser.git@feature/low-m
 pip install "spice_result_parser[mcp,plot] @ git+https://github.com/Lang0722/SPICEResultParser.git@feature/low-memory-reader"
 ```
 
-After installation, you can use the `srp-parser` (legacy converter) and `srp-mcp`
-(MCP server) commands from your terminal.
-
-### Quick Download
-
-You can download the legacy converter directly from [here](https://github.com/HMC-ACE/hspiceParser/blob/main/src/spice_result_parser/hspiceParser.py), or run the following terminal command:
-
-```bash
-wget https://raw.githubusercontent.com/HMC-ACE/hspiceParser/main/src/spice_result_parser/hspiceParser.py
-```
+After installation, the `srp-mcp` command starts the MCP server.
 
 ### Requirements
 
-The legacy converter (`hspiceParser.py`) relies only on built-in Python 3.4+ functions to
-produce .m, .csv and Pickle files; Matlab .mat output additionally needs Scipy and Numpy.
-The streaming reader and API need Python 3.9+ and numpy; the MCP server needs the `mcp`
-package (`[mcp]` extra) and PNG output needs matplotlib (`[plot]` extra).
+Python 3.9+ and numpy. The MCP server needs the `mcp` package (`[mcp]` extra) and PNG
+output needs matplotlib (`[plot]` extra).
 
 ## Low-memory reader, API and MCP server
 
-The legacy converter loads the whole file into Python floats (about 85x the file size in
-memory) and converts every trace. The streaming reader keeps only the traces you ask for:
+The original upstream converter loads the whole file into Python floats (about 85x the
+file size in memory) and converts every trace. The streaming reader keeps only the traces
+you ask for:
 
 | 490 MB transient file, 20 traces, 3.2 M points | peak RSS | time |
 |---|---|---|
 | one trace | 92 MB | 0.07 s |
 | all 20 traces | 554 MB | 0.16 s |
-| legacy converter (62 MB file) | 5.3 GB | 238 s |
+| upstream converter (62 MB file) | 5.3 GB | 238 s |
 
 Python + numpy alone account for about 29 MB of that.
 
@@ -80,6 +72,16 @@ extract("run.tr0", ["v(out)"], xrange=(1e-9, 5e-9), yrange=(0, 1.2), output="png
 # several plots, selected by index.
 list_traces("rc.raw")["plots"]                      # ['Transient Analysis', 'AC Analysis', ...]
 extract("rc.raw", ["v(out)"], plot=1, output="png") # the AC plot: log x axis, Mag + Phase
+
+# AC results: each complex variable becomes two traces, chosen by ac_format.
+extract("run.ac0", ["v(out)"])                        # v_out_Mag, v_out_Phase (degrees)
+extract("run.ac0", ["v(out)"], ac_format="db")        # v_out_dB, v_out_Phase
+extract("run.ac0", ["v(out)"], ac_format="realimag")  # v_out_Re, v_out_Im
+
+# Measure files (.mt0 / .ms0 / .ma0): the results of .measure statements.
+from spice_result_parser import read_measures
+ms = read_measures("run.mt0", ["tpd*"])             # index and swept params always kept
+ms.values["tpd"]                                    # one value per row; NaN where it failed
 ```
 
 `xrange` keeps only the rows inside an x window (time, frequency or sweep variable) and
@@ -89,7 +91,10 @@ RSS instead of 555 MB. `yrange` sets the plot's vertical limits; `sweeps=[...]` 
 sweeps; `downsample=N` keeps N evenly spaced points. Binary 9601 and 2001 files and `post=2` ASCII files are
 supported, including multi-sweep and AC results, as are Nutmeg rawfiles (ngspice /
 SPICE3 `.raw`) in both binary and ASCII form. A file that the simulator is still
-writing is read up to its last complete point and flagged `truncated`.
+writing is read up to its last complete point and flagged `truncated`. HSPICE stores AC
+values as (real, imaginary) pairs; `ac_format` turns them into magnitude and phase in
+degrees (default), dB and phase, or leaves them as real and imaginary parts, the same
+for HSPICE and Nutmeg files.
 
 ### MCP server for agents
 
@@ -98,17 +103,20 @@ pip install "spice_result_parser[mcp,plot] @ git+https://github.com/Lang0722/SPI
 ```
 
 ```json
-{"mcpServers": {"hspice": {"command": "srp-mcp"}}}
+{"mcpServers": {"spice": {"command": "srp-mcp"}}}
 ```
 
-Tools: `list_traces(path, plot)` and `extract(path, names, sweeps, output, downsample,
-dest, xrange, yrange, plot)`, on HSPICE result files and Nutmeg rawfiles alike. Over MCP
+Tools: `list_traces(path, plot, ac_format)`, `extract(path, names, sweeps, output,
+downsample, dest, xrange, yrange, plot, ac_format)` and `read_measures(path, names,
+rows)`, on HSPICE result files and Nutmeg rawfiles alike. Over MCP
 `output` is `text` (default: a readable report, per-trace min/max then a table with x
 once and one column per trace, rounded to 6 significant digits), `summary` (the same as
 JSON with exact floats plus a bounded number of downsampled points), `csv`, `npz` or
 `png`; full arrays are never sent inline. `plot` picks one plot of a Nutmeg rawfile.
 `spice_result_parser.mcp_server.format_text(ts, points)` renders that text for any
-`TraceSet` and needs no `mcp` package.
+`TraceSet` and needs no `mcp` package. `read_measures` returns a text table of an
+HSPICE measure file: the swept parameters, which measures failed, and one row per
+simulation.
 
 Design notes live in `docs/superpowers/specs/`; the full API is described in
 [Usage.md](Usage.md).
@@ -118,8 +126,9 @@ Design notes live in `docs/superpowers/specs/`; the full API is described in
 SPICEResultParser is distributed under the **GNU General Public License v3.0**
 ([LICENSE](LICENSE)). It is a fork of [HMC-ACE/hspiceParser](https://github.com/HMC-ACE/hspiceParser),
 which is MIT licensed, Copyright (c) 2021 HMC-ACE; that notice is kept in
-[LICENSE.MIT](LICENSE.MIT) and continues to cover the original code, including the
-legacy converter `src/spice_result_parser/hspiceParser.py`.
+[LICENSE.MIT](LICENSE.MIT) and continues to cover the material derived from it: the
+HSPICE format description in `hSpice_output.md` and the trace-naming rule in
+`reader.parse_var_name`.
 
 ## Documentation
 

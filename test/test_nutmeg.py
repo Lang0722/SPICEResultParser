@@ -192,6 +192,23 @@ class TestComplexExpansion(unittest.TestCase):
             np.testing.assert_allclose(ts.data["v_in_Phase"][0], np.angle(ac[:, 1], deg=True),
                                        rtol=1e-12)
 
+    def test_ac_format_realimag_and_db(self):
+        for binary in (True, False):
+            path, written = synthetic(self.dir, binary, f"f{int(binary)}.raw")
+            ac = written[1]
+            ts = read_traces(path, ["v(out)"], plot=1, ac_format="realimag")
+            self.assertEqual(ts.selected, ["frequency", "v_out_Re", "v_out_Im"])
+            np.testing.assert_allclose(ts.data["v_out_Re"][0], ac[:, 2].real, rtol=1e-12)
+            np.testing.assert_allclose(ts.data["v_out_Im"][0], ac[:, 2].imag, rtol=1e-12)
+            ts = read_traces(path, ["v_out_dB"], plot=1, ac_format="db")
+            self.assertEqual(ts.selected, ["frequency", "v_out_dB"])
+            np.testing.assert_allclose(ts.data["v_out_dB"][0], 20 * np.log10(np.abs(ac[:, 2])), rtol=1e-12)
+            self.assertEqual(read_header(path, plot=1, ac_format="db").names[1:3], ["v_in_dB", "v_in_Phase"])
+
+    def test_unknown_ac_format_rejected(self):
+        with self.assertRaisesRegex(ValueError, "ac_format must be one of"):
+            read_traces(BIN, plot=1, ac_format="polar")
+
 
 class TestSelection(unittest.TestCase):
     """Item 5."""
@@ -398,6 +415,20 @@ class TestUnwrittenPointCount(unittest.TestCase):
         fixtures.write_nutmeg(path, [("Transient Analysis", self.names, self.data, False)],
                               binary=binary, unknown_points=True, **kwargs)
         return path
+
+    def test_empty_plot_before_a_lowercase_title_is_complete(self):
+        # 'No. Points: 0' followed by another plot means an empty plot, not a live run;
+        # the next header's key is matched without regard to case, as in is_nutmeg.
+        path = self.dir / "empty_then_more.raw"
+        path.write_bytes(
+            b"Title: t\nPlotname: Operating Point\nFlags: real\nNo. Variables: 1\nNo. Points: 0\n"
+            b"Variables:\n\t0\tv(a)\tvoltage\nValues:\n"
+            b"title: t\nPlotname: Transient Analysis\nFlags: real\nNo. Variables: 2\nNo. Points: 1\n"
+            b"Variables:\n\t0\ttime\ttime\n\t1\tv(a)\tvoltage\nValues:\n 0\t0.0\n\t1.5\n")
+        self.assertEqual(read_header(path).plot_names, ["Operating Point", "Transient Analysis"])
+        ts = read_traces(path, plot=1)
+        self.assertFalse(ts.truncated)
+        np.testing.assert_array_equal(ts.data["v_a"][0], [1.5])
 
     def test_header_still_readable(self):
         for binary in (True, False):
@@ -912,7 +943,7 @@ class TestFormatText(unittest.TestCase):
         t = self.text(BIN, ["v(out)"], plot=1, points=6)
         lines = t.splitlines()
         self.assertTrue(lines[0].startswith("ac | x: frequency | 46 points (6 shown)"))
-        self.assertEqual(lines[1], self.m.AC_LEGEND)
+        self.assertEqual(lines[1], self.m.AC_LEGEND["magphase"])
         self.assertEqual(lines[7].split(), ["frequency", "v_out_Mag", "v_out_Phase"])
         self.assertEqual(lines[8].split()[0], "1")
         self.assertEqual(lines[-1].split()[0], "1e+09")
@@ -975,7 +1006,7 @@ class TestFormatText(unittest.TestCase):
         path = self.dir / "nan.raw"
         fixtures.write_nutmeg(path, [("Transient Analysis", ["time", "v(out)"], data, False)])
         lines = self.text(path).splitlines()
-        self.assertEqual(lines[3].split(), ["v_out", "nan", "nan"])
+        self.assertEqual(lines[3].split(), ["v_out", "0", "inf"])     # min/max skip the NaN
         self.assertEqual(lines[6].split(), ["0", "0"])
         self.assertEqual(lines[7].split(), ["1e-09", "nan"])
         self.assertEqual(lines[8].split(), ["2e-09", "inf"])

@@ -10,14 +10,13 @@ authors = [
     {name = "Gonzalez, Raffa", email = "rcgonzalez@g.hmc.edu"},
     {name = "Spencer, Matthew", email = "mespence@gmail.com"}
 ]
-dependencies = ["numpy", "scipy"]
+dependencies = ["numpy"]
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.0"]
 plot = ["matplotlib>=3.5"]
 
 [project.scripts]
-srp-parser = "spice_result_parser:convert"
 srp-mcp = "spice_result_parser.mcp_server:main"
 
 [build-system]

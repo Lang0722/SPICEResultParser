@@ -113,21 +113,6 @@ class TestFixtures(unittest.TestCase):
             self.assertEqual(len(fixtures.fortran(v)), 13)
             self.assertAlmostEqual(float(fixtures.fortran(v)), v, delta=abs(v) * 1e-6)
 
-    def test_binary_fixture_readable_by_old_parser(self):
-        from spice_result_parser.hspiceParser import parse_header, read_binary_signal_file
-
-        rng = np.random.default_rng(1)
-        sweeps = [([1000.0], rng.random((11, 4))), ([2000.0], rng.random((6, 4)))]
-        path = self.dir / "fx.tr0"
-        stream = fixtures.write_binary(path, "2001", ["TIME", "v(a", "v(b", "i(c", "r1"], [1, 1, 1, 8], sweeps)
-        header, blocks = read_binary_signal_file(str(path))
-        self.assertEqual(header[20:24], "2001")
-        self.assertEqual(header[0:12], "000400000001")
-        self.assertEqual(parse_header(header)[1], ["TIME", "v_a", "v_b", "i_c", "r1"])
-        flat = np.array(sum(blocks, []))
-        np.testing.assert_array_equal(flat, stream)
-        self.assertEqual(len(stream), (1 + 44 + 1) + (1 + 24 + 1))
-
     def test_binary_fixture_9601_blocks(self):
         rng = np.random.default_rng(4)
         sweeps = [([], rng.random((3000, 5)))]
@@ -149,18 +134,6 @@ class TestFixtures(unittest.TestCase):
         self.assertEqual(len(stream), (1 + 30 + 1) + (1 + 30) - 2)
         self.assertNotEqual(stream[-1], 1e30)
 
-    def test_ascii_fixture_readable_by_old_parser(self):
-        from spice_result_parser.hspiceParser import signal_file_ascii_read
-
-        rng = np.random.default_rng(2)
-        sweeps = [([1000.0], rng.uniform(-1, 1, (7, 4))), ([2000.0], rng.uniform(-1, 1, (5, 4)))]
-        path = self.dir / "fx.tr0"
-        fixtures.write_ascii(path, ["TIME", "v(a", "v(b", "i(c", "r1"], [1, 1, 1, 8], sweeps)
-        old = signal_file_ascii_read(str(path))
-        self.assertEqual(sorted(old), sorted(["TIME", "v_a", "v_b", "i_c", "param_r1"]))
-        self.assertEqual(old["param_r1"], [[1000.0], [2000.0]])
-        np.testing.assert_allclose(old["v_a"][0], sweeps[0][1][:, 1], rtol=1e-6)
-        self.assertEqual(len(old["i_c"][1]), 5)
 
 
 MULTI_NAMES = ["TIME", "v(a", "v(b", "v(c", "v(d", "i(e", "i(f", "r1"]   # 7 data columns + 1 sweep param
@@ -216,16 +189,12 @@ class TestBinaryRead(unittest.TestCase):
         ts = read_traces(HERE / "test_9601.sw0")
         self.assert_matches_old(ts, old)
 
-    def test_ac_9601_matches_old_ac_path(self):
-        # data_dict_ac_9601.pickle was produced through the "tr" path and is wrong; use the live ac path.
-        from spice_result_parser.hspiceParser import read_binary_signal_file, write_to_dict
-
-        header_str, blocks = read_binary_signal_file(str(HERE / "test_9601.ac0"))
-        old, _, _, _ = write_to_dict(blocks, header_str, "ac")
-        ts = read_traces(HERE / "test_9601.ac0")
-        self.assert_matches_old(ts, old)
-        self.assertEqual(ts.selected[:3], ["HERTZ", "v_0_Mag", "v_0_Phase"])
+    def test_ac_9601_sample_file(self):
+        ts = read_traces(HERE / "test_9601.ac0", ac_format="realimag")
+        self.assertEqual(ts.selected[:3], ["HERTZ", "v_0_Re", "v_0_Im"])
         self.assertEqual(ts.data["HERTZ"][0].size, 41)
+        np.testing.assert_allclose(ts.data["v_vo_Re"][0][:2], [0.99996054, 0.9999374], rtol=1e-6)
+        np.testing.assert_allclose(ts.data["v_vo_Im"][0][:2], [-0.00628294, -0.00790957], rtol=1e-6)
 
     def _check_multi(self, version):
         path, sweeps = make_multi(self.dir, version)
@@ -671,6 +640,7 @@ class TestSelection(unittest.TestCase):
         ts = read_traces(HERE / "test_9601.ac0", ["v(vo)"])
         self.assertEqual(ts.selected, ["HERTZ", "v_vo_Mag", "v_vo_Phase"])
 
+
     def test_memory_stays_near_selected_size(self):
         rng = np.random.default_rng(6)
         npoints, ncols = 500_000, 20
@@ -693,6 +663,148 @@ class TestSelection(unittest.TestCase):
         self.assertEqual(ts.selected, ["TIME", "v_7"])
         np.testing.assert_array_equal(ts.data["v_7"][0], expected)
 
+AC_NAMES = ["HERTZ", "v(a", "i(b"]
+AC_CODES = [2, 1, 8]
+
+
+def make_ac(directory, version="2001", name="ac.ac0"):
+    """AC fixture: HSPICE stores each complex value as a (real, imaginary) pair."""
+    rng = np.random.default_rng(21)
+    f = np.logspace(0, 6, 31)
+    z = rng.uniform(-2, 2, (31, 2)) + 1j * rng.uniform(-2, 2, (31, 2))
+    data = np.column_stack([f, z[:, 0].real, z[:, 0].imag, z[:, 1].real, z[:, 1].imag])
+    path = Path(directory) / name
+    fixtures.write_binary(path, version, AC_NAMES, AC_CODES, [([], data)])
+    return path, f, z
+
+
+class TestAcFormat(unittest.TestCase):
+    """HSPICE AC data are (real, imaginary) pairs; ac_format chooses what the pair becomes."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.path, self.f, self.z = make_ac(self.dir)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_default_is_magnitude_and_phase_in_degrees(self):
+        ts = read_traces(self.path)
+        self.assertEqual(ts.selected, ["HERTZ", "v_a_Mag", "v_a_Phase", "i_b_Mag", "i_b_Phase"])
+        np.testing.assert_allclose(ts.data["v_a_Mag"][0], np.abs(self.z[:, 0]), rtol=1e-12)
+        np.testing.assert_allclose(ts.data["v_a_Phase"][0], np.angle(self.z[:, 0], deg=True), rtol=1e-12)
+        np.testing.assert_allclose(ts.data["i_b_Mag"][0], np.abs(self.z[:, 1]), rtol=1e-12)
+        np.testing.assert_array_equal(ts.data["HERTZ"][0], self.f)
+
+    def test_realimag_returns_the_stored_parts(self):
+        ts = read_traces(self.path, ac_format="realimag")
+        self.assertEqual(ts.selected, ["HERTZ", "v_a_Re", "v_a_Im", "i_b_Re", "i_b_Im"])
+        np.testing.assert_array_equal(ts.data["v_a_Re"][0], self.z[:, 0].real)
+        np.testing.assert_array_equal(ts.data["i_b_Im"][0], self.z[:, 1].imag)
+
+    def test_db(self):
+        ts = read_traces(self.path, ["v(a"], ac_format="db")
+        self.assertEqual(ts.selected, ["HERTZ", "v_a_dB", "v_a_Phase"])
+        np.testing.assert_allclose(ts.data["v_a_dB"][0], 20 * np.log10(np.abs(self.z[:, 0])), rtol=1e-12)
+        np.testing.assert_allclose(ts.data["v_a_Phase"][0], np.angle(self.z[:, 0], deg=True), rtol=1e-12)
+
+    def test_one_half_of_a_pair_still_uses_both_stored_parts(self):
+        ts = read_traces(self.path, ["v_a_Phase"])
+        self.assertEqual(ts.selected, ["HERTZ", "v_a_Phase"])
+        np.testing.assert_allclose(ts.data["v_a_Phase"][0], np.angle(self.z[:, 0], deg=True), rtol=1e-12)
+
+    def test_xrange_applies_before_conversion(self):
+        ts = read_traces(self.path, ["v(a"], xrange=(10.0, 1e4))
+        keep = (self.f >= 10.0) & (self.f <= 1e4)
+        np.testing.assert_allclose(ts.data["v_a_Mag"][0], np.abs(self.z[keep, 0]), rtol=1e-12)
+
+    def test_9601_keeps_float32(self):
+        path, _, z = make_ac(self.dir, "9601", "ac32.ac0")
+        ts = read_traces(path)
+        self.assertEqual(ts.data["v_a_Mag"][0].dtype, np.dtype("<f4"))
+        np.testing.assert_allclose(ts.data["v_a_Mag"][0], np.abs(z[:, 0]), rtol=1e-5)
+
+    def test_header_and_list_traces_follow_the_format(self):
+        self.assertEqual(read_header(self.path, ac_format="db").names[1:3], ["v_a_dB", "v_a_Phase"])
+        self.assertEqual(api.list_traces(self.path, ac_format="realimag")["traces"],
+                         ["v_a_Re", "v_a_Im", "i_b_Re", "i_b_Im"])
+
+    def test_extract_passes_the_format(self):
+        ts = api.extract(self.path, ["i(b"], ac_format="realimag")
+        self.assertEqual(ts.selected, ["HERTZ", "i_b_Re", "i_b_Im"])
+
+    def test_unknown_format_rejected(self):
+        with self.assertRaisesRegex(ValueError, "ac_format must be one of"):
+            read_traces(self.path, ac_format="polar")
+        with self.assertRaisesRegex(ValueError, "ac_format must be one of"):
+            read_header(self.path, ac_format="polar")
+
+    def test_non_ac_file_ignores_the_format(self):
+        ts = read_traces(HERE / "test_9601.tr0", ["v_vo"], ac_format="db")
+        self.assertEqual(ts.selected, ["TIME", "v_vo"])
+
+    def test_sample_file_is_an_rc_lowpass(self):
+        # test_9601.ac0 is a first-order RC low-pass: H = 1 / (1 + j f/fc), so Re/Im gives
+        # the same fc at every frequency, the magnitude is never negative, and the phase
+        # heads to -90 degrees. Read as magnitude/phase the stored pairs fail all three.
+        ri = read_traces(HERE / "test_9601.ac0", ["v(vo"], ac_format="realimag")
+        f = ri.data["HERTZ"][0].astype(np.float64)
+        re, im = (ri.data[n][0].astype(np.float64) for n in ("v_vo_Re", "v_vo_Im"))
+        fc = -re * f / im
+        self.assertLess(np.std(fc) / np.mean(fc), 1e-3)
+        ts = read_traces(HERE / "test_9601.ac0")
+        self.assertTrue((ts.data["i_vs_Mag"][0] >= 0).all())
+        self.assertLess(ts.data["v_vo_Phase"][0][-1], -85.0)
+        np.testing.assert_allclose(ts.data["v_vo_Mag"][0], 1 / np.sqrt(1 + (f / fc.mean()) ** 2), rtol=1e-3)
+
+
+class TestHeaderReadsOnlyTheHead(unittest.TestCase):
+    def test_ascii_header_does_not_scan_the_data(self):
+        import builtins
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "big.tr0"
+            t = np.linspace(0, 1e-6, 100_000)
+            fixtures.write_ascii(path, ["TIME", "v(out"], [1, 1], [([], np.column_stack([t, t]))])
+            size = path.stat().st_size
+            total = [0]
+            real_open = builtins.open
+
+            class Counting:
+                def __init__(self, f):
+                    self.f = f
+
+                def read(self, *a):
+                    data = self.f.read(*a)
+                    total[0] += len(data)
+                    return data
+
+                def readline(self, *a):
+                    data = self.f.readline(*a)
+                    total[0] += len(data)
+                    return data
+
+                def __getattr__(self, name):
+                    return getattr(self.f, name)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    self.f.close()
+
+            builtins.open = lambda *a, **k: Counting(real_open(*a, **k))
+            try:
+                h = read_header(path)
+            finally:
+                builtins.open = real_open
+            self.assertEqual(h.names, ["TIME", "v_out"])
+            self.assertGreater(size, 2_000_000)
+            self.assertLess(total[0], 10_000)
+
+
+
 ASCII_NAMES = ["TIME", "v(a", "v(b", "i(c", "r1"]
 ASCII_CODES = [1, 1, 1, 8]
 
@@ -703,6 +815,37 @@ def make_ascii(directory):
     path = Path(directory) / "ascii.tr0"
     fixtures.write_ascii(path, ASCII_NAMES, ASCII_CODES, sweeps)
     return path, sweeps
+
+
+class TestStatsIgnoreNan(unittest.TestCase):
+    """One NaN in a trace must not blank its min/max/mean in summary and text output."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "nan.tr0"
+        d = np.column_stack([np.arange(5.0), [1.0, np.nan, -2.0, 4.0, 0.5]])
+        fixtures.write_binary(self.path, "2001", ["TIME", "v(a"], [1, 1], [([], d)])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_summary(self):
+        entry = api.summarize(read_traces(self.path))["traces"]["v_a"][0]
+        self.assertEqual((entry["min"], entry["max"], entry["mean"]), (-2.0, 4.0, 0.875))
+
+    def test_text(self):
+        from spice_result_parser import mcp_server
+
+        text = mcp_server.format_text(read_traces(self.path))
+        self.assertIn(["v_a", "-2", "4"], [line.split() for line in text.splitlines()])
+
+    def test_all_nan_is_null_without_warning(self):
+        d = np.column_stack([np.arange(3.0), [np.nan] * 3])
+        fixtures.write_binary(self.path, "2001", ["TIME", "v(a"], [1, 1], [([], d)])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            entry = api.summarize(read_traces(self.path))["traces"]["v_a"][0]
+        self.assertIsNone(entry["min"])
 
 
 class TestAsciiRead(unittest.TestCase):
@@ -725,18 +868,6 @@ class TestAsciiRead(unittest.TestCase):
         self.assertEqual(h.names, ["TIME", "v_a", "v_b", "i_c"])
         self.assertEqual(h.sweep_params, ["r1"])
         self.assertEqual(h.dtype, np.dtype("<f8"))
-
-    def test_matches_old_ascii_reader(self):
-        from spice_result_parser.hspiceParser import signal_file_ascii_read
-
-        old = signal_file_ascii_read(str(self.path))
-        ts = read_traces(self.path)
-        self.assertEqual(ts.selected, ["TIME", "v_a", "v_b", "i_c"])
-        self.assertEqual(ts.sweep_values, [[1000.0], [2000.0]])
-        self.assertFalse(ts.truncated)
-        for name in ts.selected:
-            for i in range(2):
-                np.testing.assert_array_equal(ts.data[name][i], np.asarray(old[name][i]))
 
     def test_matches_generator_to_7_digits(self):
         ts = read_traces(self.path)
@@ -978,7 +1109,7 @@ class TestApi(unittest.TestCase):
         json.dumps(out, allow_nan=False)                        # strict JSON must accept it
         self.assertEqual(out["sweep_values"][2], [2.0, None])
         self.assertIsNone(out["traces"]["v_a"][0]["y"][2])
-        self.assertIsNone(out["traces"]["v_a"][0]["min"])      # NaN poisons the statistics too
+        self.assertEqual(out["traces"]["v_a"][0]["min"], 1.0)  # statistics skip the NaN
 
     def test_summary_cap_is_a_total_budget(self):
         original = api.SUMMARY_MAX_POINTS
@@ -1338,9 +1469,34 @@ class TestPackage(unittest.TestCase):
     def test_exports(self):
         import spice_result_parser as hp
 
-        for name in ["convert", "Header", "TraceSet", "read_header", "read_traces",
+        for name in ["Header", "TraceSet", "read_header", "read_traces",
                      "list_traces", "extract", "write_file", "summarize"]:
             self.assertTrue(hasattr(hp, name), name)
+
+    def test_old_converter_is_gone(self):
+        import spice_result_parser as hp
+
+        self.assertFalse(hasattr(hp, "convert"))
+        with self.assertRaises(ImportError):
+            import spice_result_parser.hspiceParser  # noqa: F401
+        text = (HERE.parent / "pyproject.toml").read_text()
+        self.assertNotIn("srp-parser", text)
+        self.assertNotIn("scipy", text)
+
+    def test_import_writes_nothing_to_stdout(self):
+        # srp-mcp speaks JSON-RPC on stdout: an import-time print would corrupt the stream.
+        import importlib
+        import subprocess
+
+        src = Path(importlib.import_module("spice_result_parser").__file__).parent.parent
+        out = subprocess.run([sys.executable, "-c", "import sys; sys.modules['scipy'] = None\n"
+                              "import spice_result_parser, spice_result_parser.mcp_server"],
+                             check=True, cwd=str(src), capture_output=True, text=True)
+        self.assertEqual(out.stdout, "")
+
+    def test_pixi_test_task_runs_every_suite(self):
+        text = (HERE.parent / "pixi.toml").read_text()
+        self.assertIn('unittest discover -s test -p "test_*.py"', text)
 
     def test_pyproject_declares_mcp_extra_and_script(self):
         text = (HERE.parent / "pyproject.toml").read_text()
@@ -1372,7 +1528,27 @@ class TestMcp(unittest.TestCase):
 
     def test_tools_registered(self):
         names = {t.name for t in asyncio.run(self.m.server.list_tools())}
-        self.assertEqual(names, {"list_traces", "extract"})
+        self.assertEqual(names, {"list_traces", "extract", "read_measures"})
+
+    def test_server_name(self):
+        self.assertEqual(self.m.server.name, "spice-result-parser")
+
+    def test_ac_format_over_mcp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _, _ = make_ac(tmp)
+            out = self.m.list_traces(str(path), ac_format="db")
+            self.assertEqual(out["traces"][:2], ["v_a_dB", "v_a_Phase"])
+            text = self.m.extract(str(path), ["v(a"], ac_format="realimag")
+            self.assertIn(self.m.AC_LEGEND["realimag"], text)
+            self.assertIn("v_a_Re", text)
+
+    def test_read_measures_tool(self):
+        text = self.m.read_measures(str(HERE / "test.mt0"), ["rchg"])
+        self.assertTrue(text.startswith("measures | 1 row"))
+        self.assertIn("1.623e-08", text)
+        self.assertNotIn("tmech", text)
+        with self.assertRaisesRegex(self.m.ToolError, "not an HSPICE measure file"):
+            self.m.read_measures(str(HERE / "test_9601.tr0"))
 
     def test_list_traces_tool(self):
         out = self.m.list_traces(str(HERE / "test_9601.tr0"))
@@ -1447,7 +1623,7 @@ class TestMcp(unittest.TestCase):
 
     def test_unexpected_errors_carry_their_type(self):
         original = self.m.api.list_traces
-        def boom(path, plot=0):
+        def boom(path, plot=0, ac_format="magphase"):
             raise KeyError("boom")
         self.m.api.list_traces = boom
         self.addCleanup(setattr, self.m.api, "list_traces", original)

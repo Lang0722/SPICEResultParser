@@ -12,13 +12,12 @@ linux = "4.12.14"
 
 [tasks]
 release = {cmd = "./release.sh", description = "Release the package", cwd = "."}
-test = {cmd = "python test/test.py", description = "Run unit tests"}
+test = {cmd = 'python -m unittest discover -s test -p "test_*.py"', description = "Run unit tests"}
 
 [dependencies]
 spice_result_parser = {path = "."}
 numpy = ">=2.3.4,<3"
 python = ">=3.9"
-scipy = ">=1.16.3,<2"
 
 [package]
 description = "A low-memory parser for HSPICE and Nutmeg (ngspice/SPICE3) simulation result files, with an MCP server for agents."
@@ -34,4 +33,3 @@ hatchling = ">=1.26.3"
 [package.run-dependencies]
 numpy = "*"
 python = ">=3.9"
-scipy = "*"

@@ -20,8 +20,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .hspiceParser import parse_var_name
-from .reader import Header, TraceSet, _uniquify, resolve_columns
+from .reader import Header, TraceSet, _uniquify, ac_names, ac_part, parse_var_name, resolve_columns
 
 _BOM = b"\xef\xbb\xbf"
 
@@ -48,7 +47,8 @@ _ASCII_BYTES_PER_VALUE = 16     # lower bound on one written value (ngspice uses
                                 # chars); only bounds the preallocation, which _grow fixes up
 _TOKEN = re.compile(rb"\S+")
 
-_REAL, _MAG, _PHASE = 0, 1, 2   # what a selected column takes from its variable
+_REAL, _FIRST, _SECOND = 0, 1, 2   # what a selected column takes from its variable: the real
+                                   # value, or the first or second ac_format column of a complex one
 
 
 @dataclass
@@ -167,7 +167,7 @@ def _parse_plot_header(f, path: str, index: int) -> Optional[_Plot]:
         # really is the next plot (or the end of the file): then the plot is simply empty.
         ahead = f.read(16)
         f.seek(data_start)
-        count_known = not ahead or ahead.lstrip().startswith(b"Title:")
+        count_known = not ahead or ahead.lstrip().lower().startswith(b"title:")
     return _Plot(
         index=index, plotname=fields.get("plotname", ""), raw_names=raw_names, npoints=npoints,
         is_complex="complex" in flags, is_binary=is_bin, data_start=data_start,
@@ -219,16 +219,15 @@ def _sanitize(raw: str) -> str:
     return parse_var_name(raw.replace(")", ""))
 
 
-def _build_header(path: str, p: _Plot, plot_names: List[str]) -> Header:
+def _build_header(path: str, p: _Plot, plot_names: List[str], ac_format: str) -> Header:
     x_name = _sanitize(p.raw_names[0])
     if p.is_complex:
-        # Column 0 keeps its real part; every dependent variable becomes Mag + Phase,
-        # the same layout the HSPICE reader uses for AC results.
+        # Column 0 keeps its real part; every dependent variable becomes two columns
+        # (Mag + Phase by default), the same layout the HSPICE reader uses for AC results.
         names = [x_name]
         col_raw = [p.raw_names[0]]
         for raw in p.raw_names[1:]:
-            base = _sanitize(raw)
-            names += [f"{base}_Mag", f"{base}_Phase"]
+            names += ac_names(_sanitize(raw), ac_format)
             col_raw += [raw, raw]
     else:
         names = [_sanitize(r) for r in p.raw_names]
@@ -239,16 +238,16 @@ def _build_header(path: str, p: _Plot, plot_names: List[str]) -> Header:
         path=path, is_binary=p.is_binary, version="nutmeg", analysis=_analysis(p.plotname),
         ncols=len(names), nsweepparam=0, sweep_count_hint=nsweeps if nsweeps > 1 else 0,
         x_name=x_name, names=names, raw_names=list(p.raw_names), col_raw_names=col_raw,
-        type_codes=[], sweep_params=[], plot_names=list(plot_names), plot=p.index,
+        type_codes=[], sweep_params=[], plot_names=list(plot_names), plot=p.index, ac_format=ac_format,
     )
 
 
-def read_nutmeg_header(path, plot: int = 0) -> Header:
+def read_nutmeg_header(path, plot: int = 0, ac_format: str = "magphase") -> Header:
     """Parse only the headers. Binary data sections are seeked over, never read."""
     path = os.fspath(path)
     with open(path, "rb") as f:
         target, plot_names = _walk(f, path, int(plot))
-    return _build_header(path, target, plot_names)
+    return _build_header(path, target, plot_names, ac_format)
 
 
 def _column_specs(cols: Sequence[int], is_complex: bool) -> List[Tuple[int, int, int]]:
@@ -260,21 +259,19 @@ def _column_specs(cols: Sequence[int], is_complex: bool) -> List[Tuple[int, int,
         elif c == 0:
             specs.append((c, 0, _REAL))
         else:
-            specs.append((c, (c + 1) // 2, _MAG if c % 2 else _PHASE))
+            specs.append((c, (c + 1) // 2, _FIRST if c % 2 else _SECOND))
     return specs
 
 
-def _take(rows: np.ndarray, specs, buf: Dict[int, np.ndarray], start: int) -> None:
+def _take(rows: np.ndarray, specs, buf: Dict[int, np.ndarray], start: int, ac_format: str) -> None:
     """Copy the selected columns of a (npoints, nvars) slab into the preallocated buffers."""
     stop = start + rows.shape[0]
     for c, var, kind in specs:
         column = rows[:, var]
-        if kind == _MAG:
-            buf[c][start:stop] = np.abs(column)
-        elif kind == _PHASE:
-            buf[c][start:stop] = np.angle(column, deg=True)
-        else:
+        if kind == _REAL:
             buf[c][start:stop] = column.real
+        else:
+            buf[c][start:stop] = ac_part(column.real, column.imag, ac_format, second=kind == _SECOND)
 
 
 def _capacity(f, p: _Plot) -> int:
@@ -310,8 +307,9 @@ class _Writer:
     the caller's point count as soon as a window drops anything.
     """
 
-    def __init__(self, p: _Plot, specs, buf: Dict[int, np.ndarray], xrange, per: int):
+    def __init__(self, p: _Plot, specs, buf: Dict[int, np.ndarray], xrange, per: int, ac_format: str):
         self.p = p
+        self.ac_format = ac_format
         self.specs = specs
         self.buf = buf
         self.xrange = xrange
@@ -343,7 +341,7 @@ class _Writer:
         stop = self.fill + n
         if stop > next(iter(self.buf.values())).size:
             _grow(self.buf, self.fill, stop)
-        _take(rows, self.specs, self.buf, self.fill)
+        _take(rows, self.specs, self.buf, self.fill, self.ac_format)
         self.fill = stop
 
 
@@ -473,23 +471,25 @@ def _kept_spans(counts: Sequence[int], per: int, nread: int, sweeps) -> Tuple[Li
     return spans, indices
 
 
-def read_nutmeg_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None) -> TraceSet:
+def read_nutmeg_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
+                       ac_format: str = "magphase") -> TraceSet:
     """Stream one plot of a rawfile, keeping only the requested columns, sweeps and x window.
 
     xrange is None or a validated (lo, hi) pair; rows outside the closed interval are dropped
     as the file streams, so memory follows the window rather than the plot's length.
+    ac_format is what each complex variable becomes (see reader.read_traces).
     """
     path = os.fspath(path)
     with open(path, "rb") as f:
         target, plot_names = _walk(f, path, int(plot))
-        header = _build_header(path, target, plot_names)
+        header = _build_header(path, target, plot_names, ac_format)
         cols = resolve_columns(header, names)
         specs = _column_specs(cols, target.is_complex)
         points = _capacity(f, target)               # points the data section can hold
         capacity = min(points, WINDOW_CAPACITY) if xrange is not None else points
         buf = {c: np.empty(capacity, np.float64) for c in cols}
         per = max(1, (target.npoints if target.count_known else 1) // target.nsweeps)
-        write = _Writer(target, specs, buf, xrange, per)
+        write = _Writer(target, specs, buf, xrange, per, ac_format)
         f.seek(target.data_start)
         if target.is_binary:
             nread = _read_binary(f, target, write, points)

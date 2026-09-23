@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import math
 import os
+import warnings
 import zipfile
 from typing import List, Optional, Sequence, Tuple
 
@@ -14,12 +15,13 @@ from .reader import TraceSet, read_header, read_traces
 OUTPUTS = ("arrays", "csv", "npz", "summary", "png")
 
 
-def list_traces(path, plot: int = 0) -> dict:
+def list_traces(path, plot: int = 0, ac_format: str = "magphase") -> dict:
     """Trace names and file facts from the header only.
 
     plot selects one plot of a Nutmeg rawfile; "plots" lists every plot in it (HSPICE: []).
+    ac_format names the columns of complex (AC) variables, as in extract.
     """
-    h = read_header(path, plot)
+    h = read_header(path, plot, ac_format)
     return {
         "path": h.path, "format": h.version, "analysis": h.analysis, "x": h.x_name,
         "traces": h.names[1:], "sweep_params": h.sweep_params, "sweep_count_hint": h.sweep_count_hint,
@@ -71,8 +73,17 @@ def _json_floats(arr) -> List[Optional[float]]:
     return [_json_float(v) for v in np.asarray(arr, dtype=np.float64).tolist()]
 
 
+def nan_stats(a: np.ndarray) -> Tuple[float, float, float]:
+    """(min, max, mean) over the values that are not NaN; NaN for each when there are none."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)     # all-NaN slice / mean of empty slice
+        return np.nanmin(a), np.nanmax(a), np.nanmean(a)
+
+
 def summarize(ts: TraceSet, downsample: Optional[int] = None) -> dict:
     """JSON-serialisable statistics per trace and sweep; stats use the full trace, points are decimated.
+
+    min, max and mean skip NaN values; they are null only when a trace holds nothing else.
 
     Points are emitted only when downsample is given, and never more than SUMMARY_MAX_POINTS
     in total: the budget is shared evenly by the (trace, sweep) series (a summary is for
@@ -90,7 +101,8 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None) -> dict:
             a = np.asarray(arr, dtype=np.float64)
             entry = {"count": int(a.size)}
             if a.size:
-                entry.update(min=_json_float(a.min()), max=_json_float(a.max()), mean=_json_float(a.mean()),
+                lo, hi, mean = nan_stats(a)
+                entry.update(min=_json_float(lo), max=_json_float(hi), mean=_json_float(mean),
                              first=_json_float(a[0]), last=_json_float(a[-1]))
                 if downsample is not None:
                     idx = decimation_indices(a.size, downsample)
@@ -229,7 +241,7 @@ def write_file(ts: TraceSet, output: str, dest=None, yrange=None) -> str:
 def extract(path, names=None, sweeps=None, output: str = "arrays",
             downsample: Optional[int] = None, dest=None,
             xrange: Optional[Sequence[float]] = None, yrange: Optional[Sequence[float]] = None,
-            plot: int = 0):
+            plot: int = 0, ac_format: str = "magphase"):
     """Read selected traces and return them as arrays, a summary dict, or a written file path.
 
     xrange=(lo, hi) keeps only the rows whose x value (TIME, FREQ or the sweep
@@ -238,6 +250,8 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
     every output. yrange=(lo, hi)
     sets the vertical axis limits of the png plot and is ignored by other outputs.
     plot selects one plot of a Nutmeg rawfile (0-based); see list_traces for the list.
+    ac_format is what each complex (AC) variable becomes: "magphase" (_Mag, _Phase in
+    degrees), "db" (_dB = 20 log10 |z|, _Phase) or "realimag" (_Re, _Im).
     """
     if output not in OUTPUTS:
         raise ValueError(f"output must be one of {OUTPUTS}, not {output!r}")
@@ -247,7 +261,7 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
     yrange = validate_range("yrange", yrange)
     if output == "png":
         _require_matplotlib()
-    ts = read_traces(path, names, sweeps, plot, xrange)
+    ts = read_traces(path, names, sweeps, plot, xrange, ac_format)
     if output == "summary":
         return summarize(ts, downsample)
     if downsample is not None:

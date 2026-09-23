@@ -1,8 +1,4 @@
-"""Streaming, column-selecting reader for HSPICE binary and ASCII result files.
-
-Independent of hspiceParser.py except for two helpers (is_binary, parse_var_name),
-reused so trace names match the old module exactly.
-"""
+"""Streaming, column-selecting reader for HSPICE binary and ASCII result files."""
 from __future__ import annotations
 
 import fnmatch
@@ -13,8 +9,6 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
-
-from .hspiceParser import is_binary, parse_var_name
 
 _DTYPE = {"9601": np.dtype("<f4"), "2001": np.dtype("<f8"), "ascii": np.dtype("<f8"),
           "nutmeg": np.dtype("<f8")}
@@ -28,6 +22,9 @@ _MAX_CHUNK_BYTES = 4 << 20      # cap on one bulk read buffer; blocks whose fram
 WINDOW_CAPACITY = 1 << 14       # points preallocated per column when an x window is set: the
                                 # file size says nothing about how many rows fall inside it,
                                 # so start small and let the buffers grow
+
+# What each complex (AC) variable becomes: the suffixes of its two columns, per ac_format.
+AC_FORMATS = {"magphase": ("Mag", "Phase"), "db": ("dB", "Phase"), "realimag": ("Re", "Im")}
 
 
 @dataclass
@@ -47,6 +44,7 @@ class Header:
     sweep_params: List[str]
     plot_names: List[str] = field(default_factory=list)   # Nutmeg: Plotname of every plot; HSPICE: []
     plot: int = 0                                         # Nutmeg: index of the plot described here
+    ac_format: str = "magphase"                           # what each complex variable's two columns hold
 
     @property
     def dtype(self) -> np.dtype:
@@ -55,6 +53,52 @@ class Header:
     @property
     def sentinel(self):
         return self.dtype.type(1e30)
+
+
+def parse_var_name(name: str) -> str:
+    """Sanitize an HSPICE variable name: v(a.b -> v_a_b, i(x -> i_x, TIME -> TIME.
+
+    The rule of the original hspiceParser.py (MIT, see LICENSE.MIT), kept so trace names
+    are unchanged.
+    """
+    parts = [p.replace(".", "_").replace(":", "_") for p in name.split("(")]
+    if len(parts) < 2:
+        return parts[0]
+    if parts[0] == parts[1]:
+        return parts[0]
+    return parts[0] + "_" + parts[1]
+
+
+def _is_binary(path: str) -> bool:
+    """A binary HSPICE file starts with a block head whose int32 fields hold zero bytes;
+    an ASCII file never contains one. Only the head is read."""
+    with open(path, "rb") as f:
+        return b"\x00" in f.read(1024)
+
+
+def check_ac_format(ac_format: str) -> str:
+    if ac_format not in AC_FORMATS:
+        raise ValueError(f"ac_format must be one of {tuple(AC_FORMATS)}, not {ac_format!r}")
+    return ac_format
+
+
+def ac_names(base: str, ac_format: str) -> List[str]:
+    """The two column names of complex variable `base`, e.g. v_out_Mag, v_out_Phase."""
+    return [f"{base}_{suffix}" for suffix in AC_FORMATS[ac_format]]
+
+
+def ac_part(re: np.ndarray, im: np.ndarray, ac_format: str, second: bool) -> np.ndarray:
+    """One column of a complex variable from its real and imaginary parts: magnitude
+    (linear or dB) or phase in degrees, or the parts themselves for 'realimag'."""
+    if ac_format == "realimag":
+        return im if second else re
+    if second:
+        return np.degrees(np.arctan2(im, re))
+    mag = np.hypot(re, im)
+    if ac_format == "db":
+        with np.errstate(divide="ignore"):         # |H| = 0 is -inf dB
+            return 20 * np.log10(mag)
+    return mag
 
 
 def _analysis_from_extension(path: str) -> Optional[str]:
@@ -83,7 +127,8 @@ def _uniquify(path: str, names: List[str]) -> List[str]:
 
 
 def _build_header(path: str, is_bin: bool, version: str, nauto: int, nprobe: int,
-                  nsweepparam: int, sweep_count: int, tokens: Sequence[str]) -> Header:
+                  nsweepparam: int, sweep_count: int, tokens: Sequence[str],
+                  ac_format: str) -> Header:
     nvars = nauto + nprobe
     if nvars < 1:
         raise ValueError(f"{path}: header declares {nvars} variables")
@@ -104,8 +149,7 @@ def _build_header(path: str, is_bin: bool, version: str, nauto: int, nprobe: int
         names = [x_name]
         col_raw = [raw_names[0]]
         for raw in raw_names[1:]:
-            base = parse_var_name(raw)
-            names += [f"{base}_Mag", f"{base}_Phase"]
+            names += ac_names(parse_var_name(raw), ac_format)
             col_raw += [raw, raw]
     else:
         names = [parse_var_name(r) for r in raw_names]
@@ -115,7 +159,7 @@ def _build_header(path: str, is_bin: bool, version: str, nauto: int, nprobe: int
         path=path, is_binary=is_bin, version=version, analysis=analysis, ncols=len(names),
         nsweepparam=nsweepparam, sweep_count_hint=sweep_count, x_name=x_name, names=names,
         raw_names=raw_names, col_raw_names=col_raw, type_codes=type_codes,
-        sweep_params=[parse_var_name(p) for p in sweep_params_raw],
+        sweep_params=[parse_var_name(p) for p in sweep_params_raw], ac_format=ac_format,
     )
 
 
@@ -156,7 +200,7 @@ def _read_block(f, index: int, itemsize: int = 1) -> Optional[bytes]:
     return payload
 
 
-def _read_binary_header(f, path: str) -> Header:
+def _read_binary_header(f, path: str, ac_format: str = "magphase") -> Header:
     payload = _read_block(f, 0, 1)
     if payload is None:
         raise ValueError(f"{path}: empty file")
@@ -173,10 +217,11 @@ def _read_binary_header(f, path: str) -> Header:
         tokens = tokens[:-1]
     if not tokens:
         raise ValueError(f"{path}: header has no variable list")
-    return _build_header(path, True, version, nauto, nprobe, nsweepparam, int(tokens[0]), tokens[1:])
+    return _build_header(path, True, version, nauto, nprobe, nsweepparam, int(tokens[0]), tokens[1:],
+                         ac_format)
 
 
-def _read_ascii_header(f, path: str) -> Header:
+def _read_ascii_header(f, path: str, ac_format: str = "magphase") -> Header:
     """Consume the ASCII header lines of a file opened in binary mode, leaving f at the
     first data line (so its position is a byte offset the data reader can rely on)."""
     def readline() -> str:
@@ -185,6 +230,8 @@ def _read_ascii_header(f, path: str) -> Header:
     first = readline()
     if not first:
         raise ValueError(f"{path}: empty file")
+    if first.startswith("$DATA1"):
+        raise ValueError(f"{path}: this is an HSPICE measure file (.mt/.ms/.ma); read it with read_measures")
     nauto, nprobe, nsweepparam = int(first[0:4]), int(first[4:8]), int(first[8:12])
     readline()                                    # copyright line
     third = readline()
@@ -197,7 +244,7 @@ def _read_ascii_header(f, path: str) -> Header:
         text += more
     tokens = text.split()
     tokens = tokens[:tokens.index(_TERMINATOR)]
-    return _build_header(path, False, "ascii", nauto, nprobe, nsweepparam, sweep_count, tokens)
+    return _build_header(path, False, "ascii", nauto, nprobe, nsweepparam, sweep_count, tokens, ac_format)
 
 
 ASCII_BATCH_VALUES = 65536      # values per array handed to the collector; keeps per-line overhead out
@@ -279,19 +326,23 @@ def _reject_plot(path: str, plot: int) -> None:
         raise ValueError(f"{path}: plot={plot} applies to Nutmeg rawfiles only; an HSPICE file holds one plot")
 
 
-def read_header(path, plot: int = 0) -> Header:
+def read_header(path, plot: int = 0, ac_format: str = "magphase") -> Header:
     """Parse only the header. Never touches data.
 
     plot selects one plot of a Nutmeg rawfile (0-based); HSPICE files hold a single plot.
+    ac_format names the two columns of each complex (AC) variable: "magphase" (_Mag,
+    _Phase in degrees), "db" (_dB, _Phase) or "realimag" (_Re, _Im).
     """
     from . import nutmeg          # imported here: nutmeg.py builds on this module
 
     path = os.fspath(path)
+    check_ac_format(ac_format)
     if nutmeg.is_nutmeg(path):
-        return nutmeg.read_nutmeg_header(path, plot)
+        return nutmeg.read_nutmeg_header(path, plot, ac_format)
     _reject_plot(path, plot)
+    read = _read_binary_header if _is_binary(path) else _read_ascii_header
     with open(path, "rb") as f:
-        return _read_binary_header(f, path) if is_binary(path) else _read_ascii_header(f, path)
+        return read(f, path, ac_format)
 
 
 @dataclass
@@ -539,7 +590,36 @@ def _feed_bulk_frames(f, header: Header, collector: _Collector, block_payload: i
             return index
 
 
-def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None) -> TraceSet:
+def _stored_columns(header: Header, cols: Sequence[int]) -> List[int]:
+    """Columns to read from the file for the selected ones. An HSPICE AC file stores each
+    complex variable as (real, imaginary) in columns 2k-1, 2k; any other format than
+    'realimag' needs both to compute either of its two columns."""
+    if header.analysis != "ac" or header.ac_format == "realimag":
+        return list(cols)
+    stored = set(cols)
+    for c in cols:
+        if c:
+            stored.add(c + 1 if c % 2 else c - 1)
+    return sorted(stored)
+
+
+def _convert_ac(header: Header, cols: Sequence[int], data: dict) -> dict:
+    """Turn the stored (real, imaginary) columns into the ac_format columns selected."""
+    if header.analysis != "ac" or header.ac_format == "realimag":
+        return {c: data[c] for c in cols}
+    out = {}
+    for c in cols:
+        if c == 0:
+            out[c] = data[c]
+            continue
+        re_col = c if c % 2 else c - 1
+        out[c] = [ac_part(re, im, header.ac_format, second=not c % 2)
+                  for re, im in zip(data[re_col], data[re_col + 1])]
+    return out
+
+
+def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
+                ac_format: str = "magphase") -> TraceSet:
     """Stream a result file, keeping only the requested columns, sweeps and x window.
 
     names: None for all, else a list of trace names (see resolve_columns). Column 0 is always kept.
@@ -548,17 +628,22 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None) -> Tr
     xrange: None, or a validated (lo, hi) pair. Rows whose x value falls outside the closed
             interval are dropped as the file streams, so memory follows the window, not the
             column length. A sweep with no rows inside is kept, with empty arrays.
+    ac_format: what each complex (AC) variable becomes: "magphase" (_Mag, _Phase in
+            degrees), "db" (_dB = 20 log10 |z|, _Phase) or "realimag" (_Re, _Im).
+            Ignored by files without complex data.
     """
     from . import nutmeg          # imported here: nutmeg.py builds on this module
 
     path = os.fspath(path)
+    check_ac_format(ac_format)
     if nutmeg.is_nutmeg(path):
-        return nutmeg.read_nutmeg_traces(path, names, sweeps, plot, xrange)
+        return nutmeg.read_nutmeg_traces(path, names, sweeps, plot, xrange, ac_format)
     _reject_plot(path, plot)
-    if is_binary(path):
+    if _is_binary(path):
         with open(path, "rb") as f:
-            header = _read_binary_header(f, path)
+            header = _read_binary_header(f, path, ac_format)
             cols = resolve_columns(header, names)
+            stored = _stored_columns(header, cols)
             data_start = f.tell()
             file_size = os.fstat(f.fileno()).st_size
             block_payload = _peek_block_payload(f)
@@ -566,7 +651,7 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None) -> Tr
                                         header.ncols, header.dtype.itemsize)
             if xrange is not None:
                 capacity = min(capacity, WINDOW_CAPACITY)
-            collector = _Collector(header, cols, sweeps, capacity, xrange)
+            collector = _Collector(header, stored, sweeps, capacity, xrange)
             index = 1
             frame = block_payload + _FRAME_OVERHEAD
             if block_payload > 0 and block_payload % header.dtype.itemsize == 0 and frame <= _MAX_CHUNK_BYTES:
@@ -575,21 +660,23 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None) -> Tr
                 collector.feed(block)
     else:
         with open(path, "rb") as f:
-            header = _read_ascii_header(f, path)
+            header = _read_ascii_header(f, path, ac_format)
             cols = resolve_columns(header, names)
+            stored = _stored_columns(header, cols)
             file_size = os.fstat(f.fileno()).st_size
             capacity = _ascii_capacity(file_size, header.ncols)
             if xrange is not None:
                 capacity = min(capacity, WINDOW_CAPACITY)
-            collector = _Collector(header, cols, sweeps, capacity, xrange)
+            collector = _Collector(header, stored, sweeps, capacity, xrange)
             for values in _iter_ascii_values(f, path):
                 collector.feed(values)
     truncated = collector.finish()
+    data = _convert_ac(header, cols, collector.data)
     return TraceSet(
         header=header,
         selected=[header.names[c] for c in cols],
         sweep_values=collector.sweep_values,
         sweep_indices=collector.sweep_indices,
-        data={header.names[c]: collector.data[c] for c in cols},
+        data={header.names[c]: data[c] for c in cols},
         truncated=truncated,
     )

@@ -86,7 +86,7 @@ def fortran(v: float) -> str:
 
 
 def write_ascii(path, raw_names, type_codes, sweeps, per_line=5):
-    """Write a post=2 ASCII result file readable by hspiceParser.signal_file_ascii_read."""
+    """Write a post=2 ASCII result file (fixed-width 13-character fields, 5 per line)."""
     nsweepparam = len(sweeps[0][0])
     nvars = len(raw_names) - nsweepparam
     with open(path, "w") as f:

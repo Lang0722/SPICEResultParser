@@ -30,9 +30,9 @@ except ImportError:
     except ImportError:
         ToolError = ValueError
 
-from . import api
+from . import api, measure
 
-server = FastMCP("hspice-parser") if FastMCP is not None else None
+server = FastMCP("spice-result-parser") if FastMCP is not None else None
 
 
 def _tool(fn):
@@ -70,7 +70,11 @@ MAX_RUNS = 32           # split a sweep on x restarts only up to this many runs
 _ANALYSIS_WORDS = {"tr": "transient", "sw": "dc sweep", "ac": "ac", "op": "operating point",
                    "noise": "noise"}
 TRUNCATED_LINE = "TRUNCATED: the file ended before its last point; the simulation did not finish"
-AC_LEGEND = "complex traces are split into _Mag (linear magnitude) and _Phase (degrees)"
+AC_LEGEND = {   # per ac_format
+    "magphase": "complex traces are split into _Mag (linear magnitude) and _Phase (degrees)",
+    "db": "complex traces are split into _dB (20*log10 of the magnitude) and _Phase (degrees)",
+    "realimag": "complex traces are split into _Re (real part) and _Im (imaginary part)",
+}
 
 
 def _num(v) -> str:
@@ -151,7 +155,7 @@ def format_text(ts, points: int = 20) -> str:
     lines = [TRUNCATED_LINE] if ts.truncated else []
     lines.append(head)
     if h.analysis == "ac":
-        lines.append(AC_LEGEND)
+        lines.append(AC_LEGEND[h.ac_format])
     if total == 0:
         lines.append("no points in the selected x window")
         return "\n".join(lines)
@@ -161,15 +165,49 @@ def format_text(ts, points: int = 20) -> str:
             tag = f"[{ts.sweep_indices[i]}]" if nsweeps > 1 else ""
             for name in traces:
                 a = np.asarray(ts.data[name][i], dtype=np.float64)
-                stats.append([name + tag, _num(a.min()), _num(a.max())] if a.size else [name + tag, "-", "-"])
+                if a.size:
+                    lo, hi, _ = api.nan_stats(a)
+                    stats.append([name + tag, _num(lo), _num(hi)])
+                else:
+                    stats.append([name + tag, "-", "-"])
         lines += ["", *_table(stats)]
     lines += ["", *body]
     return "\n".join(lines)
 
 
+def format_measures(ms, rows: int = 20) -> str:
+    """Agent-readable text for a MeasureSet: a header, which measures failed, then one row
+    per measurement with every kept column. Failed values print as `failed`.
+
+    `rows` rows are shown (evenly spaced, first and last kept, at most TEXT_MAX_ROWS);
+    when rows were dropped a min/max/mean table over every row comes first.
+    """
+    n = ms.rows
+    idx = api.decimation_indices(n, max(2, min(rows, TEXT_MAX_ROWS)))
+    shown = n if idx is None else int(idx.size)
+    head = f"measures | {n} row{'' if n == 1 else 's'}"
+    if shown < n:
+        head += f" ({shown} shown)"
+    if ms.params:
+        head += " | params: " + ", ".join(ms.params)
+    lines = [head]
+    if ms.failed:
+        lines.append("failed: " + ", ".join(f"{name} in {k} of {n} rows" for name, k in ms.failed.items()))
+    if idx is not None:
+        stats = [["measure", "min", "max", "mean"]]
+        for name in ms.names:
+            if name != "index" and name not in ms.params:
+                stats.append([name, *(_num(v) for v in api.nan_stats(ms.values[name]))])
+        lines += ["", *_table(stats)]
+    cols = [ms.values[name] if idx is None else ms.values[name][idx] for name in ms.names]
+    table = [list(ms.names)] + [["failed" if math.isnan(v) else _num(v) for v in row] for row in zip(*cols)]
+    lines += ["", *_table(table)]
+    return "\n".join(lines)
+
+
 @_tool
 @_tool_errors
-def list_traces(path: str, plot: int = 0) -> dict:
+def list_traces(path: str, plot: int = 0, ac_format: str = "magphase") -> dict:
     """List trace names in an HSPICE .tr*/.sw*/.ac* result file (binary 9601/2001 or ASCII)
     or a Nutmeg rawfile (ngspice / SPICE3 .raw, binary or ASCII).
 
@@ -179,8 +217,10 @@ def list_traces(path: str, plot: int = 0) -> dict:
     plot: which plot of a Nutmeg rawfile to describe (0-based). A rawfile can hold
           several plots; "plots" in the result names them all, and "plot" echoes the
           index described. HSPICE files hold a single plot and report "plots": [].
+    ac_format: how complex (AC) variables are named: "magphase" (_Mag, _Phase),
+          "db" (_dB, _Phase) or "realimag" (_Re, _Im). Pass the same value to extract.
     """
-    return api.list_traces(path, plot)
+    return api.list_traces(path, plot, ac_format)
 
 
 @_tool
@@ -188,7 +228,7 @@ def list_traces(path: str, plot: int = 0) -> dict:
 def extract(path: str, names: Optional[List[str]] = None, sweeps: Optional[List[int]] = None,
             output: str = "text", downsample: Optional[int] = None, dest: Optional[str] = None,
             xrange: Optional[List[float]] = None, yrange: Optional[List[float]] = None,
-            plot: int = 0):
+            plot: int = 0, ac_format: str = "magphase"):
     """Extract selected traces from an HSPICE result file or a Nutmeg rawfile
     (ngspice / SPICE3 .raw, binary or ASCII) with memory bounded by the selection.
 
@@ -216,6 +256,11 @@ def extract(path: str, names: Optional[List[str]] = None, sweeps: Optional[List[
     yrange: [min, max] vertical axis limits for the png plot; ignored by other outputs.
     plot: which plot of a Nutmeg rawfile to read (0-based); see list_traces for the list.
           Ignored for HSPICE files, which hold a single plot.
+    ac_format: what each complex (AC) variable becomes: "magphase" (default; _Mag linear
+          magnitude, _Phase degrees), "db" (_dB = 20*log10 of the magnitude, _Phase) or
+          "realimag" (_Re, _Im). Ignored for results without complex data.
+
+    Measure files (.mt0, .ms0, .ma0) hold .measure results, not traces: use read_measures.
     """
     if output == "arrays":
         raise ValueError("output='arrays' is not available over MCP; use 'summary', 'csv', 'npz' or 'png'")
@@ -224,12 +269,13 @@ def extract(path: str, names: Optional[List[str]] = None, sweeps: Optional[List[
     xrange = api.validate_range("xrange", xrange)
     yrange = api.validate_range("yrange", yrange)
     if output == "text":
-        ts = api.extract(path, names, sweeps, "arrays", xrange=xrange, plot=plot)
+        ts = api.extract(path, names, sweeps, "arrays", xrange=xrange, plot=plot, ac_format=ac_format)
         return format_text(ts, 20 if downsample is None else downsample)
     if output == "summary":
         return api.extract(path, names, sweeps, "summary", 200 if downsample is None else downsample,
-                           xrange=xrange, plot=plot)
-    ts = api.extract(path, names, sweeps, "arrays", downsample, xrange=xrange, plot=plot)
+                           xrange=xrange, plot=plot, ac_format=ac_format)
+    ts = api.extract(path, names, sweeps, "arrays", downsample, xrange=xrange, plot=plot,
+                     ac_format=ac_format)
     written = api.write_file(ts, output, dest, yrange)
     x = ts.header.x_name
     result = {
@@ -241,6 +287,25 @@ def extract(path: str, names: Optional[List[str]] = None, sweeps: Optional[List[
     if output == "png":
         result["size"] = list(_png_size(written))
     return result
+
+
+@_tool
+@_tool_errors
+def read_measures(path: str, names: Optional[List[str]] = None, rows: int = 20) -> str:
+    """Read an HSPICE measure file (.mt0 transient, .ms0 dc, .ma0 ac): the results of
+    the netlist's .measure statements, one row per simulation (per sweep point, Monte
+    Carlo sample or temperature).
+
+    names: measure names or globs (tp*); None keeps every column. The index column and
+           the swept parameters are always kept, so each row stays identifiable.
+    rows: rows shown, evenly spaced with first and last kept (at most 500); when rows
+          are dropped a min/max/mean table over all of them comes first.
+
+    Returns a readable report: row count and swept parameters, which measures failed
+    (a failed value prints as "failed"), then a table with one column per measure,
+    values rounded to 6 significant digits.
+    """
+    return format_measures(measure.read_measures(path, names), rows)
 
 
 def _png_size(path: str):
