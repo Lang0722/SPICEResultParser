@@ -106,7 +106,7 @@ pip install "spice_result_parser[mcp,plot] @ git+https://github.com/Lang0722/SPI
 {"mcpServers": {"spice": {"command": "srp-mcp"}}}
 ```
 
-Tools: `list_traces(path, plot, ac_format)`, `extract(path, names, sweeps, output,
+Tools: `list_traces(path, plot)`, `extract(path, names, sweeps, output,
 downsample, dest, xrange, yrange, plot, ac_format)` and `read_measures(path, names,
 rows)`, on HSPICE result files and Nutmeg rawfiles alike. Over MCP
 `output` is `text` (default: a readable report, per-trace min/max then a table with x

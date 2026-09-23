@@ -9,7 +9,7 @@ Python; only `main()` needs the server.
 """
 import math
 import struct
-from typing import List, Optional
+from typing import Annotated, List, Optional
 
 import numpy as np
 
@@ -29,6 +29,12 @@ except ImportError:
         from mcp.server.fastmcp.exceptions import ToolError
     except ImportError:
         ToolError = ValueError
+
+try:
+    from pydantic import Field
+except ImportError:                          # no mcp, so no schema to describe
+    def Field(description=None):
+        return description
 
 from . import api, measure
 
@@ -207,60 +213,82 @@ def format_measures(ms, rows: int = 20) -> str:
 
 @_tool
 @_tool_errors
-def list_traces(path: str, plot: int = 0, ac_format: str = "magphase") -> dict:
-    """List trace names in an HSPICE .tr*/.sw*/.ac* result file (binary 9601/2001 or ASCII)
-    or a Nutmeg rawfile (ngspice / SPICE3 .raw, binary or ASCII).
+def list_traces(
+    path: Annotated[str, Field(description="Result file: HSPICE .tr#/.sw#/.ac# (binary 9601/2001 "
+                                           "or ASCII) or a Nutmeg .raw (binary or ASCII).")],
+    plot: Annotated[int, Field(description="Nutmeg only: which plot of the rawfile to describe, "
+                                           "0-based (see \"plots\"). Must be 0 for HSPICE files.")] = 0,
+) -> dict:
+    """List the traces in a simulation result file. Call this first: it reads only the
+    header, so it is cheap on any file size, and gives the names to pass to extract.
 
-    Reads only the header, so it is cheap on any file size. Returns the x variable
-    name, the trace names to pass to `extract`, and the sweep parameter names.
+    Result fields:
+    - path, format ("9601", "2001", "ascii" or "nutmeg")
+    - analysis: "tr" transient, "sw" dc sweep, "ac"; Nutmeg adds "op", "noise", "other"
+    - x: the x variable (TIME, HERTZ, the swept source), always returned by extract
+    - traces: every other trace name
+    - sweep_params: names of the swept parameters (HSPICE; [] for Nutmeg)
+    - sweep_count_hint: number of sweeps the header announces; 0 means a single sweep
+    - plot, plots: the plot described and the names of all plots (Nutmeg; HSPICE: 0, [])
 
-    plot: which plot of a Nutmeg rawfile to describe (0-based). A rawfile can hold
-          several plots; "plots" in the result names them all, and "plot" echoes the
-          index described. HSPICE files hold a single plot and report "plots": [].
-    ac_format: how complex (AC) variables are named: "magphase" (_Mag, _Phase),
-          "db" (_dB, _Phase) or "realimag" (_Re, _Im). Pass the same value to extract.
+    AC traces are listed as <name>_Mag and <name>_Phase. extract's ac_format renames
+    them; select them there by raw name (v(out)) or glob (v_out*), which work in every
+    format. For a measure file (.mt#, .ms#, .ma#) use read_measures instead.
     """
-    return api.list_traces(path, plot, ac_format)
+    return api.list_traces(path, plot)
 
 
 @_tool
 @_tool_errors
-def extract(path: str, names: Optional[List[str]] = None, sweeps: Optional[List[int]] = None,
-            output: str = "text", downsample: Optional[int] = None, dest: Optional[str] = None,
-            xrange: Optional[List[float]] = None, yrange: Optional[List[float]] = None,
-            plot: int = 0, ac_format: str = "magphase"):
-    """Extract selected traces from an HSPICE result file or a Nutmeg rawfile
-    (ngspice / SPICE3 .raw, binary or ASCII) with memory bounded by the selection.
+def extract(
+    path: Annotated[str, Field(description="Result file, as for list_traces.")],
+    names: Annotated[Optional[List[str]], Field(
+        description="Traces to read: names from list_traces (v_out), raw names (v(out)) or "
+                    "globs (v_*). None reads every trace. x is always included. For AC, "
+                    "v(out) or v_out* selects both columns of the pair. An unknown name "
+                    "fails with a list of the available traces.")] = None,
+    sweeps: Annotated[Optional[List[int]], Field(
+        description="0-based sweep indices to keep; None keeps all. Each sweep's parameter "
+                    "values head its table in the text output.")] = None,
+    output: Annotated[str, Field(
+        description="\"text\" (default): readable report, see the tool description. "
+                    "\"summary\": JSON with exact numbers. \"csv\" / \"npz\": write every "
+                    "point to a file. \"png\": write a plot image.")] = "text",
+    downsample: Annotated[Optional[int], Field(
+        description="Evenly spaced points kept per sweep, first and last included; at least "
+                    "2. Default: text 20 rows (500 rows in total at most), summary 200 points "
+                    "(20000 in total at most), csv/npz every point. png draws at most 5000 "
+                    "points per line.")] = None,
+    dest: Annotated[Optional[str], Field(
+        description="Output path for csv/npz/png; replaces an existing file. Default: "
+                    "<input>_<ext>_traces.<output> beside the input.")] = None,
+    xrange: Annotated[Optional[List[float]], Field(
+        description="[min, max] on x: keep only rows inside the closed interval, for every "
+                    "output. Applied while reading, so a narrow window on a huge file is "
+                    "cheap: prefer it to reading everything.")] = None,
+    yrange: Annotated[Optional[List[float]], Field(
+        description="[min, max] vertical axis limits of the png plot; ignored otherwise.")] = None,
+    plot: Annotated[int, Field(description="Nutmeg only: which plot to read, 0-based (see "
+                                           "list_traces). Must be 0 for HSPICE files.")] = 0,
+    ac_format: Annotated[str, Field(
+        description="What each complex (AC) trace becomes: \"magphase\" (default; _Mag linear, "
+                    "_Phase degrees), \"db\" (_dB = 20*log10 magnitude, _Phase) or "
+                    "\"realimag\" (_Re, _Im). Ignored without complex data.")] = "magphase",
+):
+    """Read selected traces from an HSPICE result file or a Nutmeg rawfile. Call
+    list_traces first for the names. Start with output="text" to look at the data, then
+    narrow with xrange to zoom in; use csv or npz to hand every point to other tools.
 
-    names: trace names from list_traces (v_out), raw names (v(out)), or globs (v_*);
-           None selects everything. The x variable is always included.
-    sweeps: sweep indices to keep; None keeps all.
-    output: "text" (default) returns a readable report: a header with the analysis, x
-            variable and point count, per-trace min/max, then a table with x once and
-            one column per trace, `downsample` rows per sweep (at most 500 in total),
-            values rounded to 6 significant digits, nan/inf spelled out. "summary"
-            returns the same as JSON with exact floats: per-trace count/min/max/mean/
-            first/last plus `downsample` evenly spaced x/y points. "csv" or "npz" write
-            a file and return its path; "png" writes a plot image (one line per trace
-            per sweep) and returns its path and pixel size. "arrays" is not available
-            over MCP.
-    downsample: evenly spaced points kept per sweep, first and last always included.
-            "text" defaults to 20 rows per sweep; "summary" to 200 points and never
-            returns more than 20000 in total; None keeps every point for csv and npz;
-            "png" draws at most 5000 points per line whatever downsample says.
-    dest: output file path for csv/npz/png; default is beside the input file.
-    xrange: [min, max] on the x variable (TIME, FREQ, sweep variable); only rows inside
-            the closed interval are kept, for every output. The window is applied while
-            the file streams, so a narrow window on a huge file is cheap in memory: use
-            it rather than reading everything.
-    yrange: [min, max] vertical axis limits for the png plot; ignored by other outputs.
-    plot: which plot of a Nutmeg rawfile to read (0-based); see list_traces for the list.
-          Ignored for HSPICE files, which hold a single plot.
-    ac_format: what each complex (AC) variable becomes: "magphase" (default; _Mag linear
-          magnitude, _Phase degrees), "db" (_dB = 20*log10 of the magnitude, _Phase) or
-          "realimag" (_Re, _Im). Ignored for results without complex data.
+    text: a header (analysis, x, point count, "(n shown)" when rows were dropped;
+    "TRUNCATED" first when the simulation had not finished writing), a min/max table
+    over every point, then one table per sweep with x once and one column per trace.
+    Values have 6 significant digits; nan and inf are spelled out.
 
-    Measure files (.mt0, .ms0, .ma0) hold .measure results, not traces: use read_measures.
+    summary: JSON with exact floats: per trace and sweep count, min, max, mean (NaN
+    skipped), first, last, plus downsampled x/y points; NaN and inf become null.
+
+    csv, npz, png: the file is written, and the result holds output, path, traces,
+    sweeps, sweep_indices, points (per sweep), truncated, and for png size [w, h].
     """
     if output == "arrays":
         raise ValueError("output='arrays' is not available over MCP; use 'summary', 'csv', 'npz' or 'png'")
@@ -291,19 +319,22 @@ def extract(path: str, names: Optional[List[str]] = None, sweeps: Optional[List[
 
 @_tool
 @_tool_errors
-def read_measures(path: str, names: Optional[List[str]] = None, rows: int = 20) -> str:
-    """Read an HSPICE measure file (.mt0 transient, .ms0 dc, .ma0 ac): the results of
-    the netlist's .measure statements, one row per simulation (per sweep point, Monte
-    Carlo sample or temperature).
+def read_measures(
+    path: Annotated[str, Field(description="HSPICE measure file: .mt# (transient), .ms# (dc) "
+                                           "or .ma# (ac).")],
+    names: Annotated[Optional[List[str]], Field(
+        description="Measures to show, by name or glob (tp*); None shows every column. The "
+                    "index column and the swept parameters are always kept.")] = None,
+    rows: Annotated[int, Field(
+        description="Rows shown, evenly spaced with first and last kept; at most 500.")] = 20,
+) -> str:
+    """Read the results of the netlist's .measure statements: one row per simulation
+    (per sweep point, Monte Carlo sample or temperature), one column per measure.
 
-    names: measure names or globs (tp*); None keeps every column. The index column and
-           the swept parameters are always kept, so each row stays identifiable.
-    rows: rows shown, evenly spaced with first and last kept (at most 500); when rows
-          are dropped a min/max/mean table over all of them comes first.
-
-    Returns a readable report: row count and swept parameters, which measures failed
-    (a failed value prints as "failed"), then a table with one column per measure,
-    values rounded to 6 significant digits.
+    Returns text: a header with the row count and swept parameters, a "failed:" line
+    naming each measure that could not be evaluated and in how many rows, a min/max/mean
+    table when rows were dropped, then the table itself. Failed values print as
+    "failed"; numbers have 6 significant digits.
     """
     return format_measures(measure.read_measures(path, names), rows)
 

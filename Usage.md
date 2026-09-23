@@ -183,9 +183,10 @@ pip install 'spice_result_parser[mcp]'
 {"mcpServers": {"spice": {"command": "srp-mcp"}}}
 ```
 
-Tools: `list_traces(path, plot, ac_format)`, `extract(path, names, sweeps, output, downsample, dest, xrange,
+Tools: `list_traces(path, plot)`, `extract(path, names, sweeps, output, downsample, dest, xrange,
 yrange, plot, ac_format)` and `read_measures(path, names, rows)`, on HSPICE result files and Nutmeg
-rawfiles alike (`plot` picks one plot of a rawfile, `ac_format` names AC traces as above).
+rawfiles alike (`plot` picks one plot of a rawfile; `extract`'s `ac_format` names AC traces as
+above, and `list_traces` lists them in the default `_Mag`/`_Phase` form).
 Over MCP `output` is `text` (default), `summary` (statistics and downsampled points as
 JSON with exact floats), `csv`, `npz` (write a file and return its path), or `png`
 (writes a plot and returns its path and pixel size); full arrays are never sent inline.

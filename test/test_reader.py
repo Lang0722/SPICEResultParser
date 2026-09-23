@@ -1536,11 +1536,42 @@ class TestMcp(unittest.TestCase):
     def test_ac_format_over_mcp(self):
         with tempfile.TemporaryDirectory() as tmp:
             path, _, _ = make_ac(tmp)
-            out = self.m.list_traces(str(path), ac_format="db")
-            self.assertEqual(out["traces"][:2], ["v_a_dB", "v_a_Phase"])
+            out = self.m.list_traces(str(path))
+            self.assertEqual(out["traces"][:2], ["v_a_Mag", "v_a_Phase"])
+            params = {t.name: set(t.input_schema["properties"])
+                      for t in asyncio.run(self.m.server.list_tools())}
+            self.assertEqual(params["list_traces"], {"path", "plot"})   # extract alone takes ac_format
+            self.assertIn("ac_format", params["extract"])
             text = self.m.extract(str(path), ["v(a"], ac_format="realimag")
             self.assertIn(self.m.AC_LEGEND["realimag"], text)
             self.assertIn("v_a_Re", text)
+
+    def tools(self):
+        return {t.name: t for t in asyncio.run(self.m.server.list_tools())}
+
+    def test_every_parameter_is_described_in_the_schema(self):
+        for name, tool in self.tools().items():
+            for param, spec in tool.input_schema["properties"].items():
+                self.assertTrue(spec.get("description"), f"{name}.{param} has no description")
+
+    def test_descriptions_are_short_and_start_with_usage(self):
+        tools = self.tools()
+        for name, tool in tools.items():
+            self.assertLess(len(tool.description), 1400, name)
+        self.assertIn("list_traces", tools["extract"].description)       # says what to call first
+        self.assertIn("read_measures", tools["list_traces"].description)
+
+    def test_list_traces_documents_its_result(self):
+        text = self.tools()["list_traces"].description
+        for field in ("path", "format", "analysis", "x", "traces", "sweep_params",
+                      "sweep_count_hint", "plot", "plots"):
+            self.assertRegex(text, rf"\b{field}\b", field)
+
+    def test_plot_on_hspice_is_documented_as_an_error(self):
+        props = self.tools()["extract"].input_schema["properties"]
+        self.assertNotIn("Ignored for HSPICE", props["plot"]["description"])
+        with self.assertRaisesRegex(self.m.ToolError, "Nutmeg rawfiles only"):
+            self.m.extract(str(HERE / "test_9601.tr0"), plot=1)
 
     def test_read_measures_tool(self):
         text = self.m.read_measures(str(HERE / "test.mt0"), ["rchg"])
