@@ -71,7 +71,7 @@ extract("run.tr0", ["v(out)"], xrange=(1e-9, 5e-9), yrange=(0, 1.2), output="png
 # Nutmeg rawfiles (ngspice / SPICE3 .raw) are read the same way; one file can hold
 # several plots, selected by index.
 list_traces("rc.raw")["plots"]                      # ['Transient Analysis', 'AC Analysis', ...]
-extract("rc.raw", ["v(out)"], plot=1, output="png") # the AC plot: log x axis, Mag + Phase
+extract("rc.raw", ["v_out_Mag"], plot=1, output="png")  # the AC plot: log x axis
 
 # AC results: each complex variable becomes two traces, chosen by ac_format.
 extract("run.ac0", ["v(out)"])                        # v_out_Mag, v_out_Phase (degrees)
@@ -88,7 +88,9 @@ ms.values["tpd"]                                    # one value per row; NaN whe
 is applied while the file streams, so peak memory follows the window, not the column
 length: a 10% window over the 490 MB file above reads all twenty traces at 136 MB peak
 RSS instead of 555 MB. `yrange` sets the plot's vertical limits; `sweeps=[...]` selects
-sweeps; `downsample=N` keeps N evenly spaced points. Binary 9601 and 2001 files and `post=2` ASCII files are
+sweeps, and an index the file does not hold is an error; `downsample=N` keeps N evenly
+spaced points. `dest` names the csv/npz/png file; it is checked before the read and is
+never allowed to be the input file. Binary 9601 and 2001 files and `post=2` ASCII files are
 supported, including multi-sweep and AC results, as are Nutmeg rawfiles (ngspice /
 SPICE3 `.raw`) in both binary and ASCII form. A file that the simulator is still
 writing is read up to its last complete point and flagged `truncated`. HSPICE stores AC
@@ -110,13 +112,16 @@ Tools: `list_traces(path, plot)`, `extract(path, names, sweeps, output,
 downsample, dest, xrange, yrange, plot, ac_format)` and `read_measures(path, names,
 rows)`, on HSPICE result files and Nutmeg rawfiles alike. Over MCP
 `output` is `text` (default: a readable report, per-trace min/max then a table with x
-once and one column per trace, rounded to 6 significant digits), `summary` (the same as
-JSON with exact floats plus a bounded number of downsampled points), `csv`, `npz` or
-`png`; full arrays are never sent inline. `plot` picks one plot of a Nutmeg rawfile.
+once and one column per trace, rounded to 6 significant digits, at most 500 rows and 20
+tables), `summary` (JSON with exact floats: per-trace statistics, plus downsampled points
+when `downsample` is set), `csv`, `npz` or `png` (the file is written and its absolute
+path returned); full arrays are never sent inline. `plot` picks one plot of a Nutmeg rawfile.
 `spice_result_parser.mcp_server.format_text(ts, points)` renders that text for any
 `TraceSet` and needs no `mcp` package. `read_measures` returns a text table of an
 HSPICE measure file: the swept parameters, which measures failed, and one row per
-simulation.
+simulation. `list_traces` and `read_measures` are marked read-only for the client;
+`extract` can overwrite the file `dest` names. The server works with mcp 1.x and 2.x;
+tool hints need mcp 1.7 or later.
 
 Design notes live in `docs/superpowers/specs/`; the full API is described in
 [Usage.md](Usage.md).

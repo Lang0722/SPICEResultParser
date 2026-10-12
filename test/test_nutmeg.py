@@ -268,6 +268,14 @@ class TestPlotIndex(unittest.TestCase):
             for col, name in enumerate(ts.selected):
                 np.testing.assert_allclose(ts.data[name][0], written[2][:, col].real, rtol=1e-12)
 
+    def test_plot_must_be_an_integer(self):
+        with self.assertRaisesRegex(ValueError, "plot must be an integer"):
+            read_traces(BIN, plot=1.5)
+        with self.assertRaisesRegex(ValueError, "plot must be an integer"):
+            read_header(HERE / "test_9601.tr0", plot=1.5)
+        with self.assertRaisesRegex(ValueError, "plot must be an integer"):
+            read_header(BIN, plot=True)
+
     def test_plot_on_an_hspice_file_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "applies to Nutmeg rawfiles only"):
             read_header(HERE / "test_9601.tr0", plot=1)
@@ -309,6 +317,12 @@ class TestDimensions(unittest.TestCase):
             self.assertEqual(len(ts.data["v_out"]), 1)
             np.testing.assert_array_equal(ts.data["v_out"][0], self.data[5:10, 2])
             self.assertIsNone(ts.data["v_out"][0].base)   # the whole-file buffer is released
+
+    def test_sweep_index_out_of_range(self):
+        for binary in (True, False):
+            with self.assertRaisesRegex(ValueError,
+                                        r"sweep index 3 out of range; the file holds 3 sweeps \(0 to 2\)"):
+                read_traces(self.write(binary), ["v(out)"], sweeps=[3])
 
     def test_unusable_dimensions_are_ignored(self):
         path = self.write(True, dimensions=(4, 5))        # 4 * 5 != 15
@@ -1037,6 +1051,42 @@ class TestFormatText(unittest.TestCase):
         self.assertIn(f"({self.m.TEXT_MAX_ROWS} shown)", t.splitlines()[0])
         self.assertEqual(len(t.splitlines()), 6 + self.m.TEXT_MAX_ROWS)
 
+    def test_many_sweeps_are_capped(self):
+        rng = np.random.default_rng(9)
+        sweeps = []
+        for r in range(60):
+            data = rng.random((40, 3))
+            data[:, 0] = np.linspace(0, 1e-6, 40)
+            sweeps.append(([float(r)], data))
+        path = self.dir / "mc.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(a", "v(b", "r1"], [1, 1, 1], sweeps)
+        lines = self.text(path).splitlines()
+        heads = [l for l in lines if l.startswith("--")]
+        self.assertEqual(len(heads), self.m.TEXT_MAX_TABLES + 1)
+        self.assertIn("-- 40 tables not shown; pass sweeps=[...] to see them --", heads)
+        self.assertEqual(heads[0], "-- sweep 0: r1=0 --")
+        self.assertEqual(heads[-1], "-- sweep 59: r1=59 --")
+        self.assertIn("(all 60 sweeps)", lines[2])                # one min/max row per trace
+        self.assertEqual(lines[3].split()[0], "v_a")
+        self.assertEqual(lines[4].split()[0], "v_b")
+        self.assertIn("(400 shown)", lines[0])                     # 20 tables of 20 rows
+        self.assertIn(f"({self.m.TEXT_MAX_ROWS} shown)", self.text(path, points=100).splitlines()[0])
+        self.assertEqual(lines[3].split()[1:], [self.m._num(min(d[:, 1].min() for _, d in sweeps)),
+                                                self.m._num(max(d[:, 1].max() for _, d in sweeps))])
+
+    def test_no_sweeps_selected(self):
+        t = self.text(HERE / "test_9601.tr0", ["v_vo"], sweeps=[])
+        self.assertEqual(t.splitlines()[-1], "no sweeps in the selection")
+
+    def test_many_runs_of_one_sweep_are_capped(self):
+        x = np.tile(np.linspace(0, 1, 10), 30)                    # 30 runs: x restarts 29 times
+        path = self.dir / "runs.raw"
+        fixtures.write_nutmeg(path, [("DC transfer characteristic", ["v(v-sweep)", "i(v1)"],
+                                      np.c_[x, x * 2], False)])
+        lines = self.text(path).splitlines()
+        self.assertIn("-- 10 tables not shown; output='csv' writes every point --", lines)
+        self.assertEqual(lines[2].split()[0], "trace")              # one sweep: per-sweep min/max
+
     def test_only_x(self):
         t = self.text(ASCII, [], points=2)
         lines = t.splitlines()
@@ -1093,8 +1143,9 @@ class TestMcp(unittest.TestCase):
     def test_extract_tool_writes_a_csv_of_one_plot(self):
         dest = self.dir / "dc.csv"
         out = self.m.extract(str(ASCII), ["v(out)"], output="csv", dest=str(dest), plot=2)
-        self.assertEqual(out["points"], [5])
-        self.assertEqual(out["traces"], ["v_v-sweep", "v_out"])
+        self.assertEqual(out["points"], 5)
+        self.assertEqual(out["x"], "v_v-sweep")
+        self.assertEqual(out["traces"], ["v_out"])
         self.assertFalse(out["truncated"])
         self.assertTrue(dest.exists())
         json.dumps(out)

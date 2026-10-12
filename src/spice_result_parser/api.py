@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import csv
+import errno
 import math
+import operator
 import os
 import warnings
 import zipfile
@@ -10,7 +12,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .reader import TraceSet, read_header, read_traces
+from .reader import TraceSet, read_header, read_traces, validate_range
 
 OUTPUTS = ("arrays", "csv", "npz", "summary", "png")
 
@@ -38,17 +40,19 @@ def decimation_indices(n: int, downsample: Optional[int]):
     return np.unique(np.linspace(0, n - 1, downsample).round().astype(np.intp))
 
 
-def validate_range(name: str, value) -> Optional[Tuple[float, float]]:
-    """Normalise an (lo, hi) pair to floats; None passes through."""
-    if value is None:
+def check_downsample(downsample) -> Optional[int]:
+    """downsample as an int of at least 2; None passes through."""
+    if downsample is None:
         return None
     try:
-        lo, hi = (float(v) for v in value)
-    except (TypeError, ValueError):
-        raise ValueError(f"{name} must be a pair of numbers (min, max), not {value!r}") from None
-    if lo > hi:
-        raise ValueError(f"{name} min must not exceed max: {value!r}")
-    return lo, hi
+        if isinstance(downsample, bool):
+            raise TypeError
+        downsample = operator.index(downsample)
+    except TypeError:
+        raise ValueError(f"downsample must be an integer, not {downsample!r}") from None
+    if downsample < 2:
+        raise ValueError("downsample must be at least 2")
+    return downsample
 
 
 def _decimate(ts: TraceSet, downsample: int) -> None:
@@ -81,13 +85,17 @@ def nan_stats(a: np.ndarray) -> Tuple[float, float, float]:
 
 
 def summarize(ts: TraceSet, downsample: Optional[int] = None) -> dict:
-    """JSON-serialisable statistics per trace and sweep; stats use the full trace, points are decimated.
+    """JSON-serialisable statistics per trace and sweep of ts; points are decimated.
 
+    The statistics cover every point in ts. A TraceSet already decimated (extract with
+    output="arrays" and downsample) gives statistics of the decimated points.
     min, max and mean skip NaN values; they are null only when a trace holds nothing else.
 
-    Points are emitted only when downsample is given, and never more than SUMMARY_MAX_POINTS
-    in total: the budget is shared evenly by the (trace, sweep) series (a summary is for
-    looking at, not for moving data). NaN and infinities are emitted as null.
+    Points are emitted only when downsample is given. The SUMMARY_MAX_POINTS budget is
+    shared evenly by the (trace, sweep) series, but each series keeps at least 2 points, so
+    the cap holds only up to SUMMARY_MAX_POINTS / 2 series. The statistics always grow with
+    the number of series: select a few names or sweeps on large files. NaN and infinities
+    are emitted as null.
     """
     h = ts.header
     x = ts.data[h.x_name]
@@ -124,6 +132,22 @@ def default_dest(path, output: str) -> str:
     """<root>_<ext>_traces.<output> beside the input, e.g. run_tr0_traces.csv."""
     root, ext = os.path.splitext(os.fspath(path))
     return f"{root}_{ext.lstrip('.')}_traces.{output}"
+
+
+def resolve_dest(source, output: str, dest=None) -> str:
+    """The path a csv/npz/png of `source` goes to; raises when it cannot be written safely:
+    a directory, a missing parent directory, or the input file itself."""
+    if not os.path.exists(source):                  # name the missing input, not its default dest
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), os.fspath(source))
+    dest = os.fspath(dest) if dest is not None else default_dest(source, output)
+    if os.path.isdir(dest):
+        raise ValueError(f"dest {dest!r} is a directory; give a file path")
+    parent = os.path.dirname(os.path.abspath(dest))
+    if not os.path.isdir(parent):
+        raise ValueError(f"dest {dest!r}: directory {parent!r} does not exist")
+    if os.path.exists(dest) and os.path.samefile(dest, source):
+        raise ValueError(f"dest {dest!r} is the input file; writing it would destroy the simulation result")
+    return dest
 
 
 CSV_ROWS_PER_SLICE = 65536      # rows stacked as float64 at a time; bounds writer memory
@@ -215,23 +239,23 @@ def make_figure(ts: TraceSet, yrange: Optional[Tuple[float, float]] = None, titl
     return fig
 
 
-def plot(ts: TraceSet, dest=None, yrange: Optional[Tuple[float, float]] = None,
-         title: Optional[str] = None) -> str:
-    """Write the traces as a PNG image; returns the path written. Needs matplotlib."""
-    dest = os.fspath(dest) if dest is not None else default_dest(ts.header.path, "png")
-    fig = make_figure(ts, validate_range("yrange", yrange), title)
-    fig.savefig(dest, format="png")
-    return dest
+def _write_png(ts: TraceSet, dest: str, yrange: Optional[Tuple[float, float]] = None,
+               title: Optional[str] = None) -> None:
+    make_figure(ts, validate_range("yrange", yrange, finite=True), title).savefig(dest, format="png")
 
 
-def write_file(ts: TraceSet, output: str, dest=None, yrange=None) -> str:
-    """Write a TraceSet as csv, npz or png; returns the path written. yrange applies to png only."""
+def write_file(ts: TraceSet, output: str, dest=None, yrange=None, title: Optional[str] = None) -> str:
+    """Write a TraceSet as csv, npz or png; returns the path written.
+
+    yrange and title apply to png only (png needs matplotlib). dest defaults to
+    <input>_<ext>_traces.<output> beside the input and must not be the input file.
+    """
     if output not in ("csv", "npz", "png"):
         raise ValueError(f"write_file supports 'csv', 'npz' or 'png', not {output!r}")
+    dest = resolve_dest(ts.header.path, output, dest)
     if output == "png":
-        return plot(ts, dest, yrange)
-    dest = os.fspath(dest) if dest is not None else default_dest(ts.header.path, output)
-    if output == "csv":
+        _write_png(ts, dest, yrange, title)
+    elif output == "csv":
         _write_csv(ts, dest)
     else:
         _write_npz(ts, dest)
@@ -247,18 +271,25 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
     xrange=(lo, hi) keeps only the rows whose x value (TIME, FREQ or the sweep
     variable) lies in the closed interval; the window is applied while the file streams,
     so peak memory follows the window rather than the column length, and it applies to
-    every output. yrange=(lo, hi)
-    sets the vertical axis limits of the png plot and is ignored by other outputs.
+    every output. yrange=(lo, hi) sets the vertical axis limits of the png plot; other
+    outputs do not use it, but a malformed yrange still raises.
+    downsample=N keeps N evenly spaced points per sweep (first and last kept; at least 2).
+    For "summary" it sets the x/y points emitted, and None emits statistics only.
+    dest names the csv/npz/png file (default <input>_<ext>_traces.<output> beside the
+    input); it must not be the input file, and other outputs reject it.
     plot selects one plot of a Nutmeg rawfile (0-based); see list_traces for the list.
     ac_format is what each complex (AC) variable becomes: "magphase" (_Mag, _Phase in
     degrees), "db" (_dB = 20 log10 |z|, _Phase) or "realimag" (_Re, _Im).
     """
     if output not in OUTPUTS:
         raise ValueError(f"output must be one of {OUTPUTS}, not {output!r}")
-    if downsample is not None and downsample < 2:
-        raise ValueError("downsample must be at least 2")
+    downsample = check_downsample(downsample)
     xrange = validate_range("xrange", xrange)
-    yrange = validate_range("yrange", yrange)
+    yrange = validate_range("yrange", yrange, finite=True)
+    if output in ("csv", "npz", "png"):
+        resolve_dest(path, output, dest)            # fail before the read, not after it
+    elif dest is not None:
+        raise ValueError(f"dest applies to csv, npz and png only, not to output={output!r}")
     if output == "png":
         _require_matplotlib()
     ts = read_traces(path, names, sweeps, plot, xrange, ac_format)

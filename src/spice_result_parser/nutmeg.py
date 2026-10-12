@@ -20,7 +20,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .reader import Header, TraceSet, _uniquify, ac_names, ac_part, parse_var_name, resolve_columns
+from .reader import (Header, TraceSet, _uniquify, ac_names, ac_part, check_sweeps, parse_var_name, plot_index,
+                     resolve_columns, sweep_set)
 
 _BOM = b"\xef\xbb\xbf"
 
@@ -246,7 +247,7 @@ def read_nutmeg_header(path, plot: int = 0, ac_format: str = "magphase") -> Head
     """Parse only the headers. Binary data sections are seeked over, never read."""
     path = os.fspath(path)
     with open(path, "rb") as f:
-        target, plot_names = _walk(f, path, int(plot))
+        target, plot_names = _walk(f, path, plot_index(plot))
     return _build_header(path, target, plot_names, ac_format)
 
 
@@ -451,37 +452,44 @@ def _read_ascii(f, path: str, p: _Plot, write: _Writer, limit: Optional[int]) ->
     return _scan_ascii(f, path, p, limit, write)
 
 
-def _kept_spans(counts: Sequence[int], per: int, nread: int, sweeps) -> Tuple[List[Tuple[int, int]], List[int]]:
-    """(start, stop) row spans of the kept sweeps in the buffers, and their original indices.
+def _kept_spans(counts: Sequence[int], per: int, nread: int,
+                wanted: Optional[set]) -> Tuple[List[Tuple[int, int]], List[int], int]:
+    """(start, stop) row spans of the kept sweeps in the buffers, their original indices,
+    and the number of sweeps the file reached.
 
     counts holds the rows each sweep contributed, in file order. A sweep the file never
     reached is dropped; one that was read but left nothing inside the x window stays, empty.
     """
-    wanted = None if sweeps is None else set(int(s) for s in sweeps)
     spans: List[Tuple[int, int]] = []
     indices: List[int] = []
     start = 0
+    reached = 0
     for i, count in enumerate(counts):
         if i and i * per >= nread:                  # sweeps beyond a truncated file
             break
+        reached += 1
         if wanted is None or i in wanted:
             spans.append((start, start + count))
             indices.append(i)
         start += count
-    return spans, indices
+    return spans, indices, reached
 
 
 def read_nutmeg_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
                        ac_format: str = "magphase") -> TraceSet:
     """Stream one plot of a rawfile, keeping only the requested columns, sweeps and x window.
 
-    xrange is None or a validated (lo, hi) pair; rows outside the closed interval are dropped
-    as the file streams, so memory follows the window rather than the plot's length.
+    xrange is None or a (lo, hi) pair validated by reader.validate_range; rows outside
+    the closed interval are dropped as the file streams, so memory follows the window
+    rather than the plot's length.
     ac_format is what each complex variable becomes (see reader.read_traces).
     """
     path = os.fspath(path)
+    wanted = sweep_set(sweeps)
     with open(path, "rb") as f:
-        target, plot_names = _walk(f, path, int(plot))
+        target, plot_names = _walk(f, path, plot_index(plot))
+        if target.count_known:                      # fail before the read; a short file is checked after it
+            check_sweeps(path, wanted, target.nsweeps, False)
         header = _build_header(path, target, plot_names, ac_format)
         cols = resolve_columns(header, names)
         specs = _column_specs(cols, target.is_complex)
@@ -508,7 +516,8 @@ def read_nutmeg_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None
             f"keeping the complete points",
             RuntimeWarning,
         )
-    spans, indices = _kept_spans(write.counts, per, nread, sweeps)
+    spans, indices, reached = _kept_spans(write.counts, per, nread, wanted)
+    check_sweeps(path, wanted, reached, truncated)
     # Hand out views into the buffers when nearly all of them is kept; otherwise copy the
     # spans out (a selective sweeps=, a truncated file) so the buffers are released.
     kept = sum(b - a for a, b in spans)

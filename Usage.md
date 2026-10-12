@@ -47,7 +47,8 @@ from spice_result_parser import list_traces, extract
 
 list_traces("run.tr0")
 # {'path': 'run.tr0', 'format': '2001', 'analysis': 'tr', 'x': 'TIME',
-#  'traces': ['v_out', 'v_in', 'i_vdd'], 'sweep_params': ['r1'], 'sweep_count_hint': 3}
+#  'traces': ['v_out', 'v_in', 'i_vdd'], 'sweep_params': ['r1'], 'sweep_count_hint': 3,
+#  'plot': 0, 'plots': []}
 # sweep_count_hint is 0 for a single-sweep file (it is the header's inner-sweep count).
 
 ts = extract("run.tr0", ["v(out)", "i_*"])        # names: sanitized, raw HSPICE, or glob
@@ -68,9 +69,19 @@ extract("run.tr0", ["v(out)", "v(in)"], xrange=(1e-9, 5e-9), yrange=(0, 1.2), ou
 #   -> 'run_tr0_traces.png': one line per trace per sweep, log x axis for AC files
 ```
 
-`sweeps=[0, 2]` keeps only those sweeps. `downsample=N` keeps `N` evenly spaced
-points per sweep (first and last always kept). If the simulator is still writing
-the file, the partial last sweep is returned and `ts.truncated` is `True`.
+`sweeps=[0, 2]` keeps only those sweeps (a bare `sweeps=1` is one index, `sweeps=[]`
+keeps none); an index the file does not hold raises `ValueError` naming the sweep
+count. `downsample=N` keeps `N` evenly spaced points per sweep (an integer, at least
+2; first and last always kept). If the simulator is still writing the file, the
+partial last sweep is returned and `ts.truncated` is `True`.
+
+`dest` names the csv/npz/png file. It is checked before the file is read: a directory,
+a missing parent directory or the input file itself raises `ValueError`, and so does
+a `dest` given with `output="arrays"` or `"summary"`. `summary` reports statistics of
+every point it is given; with `downsample=N` it adds `N` x/y points per (trace, sweep),
+at most 20000 in total while there are at most 10000 such series. Its size grows with
+traces x sweeps, so select a few on large files. Called on a TraceSet that `extract`
+already decimated, `summarize` reports statistics of the decimated points.
 
 `xrange` is applied while the file streams: rows outside the closed interval are
 never stored, so peak memory follows the window and not the column length. On the
@@ -122,11 +133,11 @@ ms.names                                      # ['index', 'vdd', 'tpd_rise', 'tp
 ms.params                                     # ['vdd']: kept by every selection, as is index
 ms.values["tpd_rise"]                         # float64 array, one value per row
 ms.failed                                     # {'tpd_fall': 2}: rows written as `failed`, now NaN
-ms.rows, ms.title
+ms.rows, ms.title                             # rows counts every complete row, kept columns or not
 ```
 
 A file that ends part-way through a row keeps its complete rows, with a
-`RuntimeWarning`. Passing a measure file to `read_traces` or `list_traces` raises a
+`RuntimeWarning` and `ms.truncated` set to `True`. Passing a measure file to `read_traces` or `list_traces` raises a
 `ValueError` that points to `read_measures`.
 
 
@@ -187,33 +198,45 @@ Tools: `list_traces(path, plot)`, `extract(path, names, sweeps, output, downsamp
 yrange, plot, ac_format)` and `read_measures(path, names, rows)`, on HSPICE result files and Nutmeg
 rawfiles alike (`plot` picks one plot of a rawfile; `extract`'s `ac_format` names AC traces as
 above, and `list_traces` lists them in the default `_Mag`/`_Phase` form).
-Over MCP `output` is `text` (default), `summary` (statistics and downsampled points as
-JSON with exact floats), `csv`, `npz` (write a file and return its path), or `png`
-(writes a plot and returns its path and pixel size); full arrays are never sent inline.
+Over MCP `output` is `text` (default), `summary` (statistics as JSON with exact floats,
+plus downsampled points when `downsample` is set), `csv`, `npz` (write a file), or `png`
+(write a plot); full arrays are never sent inline. A file output returns `output`, the
+absolute `path`, `x`, `traces`, `sweeps` (the count), `points` (the total), `truncated`,
+`sweep_indices` when `sweeps` was given, and for `png` the pixel `size`. The schema lists
+the valid `output` and `ac_format` values; `names` takes one string or a list.
 
 `text` is written for an agent to read: a header (`transient | x: time | 522 points
 (20 shown)`, plus `in k sweeps` and the plot name when there are several), for an AC
 plot a legend naming what the two columns of each complex trace hold (per `ac_format`),
 a `trace min max` table over every point (NaN values skipped), then one table per sweep with x once and one column per
 trace, `downsample` evenly spaced rows (first and last kept, at most 500 rows in
-total). Values are rounded to 6 significant digits; NaN and infinity print as `nan`/
-`inf`; a truncated file says so on its first line; a nested `.dc` sweep that ngspice
+total). Of more than 20 tables only the first 10 and the last 10 are shown, with one
+line counting the tables left out; when a row per (sweep, trace) would exceed 100, the
+min/max table holds one row per trace over all sweeps. Values are rounded to 6
+significant digits; NaN and infinity print as `nan`/`inf`; a truncated file says so on its first line; a nested `.dc` sweep that ngspice
 writes flat is split into one table per run of the inner variable. The same rendering
 is `spice_result_parser.mcp_server.format_text(ts, points=20)` for any `TraceSet`, and the
 module imports without the `mcp` package (only `srp-mcp` itself needs it). `xrange=[lo, hi]` restricts
 every output to the rows whose x value lies in that closed interval, and is applied
 while the file streams, so a narrow window on a huge file is cheap; `yrange=[lo, hi]`
-sets the plot's vertical axis limits and is ignored by the other outputs.
+sets the plot's vertical axis limits (finite numbers); the other outputs do not use it,
+but a malformed value is still an error. An AC plot draws every selected trace on one
+y axis, so plot the magnitude and the phase in separate calls.
 
-`downsample` is optional over MCP: left unset it defaults to 20 rows per sweep for
-`text`, 200 points per sweep for `summary`, and to no decimation at all for `csv` and
-`npz`, which keep every point. `dest` names the output file for `csv`/`npz`/`png`; it is not restricted to the
-input's directory, so the agent can write to any path the server process can
-reach. Leave it unset to write `<input>_<ext>_traces.<csv|npz|png>` beside the input.
+`downsample` is optional over MCP: left unset it defaults to 20 rows per table for
+`text`, to statistics only for `summary`, and to no decimation at all for `csv` and
+`npz`, which keep every point; a value below 2 is an error for every output. `dest`
+names the output file for `csv`/`npz`/`png` and is an error with `text` or `summary`;
+it is not restricted to the input's directory, so the agent can write to any path the
+server process can reach, but it never replaces the input file. A relative path resolves
+against the server's working directory. Leave it unset to write
+`<input>_<ext>_traces.<csv|npz|png>` beside the input. `list_traces` and `read_measures`
+are marked read-only for the client, and `extract` as one that can overwrite files.
 
-`read_measures` returns text for a measure file: `measures | 12 rows | params: vdd`,
+`read_measures` returns text for a measure file: a `TRUNCATED` line first when the file
+ends part-way through a row, then `measures | 12 rows | params: vdd`,
 a `failed:` line naming each measure that failed and in how many rows, then a table
 with one column per kept measure (failed values print as `failed`). `rows` (default
-20, at most 500) evenly spaced rows are shown; when rows are dropped a `min max mean`
+20, at least 2, at most 500) evenly spaced rows are shown; when rows are dropped a `min max mean`
 table over every row comes first. The same rendering is
 `spice_result_parser.mcp_server.format_measures(ms, rows=20)` for any `MeasureSet`.

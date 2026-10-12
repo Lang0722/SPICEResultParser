@@ -20,7 +20,7 @@ import os
 import re
 import warnings
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -36,9 +36,13 @@ class MeasureSet:
     names: List[str]                # kept columns in file order
     values: Dict[str, np.ndarray]   # name -> float64, one value per row; NaN where the measure failed
     failed: Dict[str, int]          # kept measure -> rows in which it failed (failing measures only)
+    nrows: Optional[int] = None     # complete rows in the file, also when no column is kept
+    truncated: bool = False         # the file ends part-way through a row
 
     @property
     def rows(self) -> int:
+        if self.nrows is not None:
+            return self.nrows
         return int(self.values[self.names[0]].size) if self.names else 0
 
 
@@ -72,7 +76,7 @@ def read_measures(path, names=None) -> MeasureSet:
     names: None for every column, else measure names or fnmatch globs (tp*). The `index`
     column and the swept parameters are always kept, so each row stays identifiable.
     A value written as `failed` becomes NaN and is counted in `failed`. A file that ends
-    part-way through a row keeps its complete rows, with a RuntimeWarning.
+    part-way through a row keeps its complete rows, with a RuntimeWarning and `truncated` True.
     """
     path = os.fspath(path)
     with open(path, "rb") as f:
@@ -112,4 +116,5 @@ def read_measures(path, names=None) -> MeasureSet:
         count = int(failed_mask[:, col].sum())
         if count:
             failed[name] = count
-    return MeasureSet(path=path, title=title, params=params, names=kept, values=values, failed=failed)
+    return MeasureSet(path=path, title=title, params=params, names=kept, values=values, failed=failed,
+                      nrows=nrows, truncated=bool(len(value_tokens) % ncols))

@@ -11,6 +11,7 @@ import tracemalloc
 import unittest
 import warnings
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -1465,12 +1466,123 @@ class TestXrangeWhileReading(unittest.TestCase):
         self.assertLess(peaks[1], 0.25 * peaks[0], f"windowed {peaks[1]} vs full {peaks[0]} bytes")
 
 
+class TestArgumentChecks(unittest.TestCase):
+    """Arguments the reader and the API reject, with an error that names the problem."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.path, _ = make_multi(self.dir, "2001")             # 3 sweeps
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_sweep_index_out_of_range(self):
+        with self.assertRaisesRegex(ValueError, r"sweep index 3 out of range; the file holds 3 sweeps \(0 to 2\)"):
+            read_traces(self.path, ["v_a"], sweeps=[0, 3])
+        with self.assertRaisesRegex(ValueError, "sweep index -1 out of range"):
+            api.extract(self.path, ["v_a"], sweeps=[-1], output="csv", dest=self.dir / "o.csv")
+        self.assertFalse((self.dir / "o.csv").exists())
+
+    def test_sweep_index_of_a_truncated_file(self):
+        path, _ = make_multi(self.dir, "2001", final_sentinel=False, drop_tail=3)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            with self.assertRaisesRegex(ValueError, r"sweep index 5 out of range.*\(the file is truncated\)"):
+                read_traces(path, sweeps=[5])
+
+    def test_sweeps_forms(self):
+        self.assertEqual(read_traces(self.path, ["v_a"], sweeps=1).sweep_indices, [1])   # a bare int
+        self.assertEqual(read_traces(self.path, ["v_a"], sweeps=[]).sweep_indices, [])   # none kept
+        for bad in ([1.5], True, [True]):
+            with self.assertRaisesRegex(ValueError, "integer sweep indices"):
+                read_traces(self.path, ["v_a"], sweeps=bad)
+
+    def test_read_traces_validates_xrange(self):
+        for bad in ((5, 1), (0, 1, 2), "12", (float("nan"), 1)):
+            with self.assertRaisesRegex(ValueError, "xrange"):
+                read_traces(self.path, ["v_a"], xrange=bad)
+        ts = read_traces(self.path, ["v_a"], xrange=(float("-inf"), float("inf")))   # an open bound
+        self.assertEqual(sum(a.size for a in ts.data["v_a"]), 1500 + 977 + 2310)
+
+    def test_yrange_must_be_finite(self):
+        with self.assertRaisesRegex(ValueError, "yrange must hold finite numbers"):
+            api.extract(self.path, ["v_a"], yrange=(0, float("inf")))
+
+    def test_downsample_must_be_an_integer_of_at_least_2(self):
+        for bad in (2.5, True, "5"):
+            with self.assertRaisesRegex(ValueError, "downsample must be an integer"):
+                api.extract(self.path, ["v_a"], downsample=bad)
+        with self.assertRaisesRegex(ValueError, "at least 2"):
+            api.extract(self.path, ["v_a"], downsample=1)
+        self.assertEqual(api.extract(self.path, ["v_a"], downsample=np.int64(5)).data["v_a"][0].size, 5)
+
+    def test_not_a_result_file(self):
+        for name, content in (("text.tr0", b"hello world\nfoo\n"), ("bin.tr0", b"\x00abcd" * 64)):
+            path = self.dir / name
+            path.write_bytes(content)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)      # the garbage block is short
+                with self.assertRaisesRegex(ValueError, "not an HSPICE result file .* or a Nutmeg rawfile"):
+                    read_header(path)
+
+
+class TestDestChecks(unittest.TestCase):
+    """dest is checked before the read, and never replaces the input."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.path = self.dir / "run.tr0"
+        shutil.copy(HERE / "test_9601.tr0", self.path)
+        self.original = self.path.read_bytes()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_dest_equal_to_the_input_is_refused(self):
+        for output in ("csv", "npz", "png"):
+            with self.assertRaisesRegex(ValueError, "is the input file"):
+                api.extract(self.path, ["v_vo"], output=output, dest=self.path)
+        ts = read_traces(self.path, ["v_vo"])
+        with self.assertRaisesRegex(ValueError, "is the input file"):
+            api.write_file(ts, "csv", str(self.dir / "." / "run.tr0"))
+        self.assertEqual(self.path.read_bytes(), self.original)
+
+    def test_unwritable_dest_fails_before_the_read(self):
+        with self.assertRaisesRegex(FileNotFoundError, "missing.tr0"):
+            api.extract(self.dir / "nodir" / "missing.tr0", output="csv")   # not its default dest
+        with mock.patch.object(api, "read_traces") as read:
+            with self.assertRaisesRegex(ValueError, "is a directory"):
+                api.extract(self.path, output="csv", dest=self.dir)
+            with self.assertRaisesRegex(ValueError, "does not exist"):
+                api.extract(self.path, output="csv", dest=self.dir / "nope" / "o.csv")
+        read.assert_not_called()
+
+    def test_dest_without_a_file_output_is_refused(self):
+        for output in ("arrays", "summary"):
+            with self.assertRaisesRegex(ValueError, "dest applies to csv, npz and png only"):
+                api.extract(self.path, output=output, dest=self.dir / "o.csv")
+
+    def test_write_file_passes_title_to_the_png(self):
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest("matplotlib not installed")
+        with mock.patch.object(api, "make_figure", wraps=api.make_figure) as figure:
+            dest = api.write_file(read_traces(self.path, ["v_vo"]), "png", self.dir / "t.png", title="run 7")
+        self.assertEqual(figure.call_args.args[2], "run 7")
+        self.assertTrue(Path(dest).exists())
+
+
 class TestPackage(unittest.TestCase):
     def test_exports(self):
         import spice_result_parser as hp
 
-        for name in ["Header", "TraceSet", "read_header", "read_traces",
-                     "list_traces", "extract", "write_file", "summarize"]:
+        exported = {"Header", "TraceSet", "read_header", "read_traces", "list_traces", "extract",
+                    "write_file", "summarize", "MeasureSet", "read_measures"}
+        self.assertEqual(set(hp.__all__), exported)
+        for name in exported:
             self.assertTrue(hasattr(hp, name), name)
 
     def test_old_converter_is_gone(self):
@@ -1493,6 +1605,16 @@ class TestPackage(unittest.TestCase):
                               "import spice_result_parser, spice_result_parser.mcp_server"],
                              check=True, cwd=str(src), capture_output=True, text=True)
         self.assertEqual(out.stdout, "")
+
+    def test_module_runs_the_server(self):
+        # `python -m spice_result_parser.mcp_server` must start the server, not exit silently.
+        import subprocess
+
+        code = ("import runpy, sys; sys.modules['mcp'] = None\n"
+                "runpy.run_module('spice_result_parser.mcp_server', run_name='__main__')")
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("spice_result_parser[mcp]", out.stderr)
 
     def test_pixi_test_task_runs_every_suite(self):
         text = (HERE.parent / "pixi.toml").read_text()
@@ -1538,7 +1660,7 @@ class TestMcp(unittest.TestCase):
             path, _, _ = make_ac(tmp)
             out = self.m.list_traces(str(path))
             self.assertEqual(out["traces"][:2], ["v_a_Mag", "v_a_Phase"])
-            params = {t.name: set(t.input_schema["properties"])
+            params = {t.name: set(self.schema(t)["properties"])
                       for t in asyncio.run(self.m.server.list_tools())}
             self.assertEqual(params["list_traces"], {"path", "plot"})   # extract alone takes ac_format
             self.assertIn("ac_format", params["extract"])
@@ -1549,9 +1671,13 @@ class TestMcp(unittest.TestCase):
     def tools(self):
         return {t.name: t for t in asyncio.run(self.m.server.list_tools())}
 
+    @staticmethod
+    def schema(tool):
+        return getattr(tool, "inputSchema", None) or tool.input_schema     # mcp 1.x / 2.x
+
     def test_every_parameter_is_described_in_the_schema(self):
         for name, tool in self.tools().items():
-            for param, spec in tool.input_schema["properties"].items():
+            for param, spec in self.schema(tool)["properties"].items():
                 self.assertTrue(spec.get("description"), f"{name}.{param} has no description")
 
     def test_descriptions_are_short_and_start_with_usage(self):
@@ -1568,7 +1694,7 @@ class TestMcp(unittest.TestCase):
             self.assertRegex(text, rf"\b{field}\b", field)
 
     def test_plot_on_hspice_is_documented_as_an_error(self):
-        props = self.tools()["extract"].input_schema["properties"]
+        props = self.schema(self.tools()["extract"])["properties"]
         self.assertNotIn("Ignored for HSPICE", props["plot"]["description"])
         with self.assertRaisesRegex(self.m.ToolError, "Nutmeg rawfiles only"):
             self.m.extract(str(HERE / "test_9601.tr0"), plot=1)
@@ -1602,10 +1728,11 @@ class TestMcp(unittest.TestCase):
         dest = self.dir / "o.csv"
         out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="csv", dest=str(dest))
         self.assertEqual(out["path"], str(dest))
-        self.assertEqual(out["traces"], ["TIME", "v_vo"])
+        self.assertEqual(out["x"], "TIME")
+        self.assertEqual(out["traces"], ["v_vo"])
         self.assertEqual(out["sweeps"], 1)
-        self.assertEqual(out["points"], [2605])
-        self.assertEqual(out["sweep_indices"], [0])
+        self.assertEqual(out["points"], 2605)
+        self.assertNotIn("sweep_indices", out)            # only when sweeps= was given
         self.assertFalse(out["truncated"])
         self.assertTrue(dest.exists())
         json.dumps(out)
@@ -1624,7 +1751,7 @@ class TestMcp(unittest.TestCase):
                              xrange=[lo, hi], yrange=[-2.0, 2.0])
         self.assertEqual(out["output"], "png")
         self.assertEqual(out["path"], str(dest))
-        self.assertEqual(out["points"], [int(((x >= lo) & (x <= hi)).sum())])   # 802: a repeated time point
+        self.assertEqual(out["points"], int(((x >= lo) & (x <= hi)).sum()))   # 802: a repeated time point
         self.assertEqual(len(out["size"]), 2)
         self.assertTrue(all(isinstance(v, int) and v > 0 for v in out["size"]))
         self.assertTrue(dest.exists())
@@ -1636,8 +1763,73 @@ class TestMcp(unittest.TestCase):
         x = ref.data["TIME"][0]
         out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="csv", dest=str(dest),
                              xrange=[float(x[10]), float(x[19])])
-        self.assertEqual(out["points"], [10])
+        self.assertEqual(out["points"], 10)
         self.assertEqual(len(dest.read_text().splitlines()), 11)
+
+    def test_summary_defaults_to_statistics_only(self):
+        out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="summary")
+        entry = out["traces"]["v_vo"][0]
+        self.assertEqual(entry["count"], 2605)
+        self.assertNotIn("x", entry)
+
+    def test_downsample_below_2_is_an_error_for_every_output(self):
+        for output in ("text", "summary", "csv"):
+            with self.assertRaisesRegex(self.m.ToolError, "at least 2"):
+                self.m.extract(str(HERE / "test_9601.tr0"), output=output, downsample=1,
+                               dest=str(self.dir / "o.csv") if output == "csv" else None)
+
+    def test_dest_with_text_is_an_error(self):
+        with self.assertRaisesRegex(self.m.ToolError, "dest applies to csv, npz and png only"):
+            self.m.extract(str(HERE / "test_9601.tr0"), dest=str(self.dir / "o.csv"))
+
+    def test_dest_equal_to_the_input_is_an_error(self):
+        path = self.dir / "run.tr0"
+        shutil.copy(HERE / "test_9601.tr0", path)
+        with self.assertRaisesRegex(self.m.ToolError, "is the input file"):
+            self.m.extract(str(path), output="csv", dest=str(path))
+        self.assertEqual(path.read_bytes(), (HERE / "test_9601.tr0").read_bytes())
+
+    def test_relative_dest_is_returned_absolute(self):
+        import os
+
+        cwd = os.getcwd()
+        os.chdir(self.dir)
+        try:
+            out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="csv", dest="rel.csv", sweeps=[0])
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(out["path"], str((self.dir / "rel.csv").resolve()))
+        self.assertEqual(out["sweep_indices"], [0])
+
+    def test_sweep_out_of_range_reaches_the_client(self):
+        with self.assertRaisesRegex(self.m.ToolError, "sweep index 99 out of range"):
+            self.m.extract(str(HERE / "test_9601.tr0"), sweeps=[99])
+
+    def test_schema_enums_and_string_names(self):
+        props = self.schema(self.tools()["extract"])["properties"]
+        self.assertEqual(props["output"]["enum"], ["text", "summary", "csv", "npz", "png"])
+        self.assertEqual(props["ac_format"]["enum"], ["magphase", "db", "realimag"])
+        result = asyncio.run(self.m.server.call_tool("extract", {"path": str(HERE / "test_9601.tr0"),
+                                                                  "names": "v(vo"}))
+        content = getattr(result, "content", None) or (result[0] if isinstance(result, tuple) else result)
+        self.assertIn("v_vo", content[0].text)
+
+    def test_tool_annotations(self):
+        if self.m.ToolAnnotations is None:
+            self.skipTest("mcp before 1.7 has no tool annotations")
+        tools = self.tools()
+        for name in ("list_traces", "read_measures"):
+            self.assertTrue(tools[name].annotations.read_only_hint
+                            if hasattr(tools[name].annotations, "read_only_hint")
+                            else tools[name].annotations.readOnlyHint, name)
+        hints = tools["extract"].annotations
+        self.assertTrue(getattr(hints, "destructive_hint", None) or getattr(hints, "destructiveHint", None))
+
+    def test_read_measures_returns_text_only(self):
+        tool = self.tools()["read_measures"]
+        self.assertIsNone(getattr(tool, "output_schema", None) or getattr(tool, "outputSchema", None))
+        with self.assertRaisesRegex(self.m.ToolError, "rows must be at least 2"):
+            self.m.read_measures(str(HERE / "test.mt0"), rows=1)
 
     def test_bad_range_rejected_before_reading(self):
         with self.assertRaisesRegex(self.m.ToolError, "xrange"):
@@ -1648,7 +1840,7 @@ class TestMcp(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "available traces"):
             asyncio.run(self.m.server.call_tool("extract", {"path": str(HERE / "test_9601.tr0"),
                                                              "names": ["nope"], "output": "csv"}))
-        with self.assertRaisesRegex(Exception, "must be one of"):
+        with self.assertRaisesRegex(Exception, "Input should be 'text'"):    # the schema's enum
             asyncio.run(self.m.server.call_tool("extract", {"path": str(HERE / "test_9601.tr0"),
                                                              "output": "xlsx"}))
 

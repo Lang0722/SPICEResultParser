@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import fnmatch
+import math
+import operator
 import os
 import struct
 import warnings
@@ -99,6 +101,52 @@ def ac_part(re: np.ndarray, im: np.ndarray, ac_format: str, second: bool) -> np.
         with np.errstate(divide="ignore"):         # |H| = 0 is -inf dB
             return 20 * np.log10(mag)
     return mag
+
+
+def validate_range(name: str, value, finite: bool = False) -> Optional[Tuple[float, float]]:
+    """Normalise an (lo, hi) pair to floats; None passes through. NaN is never a bound;
+    finite=True also rejects infinities (plot limits need them finite)."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (str, bytes)):
+            raise TypeError
+        lo, hi = (float(v) for v in value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a pair of numbers (min, max), not {value!r}") from None
+    if math.isnan(lo) or math.isnan(hi) or (finite and not (math.isfinite(lo) and math.isfinite(hi))):
+        raise ValueError(f"{name} must hold {'finite ' if finite else ''}numbers, not {value!r}")
+    if lo > hi:
+        raise ValueError(f"{name} min must not exceed max: {value!r}")
+    return lo, hi
+
+
+def sweep_set(sweeps) -> Optional[set]:
+    """The requested sweep indices as a set; None keeps every sweep. A bare int is one index."""
+    if sweeps is None:
+        return None
+    try:
+        if isinstance(sweeps, (int, np.integer)):
+            sweeps = [sweeps]
+        if any(isinstance(s, (bool, np.bool_)) for s in sweeps):
+            raise TypeError
+        return {operator.index(s) for s in sweeps}
+    except TypeError:
+        raise ValueError(f"sweeps must be a list of integer sweep indices, not {sweeps!r}") from None
+
+
+def check_sweeps(path: str, wanted: Optional[set], found: int, truncated: bool) -> None:
+    """Raise for requested sweep indices the file does not hold (found sweeps: 0 .. found-1)."""
+    missing = sorted(s for s in wanted or () if not 0 <= s < found)
+    if missing:
+        held = f"0 to {found - 1}" if found else "none"
+        note = " (the file is truncated)" if truncated else ""
+        raise ValueError(f"{path}: sweep index {', '.join(map(str, missing))} out of range; "
+                         f"the file holds {found} sweep{'' if found == 1 else 's'} ({held}){note}")
+
+
+def _not_a_result_file(path: str) -> ValueError:
+    return ValueError(f"{path}: not an HSPICE result file (.tr#/.sw#/.ac#) or a Nutmeg rawfile")
 
 
 def _analysis_from_extension(path: str) -> Optional[str]:
@@ -205,7 +253,10 @@ def _read_binary_header(f, path: str, ac_format: str = "magphase") -> Header:
     if payload is None:
         raise ValueError(f"{path}: empty file")
     text = payload.decode("utf-8", errors="replace")
-    nauto, nprobe, nsweepparam = int(text[0:4]), int(text[4:8]), int(text[8:12])
+    try:
+        nauto, nprobe, nsweepparam = int(text[0:4]), int(text[4:8]), int(text[8:12])
+    except ValueError:
+        raise _not_a_result_file(path) from None
     version = text[20:24].strip() or text[16:20].strip()
     if version not in ("9601", "2001"):
         raise ValueError(f"{path}: unsupported post_version {version!r}; only 9601 and 2001 are supported")
@@ -232,10 +283,12 @@ def _read_ascii_header(f, path: str, ac_format: str = "magphase") -> Header:
         raise ValueError(f"{path}: empty file")
     if first.startswith("$DATA1"):
         raise ValueError(f"{path}: this is an HSPICE measure file (.mt/.ms/.ma); read it with read_measures")
-    nauto, nprobe, nsweepparam = int(first[0:4]), int(first[4:8]), int(first[8:12])
-    readline()                                    # copyright line
-    third = readline()
-    sweep_count = int(third.split()[-1])
+    try:
+        nauto, nprobe, nsweepparam = int(first[0:4]), int(first[4:8]), int(first[8:12])
+        readline()                                # copyright line
+        sweep_count = int(readline().split()[-1])
+    except (ValueError, IndexError):
+        raise _not_a_result_file(path) from None
     text = readline()
     while _TERMINATOR not in text:
         more = readline()
@@ -321,8 +374,18 @@ def _iter_ascii_values(f, path: str) -> Iterator[np.ndarray]:
                 yield from _ascii_fields(flat, n, width, path)
 
 
+def plot_index(plot) -> int:
+    """plot as an int; a float such as 1.5 is an error, not plot 1."""
+    try:
+        if isinstance(plot, (bool, np.bool_)):
+            raise TypeError
+        return operator.index(plot)
+    except TypeError:
+        raise ValueError(f"plot must be an integer plot index, not {plot!r}") from None
+
+
 def _reject_plot(path: str, plot: int) -> None:
-    if int(plot):
+    if plot_index(plot):
         raise ValueError(f"{path}: plot={plot} applies to Nutmeg rawfiles only; an HSPICE file holds one plot")
 
 
@@ -435,7 +498,7 @@ class _Collector:
         self.sentinel = header.sentinel
         self.cols = list(cols)
         self.xrange = xrange                    # closed x window; rows outside are never stored
-        self.sweeps = None if sweeps is None else set(int(s) for s in sweeps)
+        self.sweeps = sweep_set(sweeps)
         self.capacity = max(1, int(capacity))
         self.buf = {c: np.empty(self.capacity, header.dtype) for c in self.cols}
         self.fill = 0                           # kept points written so far, across all kept sweeps
@@ -625,7 +688,7 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
     names: None for all, else a list of trace names (see resolve_columns). Column 0 is always kept.
     sweeps: None for all, else sweep indices to keep.
     plot: which plot of a Nutmeg rawfile to read (0-based); HSPICE files hold a single plot.
-    xrange: None, or a validated (lo, hi) pair. Rows whose x value falls outside the closed
+    xrange: None, or an (lo, hi) pair. Rows whose x value falls outside the closed
             interval are dropped as the file streams, so memory follows the window, not the
             column length. A sweep with no rows inside is kept, with empty arrays.
     ac_format: what each complex (AC) variable becomes: "magphase" (_Mag, _Phase in
@@ -636,6 +699,7 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
 
     path = os.fspath(path)
     check_ac_format(ac_format)
+    xrange = validate_range("xrange", xrange)
     if nutmeg.is_nutmeg(path):
         return nutmeg.read_nutmeg_traces(path, names, sweeps, plot, xrange, ac_format)
     _reject_plot(path, plot)
@@ -671,6 +735,7 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
             for values in _iter_ascii_values(f, path):
                 collector.feed(values)
     truncated = collector.finish()
+    check_sweeps(path, collector.sweeps, collector.sweep_idx, truncated)
     data = _convert_ac(header, cols, collector.data)
     return TraceSet(
         header=header,

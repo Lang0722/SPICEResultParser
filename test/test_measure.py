@@ -79,7 +79,17 @@ class TestSweptFile(unittest.TestCase):
             warnings.simplefilter("always")
             ms = read_measures(self.path)
         self.assertEqual(ms.rows, 3)
+        self.assertTrue(ms.truncated)
         self.assertTrue(any("incomplete" in str(w.message) for w in caught))
+
+    def test_rows_without_kept_columns(self):
+        self.assertEqual(read_measures(HERE / "test.mt0", []).rows, 1)    # no index, no params
+        self.assertFalse(read_measures(self.path).truncated)
+
+    def test_rows_of_a_measure_set_built_by_hand(self):
+        ms = measure.MeasureSet(path="x", title="", params=[], names=["a"], values={"a": np.arange(3.0)},
+                                failed={})
+        self.assertEqual(ms.rows, 3)
 
     def test_non_numeric_value_raises(self):
         self.path.write_text(SWEPT.replace("1.845e-11", "garbage"))
@@ -127,6 +137,14 @@ class TestFormatMeasures(unittest.TestCase):
         lines = self.m.format_measures(read_measures(self.path), rows=2).splitlines()
         self.assertEqual(lines[0], "measures | 3 rows (2 shown) | params: vdd")
         self.assertEqual([l.split()[0] for l in lines[-2:]], ["1", "3"])
+
+    def test_truncated_file_says_so_first(self):
+        self.path.write_text(SWEPT + " 4.0000           1.2000\n")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            lines = self.m.format_measures(read_measures(self.path)).splitlines()
+        self.assertEqual(lines[0], self.m.MEASURE_TRUNCATED_LINE)
+        self.assertEqual(lines[1], "measures | 3 rows | params: vdd")
 
     def test_single_row_without_params(self):
         lines = self.m.format_measures(read_measures(HERE / "test.mt0")).splitlines()
