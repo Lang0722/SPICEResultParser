@@ -1,4 +1,5 @@
 """Tests for the HSPICE measure-file reader (.mt#, .ms#, .ma#)."""
+import os
 import sys
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ import numpy as np
 
 HERE = Path(__file__).parent.resolve()
 sys.path.insert(0, str(HERE))
+os.environ.pop("SRP_ENGINE", None)      # these tests are of the Python engine, also when SRP_ENGINE is set
 
 from spice_result_parser import measure  # noqa: E402
 from spice_result_parser.measure import read_measures  # noqa: E402

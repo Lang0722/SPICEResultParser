@@ -5,9 +5,13 @@ HSPICE layout follows hSpice_output.md and the sample files in test/: each block
 nutmeg_output.md.
 """
 import math
+import os
 import struct
 
 import numpy as np
+
+# test_reader.py and test_nutmeg.py test the Python engine, also when SRP_ENGINE is set.
+os.environ.pop("SRP_ENGINE", None)
 
 _ENDIAN_HEAD = b"\x04\x00\x00\x00\x31\x00\x00\x00\x04\x00\x00\x00"
 _COPYRIGHT = " fixture.sp   01/01/2026   00:00:00 Copyright (c) 2026 Fixture. All Rights Reserved. "

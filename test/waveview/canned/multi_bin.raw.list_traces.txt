@@ -1,0 +1,5 @@
+srp_listing	1
+title	AC Analysis
+xname	voltage
+signal	v(out)	complex
+srp_done

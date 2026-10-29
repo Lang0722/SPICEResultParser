@@ -1,0 +1,8 @@
+srp_listing	1
+title	* rccircuit.sp
+xname	HERTZ
+signal	v(0)	complex
+signal	v(vo)	complex
+signal	v(vs)	complex
+signal	i(vs)	complex
+srp_done

@@ -1,0 +1,8 @@
+srp_listing	1
+title	* named probes of other kinds
+xname	TIME
+signal	power(pw)	real
+signal	lx(gmx)	real
+signal	i1(idm)	real
+signal	v(vdiff)	real
+srp_done

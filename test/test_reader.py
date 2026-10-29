@@ -1681,7 +1681,7 @@ class TestMcp(unittest.TestCase):
             self.assertEqual(out["traces"][:2], ["v_a_Mag", "v_a_Phase"])
             params = {t.name: set(self.schema(t)["properties"])
                       for t in asyncio.run(self.m.server.list_tools())}
-            self.assertEqual(params["list_traces"], {"path", "plot"})   # extract alone takes ac_format
+            self.assertEqual(params["list_traces"], {"path", "plot", "engine"})   # extract alone takes ac_format
             self.assertIn("ac_format", params["extract"])
             text = self.m.extract(str(path), ["v(a"], ac_format="realimag")
             self.assertIn(self.m.AC_LEGEND["realimag"], text)
@@ -1865,7 +1865,7 @@ class TestMcp(unittest.TestCase):
 
     def test_unexpected_errors_carry_their_type(self):
         original = self.m.api.list_traces
-        def boom(path, plot=0, ac_format="magphase"):
+        def boom(path, plot=0, ac_format="magphase", engine=None):
             raise KeyError("boom")
         self.m.api.list_traces = boom
         self.addCleanup(setattr, self.m.api, "list_traces", original)

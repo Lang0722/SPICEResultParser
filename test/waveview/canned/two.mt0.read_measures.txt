@@ -1,0 +1,27 @@
+srp_measures	1
+title	* two param sweep with subckt
+column	index
+1.0
+2.0
+3.0
+column	rval
+1000.0
+2000.0
+2000.0
+column	cval
+1.0000000000000001e-009
+1.0000000000000001e-009
+2.0000000000000001e-009
+column	tdel
+1.4049999999999999e-006
+2.7839999999999995e-006
+4.1749999999999998e-006
+column	never
+1.#QNAN
+1.#QNAN
+1.#QNAN
+column	temper
+25.0
+25.0
+25.0
+srp_done

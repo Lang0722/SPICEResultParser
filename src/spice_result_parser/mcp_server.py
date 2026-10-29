@@ -42,7 +42,7 @@ try:
 except ImportError:
     ToolAnnotations = None
 
-from . import api, measure
+from . import api, measure, waveview
 from .reader import AC_FORMATS
 
 server = FastMCP("spice-result-parser") if FastMCP is not None else None
@@ -199,6 +199,8 @@ def format_text(ts, points: int = 20) -> str:
         head += f" ({shown} shown)"
     if len(h.plot_names) > 1:
         head += f" | plot {h.plot}: {h.plot_names[h.plot]} (file has {len(h.plot_names)} plots)"
+    if h.version == "waveview":
+        head += " | engine: waveview"
     lines = [TRUNCATED_LINE] if ts.truncated else []
     lines.append(head)
     if h.analysis == "ac":
@@ -221,12 +223,13 @@ def format_text(ts, points: int = 20) -> str:
     return "\n".join(lines)
 
 
-def format_measures(ms, rows: int = 20) -> str:
+def format_measures(ms, rows: int = 20, engine: str = "python") -> str:
     """Agent-readable text for a MeasureSet: a header, which measures failed, then one row
     per measurement with every kept column. Failed values print as `failed`.
 
     `rows` rows are shown (evenly spaced, first and last kept, at most TEXT_MAX_ROWS);
-    when rows were dropped a min/max/mean table over every row comes first.
+    when rows were dropped a min/max/mean table over every row comes first. The header
+    names the engine when it is "waveview".
     """
     n = ms.rows
     idx = api.decimation_indices(n, max(2, min(rows, TEXT_MAX_ROWS)))
@@ -236,6 +239,8 @@ def format_measures(ms, rows: int = 20) -> str:
         head += f" ({shown} shown)"
     if ms.params:
         head += " | params: " + ", ".join(ms.params)
+    if engine == "waveview":
+        head += " | engine: waveview"
     lines = [MEASURE_TRUNCATED_LINE] if ms.truncated else []
     lines.append(head)
     if ms.failed:
@@ -252,6 +257,16 @@ def format_measures(ms, rows: int = 20) -> str:
     return "\n".join(lines)
 
 
+ENGINE_FIELD = Field(
+    description="Reader: \"python\" (this package's parser) or \"waveview\" (Synopsys WaveView "
+                "in batch mode; needs wv, see SRP_WAVEVIEW). Use \"waveview\" when the Python "
+                "reader fails on a file (HSPICE post_version 2013, for example) or to check a "
+                "result. \"waveview\" reads only plot 0 of a Nutmeg rawfile (plots then holds one "
+                "name), reads every point before it applies xrange, and reports format "
+                "\"waveview\". None: the SRP_ENGINE environment variable, else \"python\".")
+Engine = Optional[Literal[waveview.ENGINES]]
+
+
 @_tool(read_only=True)
 @_tool_errors
 def list_traces(
@@ -261,24 +276,27 @@ def list_traces(
                                            "server's working directory.")],
     plot: Annotated[int, Field(description="Nutmeg only: which plot of the rawfile to describe, "
                                            "0-based (see \"plots\"). Must be 0 for HSPICE files.")] = 0,
+    engine: Annotated[Engine, ENGINE_FIELD] = None,
 ) -> dict:
     """List the traces in a simulation result file. Call this first: it reads only the
     header, so it is cheap on any file size, and gives the names to pass to extract.
 
     Result fields:
-    - path, format ("9601", "2001", "ascii" or "nutmeg")
+    - path, format ("9601", "2001", "ascii", "nutmeg" or "waveview")
     - analysis: "tr" transient, "sw" dc sweep, "ac"; Nutmeg adds "op", "noise", "other"
     - x: the x variable (TIME, HERTZ, the swept source), always returned by extract
     - traces: every other trace name
     - sweep_params: names of the swept parameters (HSPICE; [] for Nutmeg)
     - sweep_count_hint: number of sweeps the header announces; 0 means a single sweep
     - plot, plots: the plot described and the names of all plots (Nutmeg; HSPICE: 0, [])
+    - engine: the reader used
 
     AC traces are listed as <name>_Mag and <name>_Phase. extract's ac_format renames
     them; select them there by raw name (v(out)), which works in every format. For a
     measure file (.mt#, .ms#, .ma#) use read_measures instead.
     """
-    return api.list_traces(path, plot)
+    engine = waveview.resolve_engine(engine)
+    return {**api.list_traces(path, plot, engine=engine), "engine": engine}
 
 
 MCP_OUTPUTS = ("text", "summary", "csv", "npz", "png")
@@ -321,6 +339,7 @@ def extract(
         description="What each complex (AC) trace becomes: \"magphase\" (default; _Mag linear, "
                     "_Phase degrees), \"db\" (_dB = 20*log10 magnitude, _Phase) or "
                     "\"realimag\" (_Re, _Im). Files without complex data do not use it.")] = "magphase",
+    engine: Annotated[Engine, ENGINE_FIELD] = None,
 ):
     """Read selected traces from an HSPICE result file or a Nutmeg rawfile. Call
     list_traces first for the names. Start with output="text" to look at the data, then
@@ -337,8 +356,9 @@ def extract(
     null. It grows with traces x sweeps: select a few.
 
     csv, npz, png: the file is written, and the result holds output, path (absolute),
-    x, traces, sweeps (count), points (total), truncated, sweep_indices when sweeps was
-    given, and for png size [w, h]. For AC, plot the magnitude and the phase separately.
+    x, traces, sweeps (count), points (total), truncated, engine, sweep_indices when
+    sweeps was given, and for png size [w, h]. For AC, plot the magnitude and the phase
+    separately.
     """
     if output == "arrays":
         raise ValueError(f"output='arrays' is not available over MCP; use one of {MCP_OUTPUTS}")
@@ -347,25 +367,27 @@ def extract(
     downsample = api.check_downsample(downsample)
     xrange = api.validate_range("xrange", xrange)
     yrange = api.validate_range("yrange", yrange, finite=True)
+    engine = waveview.resolve_engine(engine)
     if output == "text":
         if dest is not None:
             raise ValueError("dest applies to csv, npz and png only, not to output='text'")
-        ts = api.extract(path, names, sweeps, "arrays", xrange=xrange, plot=plot, ac_format=ac_format)
+        ts = api.extract(path, names, sweeps, "arrays", xrange=xrange, plot=plot, ac_format=ac_format,
+                         engine=engine)
         return format_text(ts, 20 if downsample is None else downsample)
     if output == "summary":
         return api.extract(path, names, sweeps, "summary", downsample, dest, xrange=xrange, plot=plot,
-                           ac_format=ac_format)
+                           ac_format=ac_format, engine=engine)
     api.resolve_dest(path, output, dest)             # fail before the read, not after it
     if output == "png":
         api._require_matplotlib()
     ts = api.extract(path, names, sweeps, "arrays", downsample, xrange=xrange, plot=plot,
-                     ac_format=ac_format)
+                     ac_format=ac_format, engine=engine)
     written = os.path.abspath(api.write_file(ts, output, dest, yrange))
     x = ts.header.x_name
     result = {
         "output": output, "path": written, "x": x, "traces": ts.selected[1:],
         "sweeps": len(ts.sweep_values), "points": sum(int(a.size) for a in ts.data[x]),
-        "truncated": ts.truncated,
+        "truncated": ts.truncated, "engine": engine,
     }
     if sweeps is not None:
         result["sweep_indices"] = list(ts.sweep_indices)
@@ -385,6 +407,7 @@ def read_measures(
     rows: Annotated[int, Field(
         description="Rows shown, evenly spaced with first and last kept; at least 2, at "
                     "most 500.")] = 20,
+    engine: Annotated[Engine, ENGINE_FIELD] = None,
 ):
     """Read the results of the netlist's .measure statements: one row per simulation
     (per sweep point, Monte Carlo sample or temperature), one column per measure.
@@ -397,7 +420,8 @@ def read_measures(
     """
     if rows < 2:
         raise ValueError("rows must be at least 2")
-    return format_measures(measure.read_measures(path, names), rows)
+    engine = waveview.resolve_engine(engine)
+    return format_measures(measure.read_measures(path, names, engine=engine), rows, engine)
 
 
 def _png_size(path: str):

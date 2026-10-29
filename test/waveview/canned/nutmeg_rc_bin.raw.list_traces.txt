@@ -1,0 +1,7 @@
+srp_listing	1
+title	Transient Analysis
+xname	time
+signal	v(in)	real
+signal	v(out)	real
+signal	i(v1)	real
+srp_done

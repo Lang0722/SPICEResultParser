@@ -1,0 +1,14 @@
+srp_listing	1
+title	* temperature sweep and 2-source dc
+xname	VOLTS
+param	0:vdd
+sweep	1
+sweep	1.5
+sweep	2
+signal	v(0)	real
+signal	v(in)	real
+signal	v(out)	real
+signal	v(vdd)	real
+signal	i(vdd)	real
+signal	i(vin)	real
+srp_done

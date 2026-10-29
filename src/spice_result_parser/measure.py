@@ -78,14 +78,19 @@ def _select(all_names: List[str], always: List[str], names) -> List[str]:
     return [n for n in all_names if n in chosen]
 
 
-def read_measures(path, names=None) -> MeasureSet:
+def read_measures(path, names=None, engine: Optional[str] = None) -> MeasureSet:
     """Read an HSPICE measure file.
 
     names: None for every column, else measure names or fnmatch globs (tp*). The `index`
     column and the swept parameters are always kept, so each row stays identifiable.
     A value written as `failed` becomes NaN and is counted in `failed`. A file that ends
     part-way through a row keeps its complete rows, with a RuntimeWarning and `truncated` True.
+    engine: "python" or "waveview" (waveview.read_measures); None uses SRP_ENGINE, else "python".
     """
+    from . import waveview          # imported here: waveview.py builds on this module
+
+    if waveview.resolve_engine(engine) == "waveview":
+        return waveview.read_measures(path, names)
     path = os.fspath(path)
     with open(path, "rb") as f:
         first = f.readline(4096).decode("utf-8", errors="replace")

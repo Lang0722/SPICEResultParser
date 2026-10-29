@@ -1,0 +1,14 @@
+srp_listing	1
+title	* two param sweep with subckt
+xname	TIME
+param	rval
+param	cval
+sweep	1000	1e-09
+sweep	2000	1e-09
+sweep	2000	2e-09
+signal	v(0)	real
+signal	v(in)	real
+signal	v(out)	real
+signal	x1.v(mid)	real
+signal	i(vin)	real
+srp_done

@@ -1,0 +1,12 @@
+srp_listing	1
+title	* rc sweep test
+xname	HERTZ
+param	cval
+sweep	1e-09
+sweep	2e-09
+signal	v(0)	complex
+signal	v(in)	complex
+signal	v(out)	complex
+signal	i(vin)	complex
+signal	vdb(out)	real
+srp_done

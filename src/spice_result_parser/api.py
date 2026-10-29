@@ -12,18 +12,28 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from . import waveview
 from .reader import TraceSet, read_header, read_traces, validate_range
 
 OUTPUTS = ("arrays", "csv", "npz", "summary", "png")
 
 
-def list_traces(path, plot: int = 0, ac_format: str = "magphase") -> dict:
+def readers(engine: Optional[str] = None):
+    """(read_header, read_traces) of an engine: "python" (reader.py, nutmeg.py) or "waveview"
+    (waveview.py). None uses the SRP_ENGINE environment variable, else "python"."""
+    if waveview.resolve_engine(engine) == "waveview":
+        return waveview.read_header, waveview.read_traces
+    return read_header, read_traces
+
+
+def list_traces(path, plot: int = 0, ac_format: str = "magphase", engine: Optional[str] = None) -> dict:
     """Trace names and file facts from the header only.
 
     plot selects one plot of a Nutmeg rawfile; "plots" lists every plot in it (HSPICE: []).
     ac_format names the columns of complex (AC) variables, as in extract.
+    engine selects the reader, as in extract; the WaveView engine reports format "waveview".
     """
-    h = read_header(path, plot, ac_format)
+    h = readers(engine)[0](path, plot, ac_format)
     return {
         "path": h.path, "format": h.version, "analysis": h.analysis, "x": h.x_name,
         "traces": h.names[1:], "sweep_params": h.sweep_params, "sweep_count_hint": h.sweep_count_hint,
@@ -265,7 +275,7 @@ def write_file(ts: TraceSet, output: str, dest=None, yrange=None, title: Optiona
 def extract(path, names=None, sweeps=None, output: str = "arrays",
             downsample: Optional[int] = None, dest=None,
             xrange: Optional[Sequence[float]] = None, yrange: Optional[Sequence[float]] = None,
-            plot: int = 0, ac_format: str = "magphase"):
+            plot: int = 0, ac_format: str = "magphase", engine: Optional[str] = None):
     """Read selected traces and return them as arrays, a summary dict, or a written file path.
 
     xrange=(lo, hi) keeps only the rows whose x value (TIME, FREQ or the sweep
@@ -280,9 +290,14 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
     plot selects one plot of a Nutmeg rawfile (0-based); see list_traces for the list.
     ac_format is what each complex (AC) variable becomes: "magphase" (_Mag, _Phase in
     degrees), "db" (_dB = 20 log10 |z|, _Phase) or "realimag" (_Re, _Im).
+    engine is the reader: "python" (this package's parser) or "waveview" (Synopsys
+    WaveView in batch mode, see waveview.py: it reads every point of the selected
+    traces, then applies xrange). None uses the SRP_ENGINE environment variable, else
+    "python".
     """
     if output not in OUTPUTS:
         raise ValueError(f"output must be one of {OUTPUTS}, not {output!r}")
+    read = readers(engine)[1]
     downsample = check_downsample(downsample)
     xrange = validate_range("xrange", xrange)
     yrange = validate_range("yrange", yrange, finite=True)
@@ -292,7 +307,7 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
         raise ValueError(f"dest applies to csv, npz and png only, not to output={output!r}")
     if output == "png":
         _require_matplotlib()
-    ts = read_traces(path, names, sweeps, plot, xrange, ac_format)
+    ts = read(path, names, sweeps, plot, xrange, ac_format)
     if output == "summary":
         return summarize(ts, downsample)
     if downsample is not None:

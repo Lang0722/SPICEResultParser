@@ -1,0 +1,12 @@
+srp_listing	1
+title	* expr probes
+xname	TIME
+signal	par(v(out)*2)	real
+signal	v(vd)	real
+signal	deriv(dv)	real
+signal	par(x1.loc)	real
+signal	v(out)	real
+signal	x1.i(r1)	real
+signal	v(in)	real
+signal	x1.v(n1)	real
+srp_done

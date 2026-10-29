@@ -1,0 +1,3 @@
+srp_listing	1
+error	cannot open \\Mac\Home\Project\hspiceParser\test\waveview\bogus.tr0
+srp_done

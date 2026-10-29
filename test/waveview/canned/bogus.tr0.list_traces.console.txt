@@ -1,0 +1,6 @@
+   *** running Tcl script ... ***
+   *** loading waveform file \\Mac\Home\Project\hspiceParser\test\waveview\bogus.tr0 ... ***
+   *** [ERROR] unknown waveform format
+'\\Mac\Home\Project\hspiceParser\test\waveview\bogus.tr0' ***
+   *** '\\Mac\Home\Project\hspiceParser\test\waveview\bogus.tr0' : format unknown ***
+  [ error ] sx_open_sim_file_read aborted

@@ -13,7 +13,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 import numpy as np
 
 _DTYPE = {"9601": np.dtype("<f4"), "2001": np.dtype("<f8"), "ascii": np.dtype("<f8"),
-          "nutmeg": np.dtype("<f8")}
+          "nutmeg": np.dtype("<f8"), "waveview": np.dtype("<f8")}
 _ANALYSIS_BY_TYPE_CODE = {1: "tr", 2: "ac", 3: "sw"}
 _TERMINATOR = "$&%#"
 _FRAME_OVERHEAD = 20            # 16-byte block head + 4-byte block tail
@@ -33,7 +33,7 @@ AC_FORMATS = {"magphase": ("Mag", "Phase"), "db": ("dB", "Phase"), "realimag": (
 class Header:
     path: str
     is_binary: bool
-    version: str            # "9601" | "2001" | "ascii" | "nutmeg"
+    version: str            # "9601" | "2001" | "ascii" | "nutmeg" | "waveview" (read by waveview.py)
     analysis: str           # "tr" | "sw" | "ac" (Nutmeg adds "op", "noise", "other")
     ncols: int              # values per point in the data stream
     nsweepparam: int

@@ -1,0 +1,15 @@
+srp_listing	1
+title	* deep hierarchy
+xname	TIME
+signal	v(0)	real
+signal	v(in)	real
+signal	v(out)	real
+signal	xt.v(t)	real
+signal	xt.xm.v(m)	real
+signal	xt.xm2.v(m)	real
+signal	xt.xm.xl.v(n1)	real
+signal	xt.xm.xl2.v(n1)	real
+signal	xt.xm2.xl.v(n1)	real
+signal	xt.xm2.xl2.v(n1)	real
+signal	i(vin)	real
+srp_done

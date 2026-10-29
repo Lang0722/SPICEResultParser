@@ -1,0 +1,15 @@
+srp_measures	1
+title	* dc sweep of a relay to show that it works
+column	rchg
+1.623e-008
+column	tmech
+1.5589999999999999e-008
+column	trl
+5.6749999999999995e-010
+column	tmechbb
+1.434e-008
+column	trlbb
+1.0669999999999999e-009
+column	temper
+25.0
+srp_done

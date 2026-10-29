@@ -120,6 +120,30 @@ HSPICE stores AC values as (real, imaginary) pairs. `ac_format` converts each pa
 magnitude and phase in degrees (the default), or to dB and phase. It can also keep the
 real and imaginary parts. It works the same way for HSPICE and Nutmeg files.
 
+### WaveView engine
+
+A second reader runs Synopsys Custom WaveView in batch mode. Use it when the Python
+reader cannot read a file (for example HSPICE `post_version` 2013, the default of HSPICE
+P-2019), or to check a result. It returns the same objects, so every output works the
+same way.
+
+```python
+list_traces("run.tr0", engine="waveview")
+extract("run.tr0", ["v(out)"], engine="waveview", output="csv")
+read_measures("run.mt0", engine="waveview")
+```
+
+- `engine` is `"python"` (the default) or `"waveview"`.
+- `SRP_ENGINE=waveview` selects the WaveView engine when a call gives no `engine`.
+- `SRP_WAVEVIEW` names the `wv` binary. Not set: `wv` on the `PATH`.
+- `SRP_WAVEVIEW_TIMEOUT` sets the time limit of one WaveView run (default 600 s).
+
+The WaveView engine reads every point of the selected traces into memory, and only plot
+0 of a Nutmeg rawfile. The three Tcl scripts in `spice_result_parser/tcl/` also run by
+hand with `wv -ace_no_gui`. Run a copy in a working directory, because WaveView writes
+`ace_tcl.log` beside the script. [Usage.md](Usage.md#waveview-engine) gives the details
+and the known differences between the two engines.
+
 ### MCP server for agents
 
 ```bash
@@ -132,12 +156,13 @@ pip install "spice_result_parser[mcp,plot] @ git+https://github.com/Lang0722/SPI
 
 The server has three tools:
 
-- `list_traces(path, plot)`
-- `extract(path, names, sweeps, output, downsample, dest, xrange, yrange, plot, ac_format)`
-- `read_measures(path, names, rows)`
+- `list_traces(path, plot, engine)`
+- `extract(path, names, sweeps, output, downsample, dest, xrange, yrange, plot, ac_format, engine)`
+- `read_measures(path, names, rows, engine)`
 
 `list_traces` and `extract` accept HSPICE result files and Nutmeg rawfiles. `plot`
 selects one plot of a Nutmeg rawfile. `read_measures` accepts HSPICE measure files.
+`engine` selects the reader, `"python"` or `"waveview"`.
 
 Over MCP, the `output` parameter of `extract` takes one of these values:
 

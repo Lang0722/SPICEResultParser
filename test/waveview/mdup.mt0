@@ -1,0 +1,15 @@
+$DATA1 SOURCE='HSPICE' VERSION='P-2019.06-SP1-1 win64' PARAM_COUNT=3
+.TITLE '* measure name edge cases'
+ index            rval             vmax             vmax            
+                  a_very_long_measure_name_number_one
+                  a_very_long_measure_name_number_two temper          
+                  index            d$x              temper          
+                  alter#          
+ 1                 1.000e+03          1.0000           0.9969       
+                     0.9969           0.               0.5982       
+                     0.6000           0.6000          25.0000       
+                 1               
+ 2                 2.000e+03          2.0000           0.9461       
+                     0.9461           0.               0.5832       
+                     0.6000           0.6000          25.0000       
+                 1               

@@ -1,0 +1,9 @@
+srp_listing	1
+title	* rc sweep test
+xname	TIME
+param	rval
+signal	v(0)	real
+signal	v(in)	real
+signal	v(out)	real
+signal	i(vin)	real
+srp_done

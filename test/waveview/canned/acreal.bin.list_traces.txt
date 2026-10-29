@@ -1,0 +1,7 @@
+srp_listing	1
+title	* ac only real columns 9601
+xname	HERTZ
+signal	vm(out)	real
+signal	vp(out)	real
+signal	vdb(out)	real
+srp_done

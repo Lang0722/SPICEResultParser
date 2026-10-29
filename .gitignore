@@ -6,3 +6,5 @@ __pycache__/
 *.pyc
 # superpowers SDD scratch workspace
 .superpowers/
+# WaveView writes this log beside a Tcl script that it runs
+ace_tcl.log

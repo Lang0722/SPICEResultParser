@@ -1,0 +1,2 @@
+   *** running Tcl script ... ***
+   *** loading waveform file \\Mac\Home\Project\hspiceParser\test\test_9601.tr0 ... ***

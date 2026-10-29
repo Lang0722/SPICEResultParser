@@ -1,0 +1,15 @@
+srp_measures	1
+title	* data sweep one param
+column	index
+1.0
+2.0
+column	rval
+1000.0
+2000.0
+column	vmax
+0.99339999999999995
+0.91820000000000002
+column	temper
+25.0
+25.0
+srp_done

@@ -147,7 +147,9 @@ complex data ignore it. Phase is `atan2(im, re)` in degrees, wrapped to (-180, 1
 HSPICE writes `.measure` results to `run.mt0` (transient), `run.ms0` (dc) or `run.ma0` (ac). They
 hold one row per simulation, that is, per sweep point, Monte Carlo sample or
 temperature. Each row has one column per measure, then `temper` and `alter#`. A swept
-run adds an `index` column and the swept parameters in front.
+run adds the swept parameters in front. A `.data` sweep or a Monte Carlo run also adds
+an `index` column before them. `PARAM_COUNT` in the first line of the file counts these
+leading columns, `index` included.
 
 ```python
 from spice_result_parser import read_measures
@@ -222,6 +224,143 @@ The reader does not support these files:
 - LTspice's binary `.raw` variants (float32 time column, UTF-16 header)
 - files written with `set appendwrite`
 
+# WaveView engine
+
+The package has two readers. The default reader is the Python parser in this package.
+The second reader runs Synopsys Custom WaveView in batch mode (`wv -ace_no_gui`). Use it
+when the Python parser cannot read a file, for example an HSPICE `post_version` 2013
+binary, which is the default output of HSPICE P-2019. Use it also to check a result that
+you doubt. Both readers return the same `Header`, `TraceSet` and `MeasureSet`, so every
+output (`text`, `summary`, `arrays`, `csv`, `npz`, `png`) works the same way.
+
+`list_traces`, `extract` and `read_measures` take an `engine` argument, and so do the
+three MCP tools:
+
+```python
+list_traces("run.tr0", engine="waveview")["format"]     # 'waveview'
+extract("run.tr0", ["v(out)"], engine="waveview", output="csv")
+read_measures("run.mt0", engine="waveview")
+```
+
+| Setting | Effect |
+|---|---|
+| `engine="python"` or `engine="waveview"` | Selects the reader for one call. |
+| `SRP_ENGINE` | The reader when `engine` is `None` (the default). Not set: `python`. `SRP_ENGINE=waveview srp-mcp` switches the whole MCP server. |
+| `SRP_WAVEVIEW` | The path of the `wv` (`wv.exe`) binary. Not set: `wv` on the `PATH`. |
+| `SRP_WAVEVIEW_TIMEOUT` | The time limit of one WaveView run, in seconds. Default: 600. Maximum: 1000000. At the limit, the engine stops WaveView and each process that it started. |
+
+An unknown engine name raises `ValueError`. When WaveView fails, the reader raises
+`waveview.WaveViewError`. Its text quotes the WaveView console lines that name the error.
+WaveView opens an empty file without an error, so the engine raises `WaveViewError`
+when WaveView finds no signals in a file.
+
+The WaveView engine reports `format: "waveview"`. Over MCP, the `list_traces` result and
+the `csv`/`npz`/`png` results of `extract` have an `engine` field. The `text` reports of
+`extract` and `read_measures` add `| engine: waveview` to the header line. The Python
+engine's text does not change.
+
+The engine runs three Tcl scripts. They are in the package, in `spice_result_parser/tcl/`
+(`waveview.TCL_DIR`). You can run them by hand. WaveView writes `ace_tcl.log` beside the
+script that it runs, so copy the script to a working directory first and run the copy
+there, as the engine does. The input and output paths go in environment variables:
+
+```bash
+# Linux
+cp "$(python -c 'from spice_result_parser import waveview; print(waveview.TCL_DIR)')"/list_traces.tcl .
+SRP_IN=run.tr0 SRP_OUT=out.txt wv -ace_no_gui list_traces.tcl
+# Windows (cmd), with the copy in the current directory: no space before "&&", or the
+# space becomes part of the value
+set SRP_IN=run.tr0&& set SRP_OUT=out.txt&& wv.exe -ace_no_gui list_traces.tcl
+```
+
+- `list_traces.tcl` writes the title, the x name, the sweep parameters, the parameter
+  values of each sweep, and each signal with its type.
+- `extract.tcl` writes every point of the signals that `SRP_SIGNALS` names. That is a
+  file with one name per line. When `SRP_SIGNALS` is not set, the script writes every
+  signal.
+- `read_measures.tcl` writes every column of a measure file.
+
+Each script ends its output with `srp_done`. The exit code of WaveView does not show
+success: it is 0 after an error that the script catches. Thus a missing `srp_done` is
+the sign of a failure. The header of each script describes its output.
+
+The engine sets `SRP_IN`, `SRP_OUT` and `SRP_SIGNALS` itself. It ignores the values of
+these variables in your own environment.
+
+WaveView reads the input path as a Tcl list, so the scripts give it the path as one list
+element. WaveView cannot open a path with non-ASCII characters, or a Windows path of 260
+characters or more. On Windows the scripts then use the 8.3 short name of the path. If
+WaveView still cannot open the file, the error gives the cause. Some characters can reach
+WaveView as `?`. Then the scripts cannot find the short name.
+
+The engine puts the script copy, its output and the list of signals in a temporary
+folder. On Windows, WaveView can fail to read that folder when its path has non-ASCII
+characters, for example a user name that the system code page cannot show. The error
+then says so. Set `TMP` (Windows) or `TMPDIR` to a folder with an ASCII path.
+
+The WaveView engine is different from the Python engine in these ways:
+
+- It reads every point of the selected traces into memory. It applies `xrange` after
+  the read. Each `extract` starts WaveView two times. On the test VM, 1 M values took
+  about 4 s.
+- It reads plot 0 of a Nutmeg rawfile only. `plots` holds one name, and `plot=1` raises
+  `ValueError`.
+- WaveView does not report some facts. The engine reads them from the file header when
+  the Python reader can read that header:
+  - the x name of a Nutmeg plot. WaveView gives the type of variable 0, for example
+    `voltage`.
+  - the `Dimensions` line of a Nutmeg plot.
+  - the float32 x values of a 9601 file. The engine compares the `xrange` bounds in
+    float32, as the Python engine does.
+  - the analysis and the sweep count in an HSPICE header.
+  - the name of a named probe. For `.probe vo=v(out)`, the file has `vo`, and WaveView
+    lists `v(vo)`. Without the header (HSPICE `post_version` 2013), the engine keeps
+    WaveView's name: `v_vo`, `i_io`, `p_pw`, `vdb_vodb`. These names are always
+    correct: `par`, `deriv` and `integ` expressions, and the `.noise` columns
+    `outnoise` and `innoise`.
+- WaveView does not read the partial sweep of a truncated file, or any sweep after it.
+  When the HSPICE header declares more sweeps than WaveView reads, or WaveView reads
+  no complete sweep of a swept file, `truncated` is `True` and a `RuntimeWarning` says
+  that the file is probably truncated. For an unswept truncated file, the engine
+  cannot see the truncation. It raises `WaveViewError` only when WaveView writes fewer
+  points for a selected signal than for x. Otherwise it returns the points that
+  WaveView reads, and `truncated` is `False`. These can be fewer than the complete
+  points in the file. The Python engine keeps the complete points of the partial
+  sweep, and sets `truncated`.
+- The arrays are float64, also for 9601 files. The values of real signals are equal.
+- The real and imaginary parts of complex values differ by about 1 ulp of the magnitude
+  (absolute). Thus a small part can have a much larger relative difference. For a 9601
+  AC file, the Python engine computes magnitude, phase and dB in float32. Thus these
+  traces differ by about 1e-7 (relative).
+- A measure file has no `alter#` column. A value can differ by 1 ulp from the text of
+  the file.
+- The sweep values come from WaveView's sweep conditions. They have 6 significant
+  digits.
+- A real signal in an AC file, for example `vdb(out)`, is one trace (`vdb_out`), not a
+  `_Mag`/`_Phase` pair.
+- When WaveView lists two signals with the same name, the engine raises
+  `WaveViewError`, because the scripts find a signal by its name. Examples: two
+  variables with one name in a Nutmeg plot, or a node `vo` and a named probe
+  `vo=v(out)` in an HSPICE file. Read such a file with the Python engine.
+
+The Python reader has these known errors. The WaveView engine does not have them:
+
+- It rejects HSPICE `post_version` 2013 binaries.
+- In a `.data` sweep, it counts the name of the `.data` table as a sweep parameter. Thus
+  the sweep values and the data shift by one value.
+- In a Monte Carlo measure file, the lines that start with `$` (`$OPTION ...`) come
+  before `.TITLE`. The Python reader takes them for the title and the names, and it
+  reads 0 rows, with only a `RuntimeWarning`.
+- An ASCII header can wrap a long name over two lines. The Python reader then reads two
+  names, and each later name labels the column before it.
+- An AC file can hold real signals such as `vdb(out)`. The Python reader reads each AC
+  signal as a complex pair, so the columns after a real signal shift.
+
+The tests against the real WaveView are in `test/test_waveview_e2e.py`. They run only
+when you set `SRP_E2E_WAVEVIEW=1`. Also set `SRP_WAVEVIEW` to the `wv` binary. If you
+do not, the tests use `test/waveview/wv_vm.py`, which runs WaveView on a Parallels VM
+from a Mac.
+
 # MCP server
 
 Install the `mcp` extra (the optional dependencies of the MCP server). Then register the
@@ -235,8 +374,9 @@ pip install 'spice_result_parser[mcp]'
 {"mcpServers": {"spice": {"command": "srp-mcp"}}}
 ```
 
-Tools: `list_traces(path, plot)`, `extract(path, names, sweeps, output, downsample, dest, xrange,
-yrange, plot, ac_format)` and `read_measures(path, names, rows)`. `list_traces` and
+Tools: `list_traces(path, plot, engine)`, `extract(path, names, sweeps, output, downsample, dest,
+xrange, yrange, plot, ac_format, engine)` and `read_measures(path, names, rows, engine)`.
+`engine` selects the reader (see [WaveView engine](#waveview-engine)). `list_traces` and
 `extract` accept HSPICE result files and Nutmeg rawfiles. `read_measures` accepts HSPICE
 measure files. `plot` selects one plot of a rawfile. `extract`'s
 `ac_format` names AC traces as above, and `list_traces` lists them in the default
@@ -261,6 +401,7 @@ The server never sends full arrays inline. When `output` is `csv`, `npz` or `png
 - `x`, `traces`
 - `sweeps` (the count), `points` (the total)
 - `truncated`
+- `engine`, the reader that read the file
 - `sweep_indices` when the call gives `sweeps`
 - for `png`, the pixel `size`
 

@@ -1,0 +1,9 @@
+srp_listing	1
+title	* hierarchical differential probes, collision with a top-level n
+xname	TIME
+signal	x1.xl.v(n1,b)	real
+signal	v(x1.xl.n1,b)	real
+signal	v(x1.xl.n1,x1.m)	real
+signal	v(x1.m,x1.xl.n1)	real
+signal	v(b)	real
+srp_done
