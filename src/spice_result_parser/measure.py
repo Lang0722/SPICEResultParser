@@ -2,7 +2,7 @@
 
 A measure file is text:
 
-    $DATA1 SOURCE='HSPICE' VERSION='...' PARAM_COUNT=1
+    $DATA1 SOURCE='HSPICE' VERSION='...' PARAM_COUNT=2
     .TITLE '* inverter delay'
      index    vdd      tpd        temper   alter#
      1.0000   0.9000   2.345e-11  25.0000  1.0000
@@ -10,8 +10,8 @@ A measure file is text:
 
 The names run until `alter#`; then every row holds one value per name, wrapped over
 as many lines as the simulator likes. A measure that could not be evaluated is written
-as `failed`. When the run was swept the first column is `index`, followed by the
-PARAM_COUNT swept parameters.
+as `failed`. PARAM_COUNT counts the leading columns that identify a row: `index` (a
+`.data` sweep or Monte Carlo writes it) and the swept parameters.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ import os
 import re
 import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -53,6 +53,14 @@ def _to_float(token: str, path: str) -> float:
         return float(token)
     except ValueError:
         raise ValueError(f"{path}: measure value {token!r} is not a number") from None
+
+
+def _leading_columns(all_names: List[str], param_count: int) -> Tuple[List[str], List[str]]:
+    """(the index column if the file has one, the swept parameters). PARAM_COUNT counts
+    index too: `index rval cval tdel` with PARAM_COUNT=3 sweeps rval and cval, and
+    `rval tdel` with PARAM_COUNT=1 sweeps rval."""
+    index = all_names[:1] if all_names[:1] == ["index"] else []
+    return index, all_names[len(index):param_count]
 
 
 def _select(all_names: List[str], always: List[str], names) -> List[str]:
@@ -102,9 +110,8 @@ def read_measures(path, names=None) -> MeasureSet:
     if len(value_tokens) % ncols:
         warnings.warn(f"{path}: file ends with an incomplete row; keeping {nrows} complete rows",
                       RuntimeWarning)
-    first_param = 1 if all_names[0] == "index" else 0
-    params = all_names[first_param:first_param + param_count]
-    kept = _select(all_names, all_names[:first_param] + params, names)
+    index, params = _leading_columns(all_names, param_count)
+    kept = _select(all_names, index + params, names)
     table = np.array([_to_float(t, path) for t in value_tokens[:nrows * ncols]],
                      dtype=np.float64).reshape(nrows, ncols)
     failed_mask = np.array([t == "failed" for t in value_tokens[:nrows * ncols]],
