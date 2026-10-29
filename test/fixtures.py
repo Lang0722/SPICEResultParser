@@ -34,7 +34,7 @@ def _block(payload: bytes) -> bytes:
 
 
 def write_binary(path, version, raw_names, type_codes, sweeps, block_bytes=8192,
-                 final_sentinel=True, drop_tail=0):
+                 final_sentinel=True, drop_tail=0, header_bytes=None):
     """Write a binary result file.
 
     sweeps: list of (param_values, data); data has shape (npoints, ncols) where
@@ -43,6 +43,8 @@ def write_binary(path, version, raw_names, type_codes, sweeps, block_bytes=8192,
     that many trailing values from the stream (to leave a partial point).
     block_bytes: payload size per block, or a sequence of sizes cycled through
     (to build files with non-uniform blocks).
+    header_bytes: split the header text into blocks of this size, as HSPICE does with a
+    long variable list (its first block holds 8184 bytes).
     Returns the flat value stream that was written.
     """
     dtype = np.dtype("<f4") if version == "9601" else np.dtype("<f8")
@@ -61,8 +63,11 @@ def write_binary(path, version, raw_names, type_codes, sweeps, block_bytes=8192,
     sizes = list(block_bytes) if isinstance(block_bytes, (list, tuple)) else [int(block_bytes)]
     if any(s <= 0 for s in sizes):
         raise ValueError("block_bytes entries must be positive")
+    head = text.encode("utf-8")
+    step = header_bytes or len(head)
     with open(path, "wb") as f:
-        f.write(_block(text.encode("utf-8")))
+        for start in range(0, len(head), step):
+            f.write(_block(head[start:start + step]))
         offset = 0
         k = 0
         while offset < len(raw):

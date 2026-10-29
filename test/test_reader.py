@@ -319,6 +319,25 @@ class TestBinaryRead(unittest.TestCase):
         self.assertEqual(ts.data["v_a"], [])
         self.assertFalse(ts.truncated)
 
+    def test_header_over_several_blocks(self):
+        # Above about 330 names HSPICE goes on with the header in the next blocks; only
+        # the last one holds the terminator.
+        names = ["TIME"] + [f"v(n{i}" for i in range(400)]
+        data = np.arange(3 * 401, dtype=np.float64).reshape(3, 401)
+        for version in ("9601", "2001"):
+            path = self.dir / f"wide{version}.tr0"
+            fixtures.write_binary(path, version, names, [1] * 401, [([], data)], header_bytes=1000)
+            self.assertGreater(path.stat().st_size // 1000, 6)
+            h = read_header(path)
+            self.assertEqual(h.raw_names, names)
+            ts = read_traces(path, ["v(n0", "v(n399"])
+            np.testing.assert_array_equal(ts.data["v_n399"][0], data[:, 400])
+            np.testing.assert_array_equal(ts.data["TIME"][0], data[:, 0])
+        path = self.dir / "cut.tr0"
+        path.write_bytes(fixtures._block(fixtures.header_text("9601", names, [1] * 401, 0, 0).encode()[:1000]))
+        with self.assertRaisesRegex(ValueError, "terminator"):
+            read_header(path)
+
     def test_capacity_estimates(self):
         # 16424 bytes of frames after a header: two 8192-byte-payload frames would be 16424 bytes
         self.assertEqual(reader._binary_capacity(16424 + 100, 100, 8192, 20, 8), 16384 // 8 // 20 + 1)

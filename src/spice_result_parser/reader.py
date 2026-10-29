@@ -260,12 +260,19 @@ def _read_binary_header(f, path: str, ac_format: str = "magphase") -> Header:
     version = text[20:24].strip() or text[16:20].strip()
     if version not in ("9601", "2001"):
         raise ValueError(f"{path}: unsupported post_version {version!r}; only 9601 and 2001 are supported")
+    index = 1
+    while _TERMINATOR not in text:      # a long variable list (above ~330 names) goes on in the next blocks
+        more = _read_block(f, index, 1)
+        if more is None:
+            raise ValueError(f"{path}: header terminator {_TERMINATOR} not found")
+        text += more.decode("utf-8", errors="replace")
+        index += 1
     marker = text.find("Reserved.")
     if marker < 0:
         raise ValueError(f"{path}: header has no copyright marker")
     tokens = text[marker + len("Reserved."):].split()
-    if tokens and tokens[-1] == _TERMINATOR:
-        tokens = tokens[:-1]
+    if _TERMINATOR in tokens:
+        tokens = tokens[:tokens.index(_TERMINATOR)]
     if not tokens:
         raise ValueError(f"{path}: header has no variable list")
     return _build_header(path, True, version, nauto, nprobe, nsweepparam, int(tokens[0]), tokens[1:],
