@@ -1,6 +1,6 @@
 srp_listing	1
 title	DC transfer characteristic
 xname	voltage
-signal	v(out)	real
-signal	i(v1)	real
+signal	v(out)	real	6
+signal	i(v1)	real	6
 srp_done

@@ -255,6 +255,13 @@ read_measures("run.mt0", engine="waveview")
 | `SRP_WAVEVIEW` | The path of the `wv` (`wv.exe`) binary. Not set: `wv` on the `PATH`. |
 | `SRP_WAVEVIEW_TIMEOUT` | The time limit of one WaveView run, in seconds. Default: 600. Maximum: 1000000. At the limit, the engine stops WaveView and each process that it started. |
 
+On Linux, WaveView runs in its own session, so that the engine can stop each process
+that a `wv` launcher script starts. Thus a signal to the process group of the caller
+does not reach WaveView. `srp-mcp` stops the WaveView runs in progress when it gets
+`SIGTERM` or `SIGHUP`. If your own program can be stopped by a signal while it reads,
+call `waveview.stop_all()` from its signal handler. The engine also calls `stop_all` at
+the exit of the interpreter. Nothing can stop WaveView after a `SIGKILL` of the caller.
+
 An unknown engine name raises `ValueError`. When WaveView fails, the reader raises
 `waveview.WaveViewError`. Its text quotes the WaveView console lines that name the error.
 WaveView opens an empty file without an error, so the engine raises `WaveViewError`
@@ -280,19 +287,23 @@ set SRP_IN=run.tr0&& set SRP_OUT=out.txt&& wv.exe -ace_no_gui list_traces.tcl
 ```
 
 - `list_traces.tcl` writes the title, the x name, the sweep parameters, the parameter
-  values of each sweep, and each signal with its type.
+  values of each sweep, and each signal with its type and its point count.
 - `extract.tcl` writes every point of the signals that `SRP_SIGNALS` names. That is a
   file with one name per line. When `SRP_SIGNALS` is not set, the script writes every
-  signal.
+  signal. When `SRP_XCHECK` is set, the script also checks that all the signals have the
+  same x points.
 - `read_measures.tcl` writes every column of a measure file.
 
 Each script ends its output with `srp_done`. The exit code of WaveView does not show
 success: it is 0 after an error that the script catches. Thus a missing `srp_done` is
 the sign of a failure. The header of each script describes its output.
 
-The engine sets `SRP_IN`, `SRP_OUT` and `SRP_SIGNALS` itself. It ignores the values of
-these variables in your own environment.
+The engine sets `SRP_IN`, `SRP_OUT`, `SRP_SIGNALS` and `SRP_XCHECK` itself. It ignores
+the values of these variables in your own environment. The scripts write each name as
+valid UTF-8, also a name with a Latin-1 byte.
 
+On Linux the engine gives WaveView the path of the file that the system opens
+(`os.path.realpath`): in `results/latest/../run.tr0`, `..` comes after the link `latest`.
 WaveView reads the input path as a Tcl list, so the scripts give it the path as one list
 element. WaveView cannot open a path with non-ASCII characters, or a Windows path of 260
 characters or more. On Windows the scripts then use the 8.3 short name of the path. If
@@ -315,31 +326,60 @@ The WaveView engine is different from the Python engine in these ways:
   the Python reader can read that header:
   - the x name of a Nutmeg plot. WaveView gives the type of variable 0, for example
     `voltage`.
-  - the `Dimensions` line of a Nutmeg plot.
+  - the `Dimensions` line and the point count of a Nutmeg plot.
   - the float32 x values of a 9601 file. The engine compares the `xrange` bounds in
     float32, as the Python engine does.
   - the analysis and the sweep count in an HSPICE header.
-  - the name of a named probe. For `.probe vo=v(out)`, the file has `vo`, and WaveView
-    lists `v(vo)`. Without the header (HSPICE `post_version` 2013), the engine keeps
-    WaveView's name: `v_vo`, `i_io`, `p_pw`, `vdb_vodb`. These names are always
-    correct: `par`, `deriv` and `integ` expressions, and the `.noise` columns
-    `outnoise` and `innoise`.
-- WaveView does not read the partial sweep of a truncated file, or any sweep after it.
-  When the HSPICE header declares more sweeps than WaveView reads, or WaveView reads
-  no complete sweep of a swept file, `truncated` is `True` and a `RuntimeWarning` says
-  that the file is probably truncated. For an unswept truncated file, the engine
-  cannot see the truncation. It raises `WaveViewError` only when WaveView writes fewer
-  points for a selected signal than for x. Otherwise it returns the points that
-  WaveView reads, and `truncated` is `False`. These can be fewer than the complete
-  points in the file. The Python engine keeps the complete points of the partial
-  sweep, and sets `truncated`.
-- The arrays are float64, also for 9601 files. The values of real signals are equal.
+  - the names of named probes and expressions. For `.probe vo=v(out)`, the file has
+    `vo`, and WaveView lists `v(vo)`. For `xt.vo=v(xt.n1)`, the file has `xt.vo`, and
+    WaveView lists `xt.v(vo)`. For an unnamed `par('rval')`, the file has `par(rval`,
+    and WaveView lists `par(rval)`, as for a named `rval=par(...)`.
+- Without the header (HSPICE `post_version` 2013), a named probe keeps WaveView's name:
+  `v_vo`, `v_xt_vo`, `i_io`, `p_pw`, `vdb_vodb`. Named `par`, `deriv` and `integ`
+  expressions get the file's names, also with `$ # [ ] < >` in them (`my$x`, `q[0]`).
+  So do the `.noise` columns `outnoise` and `innoise`. An unnamed `par('rval')` comes out
+  as `rval`.
+- A probe in a subcircuit (`.probe tran inner=v(n1)` in a `.subckt`) keeps WaveView's
+  name, also with the header: `v_xt_inner`, where the Python engine gives `1_inner`.
+- WaveView prints `waveform file '...' not complete` on its console for a truncated file.
+  Then, or when the HSPICE header declares more sweeps than WaveView reads, `truncated`
+  is `True` and a `RuntimeWarning` says that the file is probably truncated. The engine
+  keeps the points that every signal of the file has, also when you select fewer
+  signals. In a binary HSPICE file, WaveView drops the partial sweep and every sweep
+  after it. In an unswept binary file it reads fewer points than the Python engine, and
+  no points when the file ends inside its first data block. In an ASCII file, it reads
+  the partial sweep, as the Python engine does. WaveView also reads a value that the
+  end of a Nutmeg file cuts short. Thus the engine keeps the complete points of a Nutmeg
+  plot as the Python engine counts them, and the sweeps of its `Dimensions` line that
+  these points reach, the last one partial.
+- The arrays are float64, also for 9601 files. The values of real signals are equal,
+  with the two exceptions that follow.
+- WaveView ends its scan of some HSPICE signals early, after values of about 1e34 or
+  more (1e33 is safe; the limit depends on the waveform). WaveView gives no error. The
+  engine compares the points of each selected signal with WaveView's count of them, also
+  in a truncated file, and raises `WaveViewError` for such a signal. WaveView can also
+  end the scan of a measure early. Then `read_measures` raises `WaveViewError`.
+- WaveView changes the values of a Nutmeg file. A value above 1e30 becomes +-1e30, a
+  value below 1e-30 becomes 0, and an infinite value makes the data of the whole plot
+  wrong. The engine raises `WaveViewError` when a value is +-1e30. It cannot see a value
+  that became 0. Read such a file with the Python engine.
+- In an HSPICE `post=3` file, each signal has its own x points. The Python engine
+  rejects the file. The WaveView engine reads one signal at a time from it, and raises
+  `WaveViewError` when two selected signals have different x points. This check makes
+  `extract` slower (about 70 % on the test VM), so the engine runs it only for a file
+  that is not an HSPICE `post=1` or `post=2` file or a Nutmeg file. WaveView gives no x
+  name for such a file: the engine uses `TIME` for a `.tr#` file and `HERTZ` for a
+  `.ac#` file.
 - The real and imaginary parts of complex values differ by about 1 ulp of the magnitude
   (absolute). Thus a small part can have a much larger relative difference. For a 9601
   AC file, the Python engine computes magnitude, phase and dB in float32. Thus these
   traces differ by about 1e-7 (relative).
 - A measure file has no `alter#` column. A value can differ by 1 ulp from the text of
-  the file.
+  the file. WaveView cuts a long title, and it reads the values of a row that the end of
+  the file cuts. Thus the engine reads the title, `PARAM_COUNT` and the count of the
+  values from the file text, with the rules of the Python engine. When a column has
+  fewer values than the complete rows of the file, WaveView has ended its scan early
+  (see above), and the engine raises `WaveViewError`.
 - The sweep values come from WaveView's sweep conditions. They have 6 significant
   digits.
 - A real signal in an AC file, for example `vdb(out)`, is one trace (`vdb_out`), not a

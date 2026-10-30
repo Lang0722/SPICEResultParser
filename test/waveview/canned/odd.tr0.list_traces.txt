@@ -1,18 +1,18 @@
 srp_listing	1
 title	* odd names
 xname	TIME
-signal	v(out)	real
-signal	x1.v(n#1)	real
-signal	x1.i(r1)	real
-signal	x1.i1(m1)	real
-signal	i1(m2)	real
-signal	i(rbus)	real
-signal	v(bus[0])	real
-signal	v(bus<1>)	real
-signal	v(in,out)	real
-signal	power(rbus)	real
-signal	lx4(m2)	real
-signal	x1.i(vsup)	real
-signal	x1.v(b)	real
-signal	par(myexpr)	real
+signal	v(out)	real	57
+signal	x1.v(n#1)	real	57
+signal	x1.i(r1)	real	57
+signal	x1.i1(m1)	real	57
+signal	i1(m2)	real	57
+signal	i(rbus)	real	57
+signal	v(bus[0])	real	57
+signal	v(bus<1>)	real	57
+signal	v(in,out)	real	57
+signal	power(rbus)	real	57
+signal	lx4(m2)	real	57
+signal	x1.i(vsup)	real	57
+signal	x1.v(b)	real	57
+signal	par(myexpr)	real	57
 srp_done

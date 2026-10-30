@@ -1,0 +1,9 @@
+srp_listing	1
+title	* post=3: two pwl nodes with the same number of breakpoints at d
+xname	
+signal	v(0)	real	2
+signal	v(a)	real	7
+signal	v(b)	real	7
+signal	i(va)	real	7
+signal	i(vb)	real	7
+srp_done

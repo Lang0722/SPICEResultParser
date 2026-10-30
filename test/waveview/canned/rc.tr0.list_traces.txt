@@ -5,8 +5,8 @@ param	rval
 sweep	1000
 sweep	2000
 sweep	4000
-signal	v(0)	real
-signal	v(in)	real
-signal	v(out)	real
-signal	i(vin)	real
+signal	v(0)	real	229
+signal	v(in)	real	229
+signal	v(out)	real	229
+signal	i(vin)	real	229
 srp_done

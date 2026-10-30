@@ -1,0 +1,6 @@
+   *** running Tcl script ... ***
+   *** loading waveform file \\Mac\Home\.cache\srp_fix3\rec\in\cut_dims.raw ... ***
+   *** error reading waveform file ***
+   *** waveform file '\\Mac\Home\.cache\srp_fix3\rec\in\cut_dims.raw' not complete ! ***
+   *** error reading waveform file ***
+   *** waveform file '\\Mac\Home\.cache\srp_fix3\rec\in\cut_dims.raw' not complete ! ***

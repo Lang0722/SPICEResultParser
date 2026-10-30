@@ -9,6 +9,7 @@ Python; only `main()` needs the server.
 """
 import math
 import os
+import signal
 import struct
 from typing import Annotated, List, Literal, Optional, Union
 
@@ -431,9 +432,19 @@ def _png_size(path: str):
     return struct.unpack(">II", head[16:24])
 
 
+def _stop(signum, frame) -> None:
+    """SIGTERM or SIGHUP: stop the WaveView runs in progress (they run in their own session, so
+    the signal does not reach them), then end as the signal's default action does."""
+    waveview.stop_all()
+    os._exit(128 + signum)
+
+
 def main() -> None:
     if server is None:
         raise ImportError("MCP support needs the optional dependency: pip install 'spice_result_parser[mcp]'")
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _stop)
     server.run()   # stdio transport
 
 

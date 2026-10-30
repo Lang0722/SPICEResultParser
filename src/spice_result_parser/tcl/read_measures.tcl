@@ -54,6 +54,12 @@ proc write_values {sig} {
     sx_release $scan
 }
 
+# A name as valid UTF-8. WaveView gives the bytes of the file: a Latin-1 byte
+# would not equal the name in SRP_SIGNALS, and puts can lose the end of the line.
+proc clean {name} {
+    return [encoding convertfrom utf-8 [encoding convertto utf-8 $name]]
+}
+
 puts $out "srp_measures\t1"
 # sx_open_sim_file_read splits its argument as a Tcl list: pass one element, in
 # quotes when the path has a brace ([list] escapes a lone brace with a backslash,
@@ -80,13 +86,14 @@ if {$f == ""} {
     finish "cannot open $env(SRP_IN)$why"
 }
 set title [sx_wdf_info $f -title]
-puts $out "title\t[string trim [string map [list "\t" " " "\r" " " "\n" " "] $title]]"
+puts $out "title\t[string trim [string map [list "\t" " " "\r" " " "\n" " "] [clean $title]]]"
 sx_current_sim_file $f
 # Two columns can have one name (a measure named as a .data parameter): keep
 # the signal objects in a list, not only in the array of names.
 set all [sx_signal *]
 foreach s $all {
-    set object([sx_get_name $s]) $s
+    set nameof($s) [clean [sx_get_name $s]]
+    set object($nameof($s)) $s
 }
 
 if {[info exists env(SRP_SIGNALS)]} {
@@ -111,7 +118,7 @@ if {[info exists env(SRP_SIGNALS)]} {
 }
 
 foreach s $all {
-    set name [sx_get_name $s]
+    set name $nameof($s)
     if {![info exists wanted($name)]} {
         continue
     }

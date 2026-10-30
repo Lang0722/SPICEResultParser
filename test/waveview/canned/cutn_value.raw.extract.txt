@@ -1,0 +1,18 @@
+srp_extract	1
+trace	0
+x	v(out)
+0.0
+0.5
+1.0
+0.0
+real	v(out)
+0.0
+0.5
+1.0
+0.0
+real	i(v1)
+0.0
+0.001
+0.002
+1.0
+srp_done

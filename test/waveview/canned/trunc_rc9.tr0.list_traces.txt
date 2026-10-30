@@ -3,8 +3,8 @@ title	* rc sweep 9601
 xname	TIME
 param	rval
 sweep	1000
-signal	v(0)	real
-signal	v(in)	real
-signal	v(out)	real
-signal	i(vin)	real
+signal	v(0)	real	87
+signal	v(in)	real	87
+signal	v(out)	real	87
+signal	i(vin)	real	87
 srp_done

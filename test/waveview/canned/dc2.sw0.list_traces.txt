@@ -5,10 +5,10 @@ param	0:vdd
 sweep	1
 sweep	1.5
 sweep	2
-signal	v(0)	real
-signal	v(in)	real
-signal	v(out)	real
-signal	v(vdd)	real
-signal	i(vdd)	real
-signal	i(vin)	real
+signal	v(0)	real	12
+signal	v(in)	real	12
+signal	v(out)	real	12
+signal	v(vdd)	real	12
+signal	i(vdd)	real	12
+signal	i(vin)	real	12
 srp_done

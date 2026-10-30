@@ -6,9 +6,9 @@ param	cval
 sweep	1000	1e-09
 sweep	2000	1e-09
 sweep	2000	2e-09
-signal	v(0)	real
-signal	v(in)	real
-signal	v(out)	real
-signal	x1.v(mid)	real
-signal	i(vin)	real
+signal	v(0)	real	141
+signal	v(in)	real	141
+signal	v(out)	real	141
+signal	x1.v(mid)	real	141
+signal	i(vin)	real	141
 srp_done

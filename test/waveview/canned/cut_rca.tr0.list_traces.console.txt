@@ -1,0 +1,4 @@
+   *** running Tcl script ... ***
+   *** loading waveform file \\Mac\Home\.cache\srp_fix3\rec\in\cut_rca.tr0 ... ***
+   *** reading error at line 190 ***
+   *** waveform file '\\Mac\Home\.cache\srp_fix3\rec\in\cut_rca.tr0' not complete ! ***

@@ -14,7 +14,9 @@
 #   sweep   <value> ...     one per trace: the value of each parameter, in the
 #                           order of the param records (%g, 6 significant
 #                           digits); none when not swept
-#   signal  <name> <real|complex>
+#   signal  <name> <real|complex> <npoints>
+#                           npoints: WaveView's point count of the signal; in a
+#                           swept file it holds one more point per sweep
 #   srp_done
 # A file that WaveView cannot open gives "error<TAB>cannot open <path>".
 # sx_open_sim_file_read splits its argument as a Tcl list, so the path goes in
@@ -40,6 +42,12 @@ proc one_line {text} {
     return [string trim [string map [list "\t" " " "\r" " " "\n" " "] $text]]
 }
 
+# A name as valid UTF-8: WaveView gives the bytes of the file, and puts can lose
+# the end of a line that holds a Latin-1 byte.
+proc clean {name} {
+    return [encoding convertfrom utf-8 [encoding convertto utf-8 $name]]
+}
+
 emit srp_listing 1
 set path $env(SRP_IN)
 if {![string is ascii $path] || [string length $path] >= 260} {
@@ -61,20 +69,21 @@ if {![string is ascii $path]} {
 if {$f == ""} {
     emit error "cannot open $env(SRP_IN)$why"
 } else {
-    emit title [one_line [sx_wdf_info $f -title]]
+    emit title [one_line [clean [sx_wdf_info $f -title]]]
     sx_current_sim_file $f
     set sigs [sx_signal *]
     if {[llength $sigs] > 0} {
-        emit xname [sx_signal_attribute [lindex $sigs 0] -xname]
+        emit xname [clean [sx_signal_attribute [lindex $sigs 0] -xname]]
     }
     foreach p [sx_get_sweep_parameters $f] {
-        emit param $p
+        emit param [clean $p]
     }
     foreach c [sx_get_sweep_conditions $f] {
         emit sweep [join $c "\t"]
     }
     foreach s $sigs {
-        emit signal [sx_get_name $s] [sx_signal_attribute $s -datatype]
+        emit signal [clean [sx_get_name $s]] [sx_signal_attribute $s -datatype] \
+            [sx_signal_attribute $s -npoints]
     }
 }
 emit srp_done

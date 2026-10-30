@@ -1,0 +1,8 @@
+srp_listing	1
+title	* rccircuit.sp
+xname	TIME
+signal	v(0)	real	1229
+signal	v(vo)	real	1229
+signal	v(vs)	real	1229
+signal	i(vs)	real	1228
+srp_done

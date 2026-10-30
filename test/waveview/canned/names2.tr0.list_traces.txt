@@ -1,0 +1,15 @@
+srp_listing	1
+title	* hierarchical named probes, expressions with odd names, unnamed
+xname	TIME
+signal	v(top)	real	13
+signal	xt.x2.v(deep)	real	13
+signal	xt.power(pw)	real	13
+signal	xt.i(io)	real	13
+signal	par(my$x)	real	13
+signal	par(q[0])	real	13
+signal	deriv(dv$)	real	13
+signal	par(rval)	real	13
+signal	par(temper)	real	13
+signal	par(v(in)*3)	real	13
+signal	v(in)	real	13
+srp_done

@@ -14,6 +14,8 @@
 #         SRP_SIGNALS optional: a text file with one exact signal name per line,
 #                     as list_traces.tcl writes them. Not set: every signal.
 #                     No names in it: x only.
+#         SRP_XCHECK  optional: set, the script checks that all signals have
+#                     the same x points (see write_points).
 # Output: SRP_OUT     a text file. Records have a tab; value lines do not:
 #   srp_extract 1
 #   trace   <i>           0-based; one per sweep trace, one when not swept
@@ -22,11 +24,11 @@
 #   complex <signal>      then "<real part> <imaginary part>" per point
 #   ...                   (the signals in the order of the file)
 #   srp_done
-# NaN prints as 1.#QNAN on Windows. A file that does not open or a signal name
-# that the file does not have gives "error<TAB><text>" then srp_done. A missing
-# srp_done means that the script failed: the console (stdout) has the WaveView
-# error. The exit code does not show success: it is 0 after an error that the
-# script catches.
+# NaN prints as 1.#QNAN on Windows. A file that does not open, a signal name
+# that the file does not have, or signals with their own x points (an HSPICE
+# post=3 file) give "error<TAB><text>" then srp_done. A missing srp_done means
+# that the script failed: the console (stdout) has the WaveView error. The exit
+# code does not show success: it is 0 after an error that the script catches.
 #
 # Tcl 8.4: no dict, lassign, {*} or "in".
 
@@ -44,33 +46,65 @@ proc finish {{error ""}} {
     exit
 }
 
-# Write one value line per point of trace `trace` of signal `sig`. The loops are
-# in a proc so that Tcl compiles them.
+# A name as valid UTF-8. WaveView gives the bytes of the file: a Latin-1 byte
+# would not equal the name in SRP_SIGNALS, and puts can lose the end of the line.
+proc clean {name} {
+    return [encoding convertfrom utf-8 [encoding convertto utf-8 $name]]
+}
+
+# Write one value line per point of trace `trace` of signal `sig`. With
+# SRP_XCHECK, the x scan keeps its values in xs, and a y scan compares its x
+# values with them: all the signals of the trace must have the same x points.
+# The check costs time, so waveview.py sets SRP_XCHECK only for a file whose
+# format does not give one x to all signals. The loops are in a proc so that
+# Tcl compiles them.
 proc write_points {sig trace swept kind} {
-    global out
+    global out xs xname xcheck
     set scan [sx_scan_data_points $sig POINT]
     if {$swept} {
         set more [sx_jump_to_x $scan FIRST -trace $trace]
     } else {
         set more [sx_jump_to_x $scan FIRST]
     }
-    if {$kind == "x"} {
+    set k 0
+    set n [llength $xs]
+    if {$kind == "x" && $xcheck} {
+        set xs {}
+        while {$more == 1} {
+            set x [sx_x_value $scan]
+            lappend xs $x
+            puts $out $x
+            set more [sx_jump_to_x $scan NEXT]
+        }
+    } elseif {$kind == "x"} {
         while {$more == 1} {
             puts $out [sx_x_value $scan]
             set more [sx_jump_to_x $scan NEXT]
         }
     } elseif {$kind == "complex"} {
         while {$more == 1} {
+            if {$k < $n && [sx_x_value $scan] != [lindex $xs $k]} {
+                break
+            }
             puts $out "[sx_y_value $scan real] [sx_y_value $scan imag]"
+            incr k
             set more [sx_jump_to_x $scan NEXT]
         }
     } else {
         while {$more == 1} {
+            if {$k < $n && [sx_x_value $scan] != [lindex $xs $k]} {
+                break
+            }
             puts $out [sx_y_value $scan]
+            incr k
             set more [sx_jump_to_x $scan NEXT]
         }
     }
     sx_release $scan
+    if {$more == 1} {
+        finish "the signals have their own x points (an HSPICE post=3 file, for example):\
+            [clean [sx_get_name $sig]] has other x points than $xname; extract one signal at a time"
+    }
 }
 
 # sx_open_sim_file_read splits its argument as a Tcl list: pass one element, in
@@ -101,8 +135,9 @@ sx_current_sim_file $f
 set all [sx_signal *]
 set order {}
 foreach s $all {
-    set name [sx_get_name $s]
+    set name [clean [sx_get_name $s]]
     set object($name) $s
+    set nameof($s) $name
     lappend order $name
 }
 if {[llength $all] == 0} {
@@ -145,17 +180,20 @@ set xsig [lindex $all 0]
 if {[llength $sigs] > 0} {
     set xsig [lindex $sigs 0]
 }
+set xname $nameof($xsig)
+set xs {}
+set xcheck [info exists env(SRP_XCHECK)]
 puts $out "srp_extract\t1"
 for {set i 0} {$i < $ntrace} {incr i} {
     puts $out "trace\t$i"
-    puts $out "x\t[sx_get_name $xsig]"
+    puts $out "x\t$xname"
     write_points $xsig $i $swept x
     foreach s $sigs {
         set kind [sx_signal_attribute $s -datatype]
         if {$kind != "complex"} {
             set kind real
         }
-        puts $out "$kind\t[sx_get_name $s]"
+        puts $out "$kind\t$nameof($s)"
         write_points $s $i $swept $kind
     }
 }

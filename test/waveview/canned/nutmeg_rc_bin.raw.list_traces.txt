@@ -1,7 +1,7 @@
 srp_listing	1
 title	Transient Analysis
 xname	time
-signal	v(in)	real
-signal	v(out)	real
-signal	i(v1)	real
+signal	v(in)	real	80
+signal	v(out)	real	80
+signal	i(v1)	real	80
 srp_done

@@ -41,10 +41,10 @@ testing.
   text export, and Python reads it whole. Memory follows the selected signals
   × points, not the x window.
 - No Nutmeg plot other than plot 0 (WaveView opens only the first plot).
-- No `truncated` detection from WaveView itself (it does not report it). The
-  engine sets `truncated` only when the HSPICE header, read by `reader.py`,
-  declares more sweeps than WaveView reads, or when WaveView lists sweep
-  parameters but no complete sweep.
+- `truncated` comes from WaveView's console (`waveform file '...' not complete`,
+  found in the third review round), from the HSPICE header when `reader.py` reads it
+  and it declares more sweeps than WaveView reads, from a swept file with no
+  complete sweep, and from the point count of a Nutmeg plot header.
 
 ## Anti-goals
 
@@ -75,7 +75,7 @@ Commands used (all confirmed on the VM):
 | `sx_get_name $s` | the signal name. |
 | `sx_signal_attribute $s -datatype` | `real` or `complex`. |
 | `sx_signal_attribute $s -xname` | `TIME`, `HERTZ`, `VOLTS` (HSPICE), `index` (.mt#). Nutmeg: the type of variable 0 (`voltage` for `v(v-sweep)`), not its name; the engine reads the name from the header. |
-| `sx_signal_attribute $s -npoints` | total points over all traces. |
+| `sx_signal_attribute $s -npoints` | total points over all traces, plus one per trace in a swept file. In a complete file, the POINT scan reads that count less one per trace; a scan that WaveView ends early (values of about 1e34 or more) reads fewer. |
 | `sx_get_sweep_parameters $f` | e.g. `rval` or `rval cval`; `{}` when not swept. |
 | `sx_get_sweep_conditions $f` | one entry per trace, a Tcl list of the parameter values in the order of `sx_get_sweep_parameters`, each `%g` (6 significant digits, also with `tcl_precision 17`): `{1.5e+06 1e-15}`. `{}` when not swept. Used by the scripts. |
 | `sx_get_sweep_conditions $f withname` | `rval=1000:cval=1n`. Not used: `M` means mega (`1.5M`), the second and later values keep 3 digits, and a parameter name can hold `:` (`0:vdd` for `.dc vin ... vdd ...`). |
@@ -168,8 +168,9 @@ Mirrors the Python readers:
 Inputs to Tcl go in environment variables, `SRP_IN`, `SRP_OUT`, and for
 extract and measures `SRP_SIGNALS` (path of a file with one exact signal name
 per line; absent = all). All files are in a `tempfile.TemporaryDirectory()`.
-The input path is passed through `os.path.abspath`. A missing input raises
-`FileNotFoundError` before WaveView starts. `plot != 0` raises `ValueError`
+The input path is passed through `os.path.realpath` on POSIX (the file that the
+kernel opens: `a/link/..` is resolved after the link) and `os.path.abspath` on
+Windows. A missing input raises `FileNotFoundError` before WaveView starts. `plot != 0` raises `ValueError`
 (WaveView reads only the first plot).
 
 ### Tcl scripts (`src/spice_result_parser/tcl/`)
@@ -186,10 +187,14 @@ title<TAB><title, trimmed>
 xname<TAB><xname of the first signal>
 param<TAB><name>              (one per sweep parameter, in order)
 sweep<TAB><value>...           (one per trace: each parameter's value, %g; none when not swept)
-signal<TAB><name><TAB><real|complex>
+signal<TAB><name><TAB><real|complex><TAB><npoints>
 ...
 srp_done
 ```
+
+Each name goes through `encoding convertfrom utf-8 [encoding convertto utf-8 ...]`
+in all three scripts: WaveView gives the bytes of the file, and a Latin-1 byte would
+not equal the name in `SRP_SIGNALS` (and `puts` can lose the end of its line).
 
 A file that does not open (empty list): write `error<TAB>cannot open <path>`
 and `srp_done`. Python raises `WaveViewError` with that text plus the console
@@ -218,8 +223,9 @@ characters or more, is tried as its 8.3 short name on Windows.
 `read_measures.tcl`: `set tcl_precision 17`; for every selected signal object,
 in file order, `column<TAB><name>` followed by one line per point (`<y>`), from
 a POINT scan; then `srp_done`. Two columns can have one name (a measure named
-as a `.data` parameter, `index` or `temper`): both are written, and Python keeps
-the first, as `measure.read_measures` does.
+as a `.data` parameter, `index` or `temper`): both are written, and Python gives
+the second one the suffix `#<column>` (`measure._unique`), as `measure.read_measures`
+does.
 
 Header comments in each script say how to run it by hand, e.g.
 `SRP_IN=run.tr0 SRP_OUT=out.txt wv -ace_no_gui list_traces.tcl` (Windows:
@@ -239,10 +245,15 @@ gets `"waveview": float64`):
   plot header (`nutmeg._parse_plot_header`), when it parses.
 - names: per signal, the raw name (see "Name mapping") → `parse_var_name`. A
   named probe (`.probe vo=v(out)`) has the bare name `vo` in the file, and
-  WaveView lists `v(vo)`: when `reader.read_header` reads the header and its
-  name count matches, a header name without `(` that WaveView wraps
-  (`<type>(<name>)`) replaces WaveView's name. Only such names come from the
-  header, because `reader.py` has errors that WaveView does not have.
+  WaveView lists `v(vo)`; `xt.vo=v(xt.n1)` is `xt.v(vo)`. When `reader.read_header`
+  reads the header and its name count matches, the header name replaces WaveView's
+  name if it names the same signal (`_is_own_name`, on WaveView's name with the
+  hierarchy inside the parens): a header name without `(` that this name wraps
+  (`<type>(<name>)`), or the name less its `)` (an unnamed `par('rval')` is
+  `par(rval` in the file and `par(rval)` in WaveView). Only such names come from the
+  header, because `reader.py` has errors that WaveView does not have. When WaveView
+  gives no x name (an HSPICE `post=3` file), x is `TIME` for `.tr#`, `HERTZ` for
+  `.ac#`, else `x`.
   Complex → `ac_names(base, ac_format)`, two columns, `col_raw_names` repeats
   the raw name. Then `_uniquify`.
 - `sweep_params`: `parse_var_name` of each `param`. `nsweepparam` = their count.
@@ -258,22 +269,44 @@ gets `"waveview": float64`):
 - Parse the `extract.tcl` records: split at the record lines, convert each
   value block with numpy (also map `1.#QNAN`, `-1.#IND`, `1.#INF`), and check
   the value count against the line count (some NumPy versions only warn about a
-  value they cannot read, and a warnings filter is not safe in threads). A point
-  count that differs between x and a signal raises `WaveViewError`.
+  value they cannot read, and a warnings filter is not safe in threads). The points
+  of each selected signal (and of the x signal) must be its `npoints` less one per
+  sweep: else `WaveViewError` (WaveView ends a scan early after some values of about
+  1e34 or more). In a file that the console calls not complete they can be more (a
+  cut ASCII file has one more, and the file can grow between the two runs), not
+  fewer. Then the last trace keeps the points that every signal of the file has: each
+  selected signal loses the points of the partial row that `npoints` shows (its
+  `npoints` less the smallest `npoints`). A Nutmeg plot also keeps at most the complete
+  points of `nutmeg.py` (`_nutmeg_complete`: from the size of a binary file, from
+  `nutmeg._scan_ascii` for an ASCII file), because WaveView reads a value that the cut
+  makes short, and the place of the cut decides which signals get a point of the
+  partial row. A point count that still differs between x and a signal raises
+  `WaveViewError`. A Nutmeg value of +-1e30 raises
+  `WaveViewError` (WaveView limits Nutmeg values to +-1e30, and an infinite value
+  changes the whole plot). `extract.tcl` gets `SRP_XCHECK` for a file that is not an
+  HSPICE `post=1`/`post=2` file or Nutmeg (`_shared_x`): it then compares the x of
+  every point of every signal with the x signal, and stops with an error record at
+  the first difference (HSPICE `post=3`: each signal has its own x points). The check
+  makes a large extract about 70 % slower, so it does not run for the other files.
 - AC columns: from the real and imaginary parts with `reader.ac_part`, as the
   Python engine does.
 - Sweep values: the fields of each `sweep` record, read with `float`; a count
   that differs from the parameter count raises `WaveViewError`.
   Unswept: one sweep with `[]`. Swept, with no `sweep` record (a file cut
   inside sweep 0): no sweeps, `truncated=True`, and `extract.tcl` does not run.
-  Nutmeg with a usable `Dimensions` line: the one
-  WaveView trace is split into `_Plot.nsweeps` equal sweeps.
+  Nutmeg with a usable `Dimensions` line: the one WaveView trace is split into
+  sweeps of `npoints // _Plot.nsweeps` points (the plot header's count); a truncated
+  plot keeps the sweeps that it reaches, the last one partial, as `nutmeg.py`.
+  When `extract.tcl` writes more traces than the listing (the simulator ended a sweep
+  between the two runs), the first ones are kept.
 - `sweeps` filter and the closed `xrange` window are applied in Python. Same
   errors as the Python reader (`sweep_set`, `check_sweeps`, `validate_range`).
   For a 9601 file the bounds are rounded to float32 first, as the Python
   engine compares float32 x with them.
-- `truncated`: True when the HSPICE header declares more sweeps than WaveView
-  reads (WaveView drops the partial sweep), with a `RuntimeWarning`.
+- `truncated`: True when WaveView's console says that the file is not complete, when
+  the HSPICE header declares more sweeps than WaveView reads, or when a Nutmeg plot
+  has fewer points than its header, with a `RuntimeWarning`. In a binary HSPICE file
+  WaveView drops the partial sweep; in an ASCII file it reads it.
 - Two signals with one WaveView name raise `WaveViewError` (the scripts find a
   signal by name).
 
@@ -281,8 +314,15 @@ gets `"waveview": float64`):
 `PARAM_COUNT` from the file's first line, read in Python (text, 4096 bytes),
 with the rule of `measure._leading_columns`: `PARAM_COUNT` counts the leading
 columns, `index` included. Selection with `measure._select`. Values: float, NaN for
-failed; `failed` = NaN count per kept column. `nrows` = points of the first
-signal. `truncated=False`.
+failed; `failed` = NaN count per kept column, after the cut below. The title comes
+from the `.TITLE` line of the file (WaveView cuts a long title). WaveView reads the
+values of a row that the end of the file cuts, also a value that the cut makes short,
+so the file text gives the count of the values after `alter#`. When the column counts
+agree (WaveView's columns and `alter#`), `nrows` = the values // the column count,
+`truncated` = a remainder, and a WaveView column with fewer than `nrows` values raises
+`WaveViewError` (an early end of the scan, as in `read_traces`). Otherwise `nrows` =
+the smallest column, and `truncated` when the columns differ. A truncated file warns
+with the `RuntimeWarning` of `measure.read_measures`.
 
 ### Name mapping
 
@@ -295,6 +335,7 @@ rewritten:
    `v(x1.x2.n1)` and `x1.v(a,b)` → `v(x1.a,x1.b)` (WaveView takes out only the
    path that all nodes share).
 2. `par(<name>)`, `deriv(<name>)`, `integ(<name>)`, `noise(<name>)` → `<name>`
+   (a name: `[A-Za-z_][\w.$#\[\]<>:]*`, not an expression)
    (WaveView's names of `.probe vm=par('...')`, `dv=deriv(...)`, `ig=integ(...)`
    and the `.noise` columns), and `power(` → `p(` (WaveView's name of
    `.probe p(r9)`). Other named probes (`v(vo)`, `i(io)`, `vdb(vodb)`) need the
@@ -344,10 +385,16 @@ through the existing generic error branch (`WaveViewError: ...`).
   parameter). Fixed in `measure._leading_columns`, for both engines.
 - A Monte Carlo `.mt0` has `$OPTION ...` lines before `.TITLE`. The Python
   reader takes them for the title and the names and reads 0 rows. Not fixed.
-- A binary (9601/2001) header with more than about 330 names goes on in the
-  next blocks; the Python reader read only block 0 and raised "header lists N
-  tokens". Fixed in `reader._read_binary_header` (found in the second review
-  round). It also gave the WaveView engine no header for such files.
+- A binary (9601/2001) header longer than one block (about 8 KB of text: about
+  330 short names, fewer with names of 16 characters or more) goes on in the next
+  blocks; the Python reader read only block 0 and raised "header lists N tokens".
+  Fixed in `reader._read_binary_header` (found in the second review round). It also
+  gave the WaveView engine no header for such files. A header without `$&%#` followed
+  by a data block (a NUL byte) is read as it is, as before.
+- A measure named as a `.data` parameter, `index` or `temper` gave the values of the
+  first column of that name in both engines. Fixed with `measure._unique` (third
+  review round): the second column gets the suffix `#<column>`, and more suffixes when
+  another column already has that name.
 
 ## Left to the builder
 

@@ -1,0 +1,11 @@
+srp_listing	1
+title	* values of 1e33 to 1e36: waveview ends its scan early on some o
+xname	TIME
+signal	v(0)	real	122
+signal	v(g33)	real	122
+signal	v(g34)	real	122
+signal	v(g36)	real	122
+signal	v(h34)	real	122
+signal	v(in)	real	122
+signal	i(vin)	real	122
+srp_done

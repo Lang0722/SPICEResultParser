@@ -1,0 +1,20 @@
+Title: a latin-1 name
+Date: Thu Oct 29 2026
+Plotname: Transient Analysis
+Flags: real
+No. Variables: 3
+No. Points: 3
+Variables:
+	0	time	time
+	1	v(é)	voltage
+	2	v(x)	voltage
+Values:
+ 0	0.000000000000000e+00
+	0.000000000000000e+00
+	0.000000000000000e+00
+ 1	1.000000000000000e-09
+	5.000000000000000e-01
+	2.500000000000000e-01
+ 2	2.000000000000000e-09
+	1.000000000000000e+00
+	5.000000000000000e-01

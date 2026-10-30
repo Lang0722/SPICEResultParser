@@ -16,7 +16,8 @@ import sys
 VM = os.environ.get("SRP_VM", "Windows 11")
 WV = os.environ.get("SRP_VM_WV", r"C:\synopsys\Custom WaveView O-2018.09-SP2\wv.exe")
 HOME = os.path.realpath(os.path.expanduser("~"))
-FORWARDED = ("SRP_IN", "SRP_OUT", "SRP_SIGNALS")
+FORWARDED = ("SRP_IN", "SRP_OUT", "SRP_SIGNALS")     # paths
+FLAGS = ("SRP_XCHECK",)                             # values, forwarded as they are
 
 
 def vm_path(path: str) -> str:
@@ -32,6 +33,7 @@ def main(argv) -> int:
     script = argv[-1]
     options = argv[:-1]
     sets = [f'set "{name}={vm_path(os.environ[name])}"' for name in FORWARDED if name in os.environ]
+    sets += [f'set "{name}={os.environ[name]}"' for name in FLAGS if name in os.environ]
     command = " && ".join(sets + [f'"{WV}" {" ".join(options)} "{vm_path(script)}"'])
     proc = subprocess.run(["prlctl", "exec", VM, "cmd", "/c", command], stdin=subprocess.DEVNULL)
     return proc.returncode

@@ -1,0 +1,23 @@
+srp_measures	1
+title	* rc sweep test
+column	rval
+1000.0
+2000.0
+4000.0
+column	tdel
+6.9230000000000003e-007
+1.3879999999999999e-006
+2.7810000000000001e-006
+column	vmax
+0.99399999999999999
+0.92579999999999996
+0.77329999999999999
+column	never
+1.#QNAN
+1.#QNAN
+1.#QNAN
+column	temper
+25.0
+25.0
+2.0
+srp_done

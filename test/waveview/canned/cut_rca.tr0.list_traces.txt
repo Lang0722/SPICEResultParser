@@ -1,0 +1,12 @@
+srp_listing	1
+title	* rc sweep ascii
+xname	TIME
+param	rval
+sweep	1000
+sweep	2000
+sweep	4000
+signal	v(0)	real	221
+signal	v(in)	real	221
+signal	v(out)	real	221
+signal	i(vin)	real	221
+srp_done

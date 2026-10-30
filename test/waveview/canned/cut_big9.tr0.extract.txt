@@ -1,0 +1,11 @@
+srp_extract	1
+trace	0
+x	v(0)
+real	v(0)
+real	v(g33)
+real	v(g34)
+real	v(g36)
+real	v(h34)
+real	v(in)
+real	i(vin)
+srp_done

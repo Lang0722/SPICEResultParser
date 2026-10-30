@@ -75,6 +75,7 @@ PARITY = {
     WV / "expr.tr0": 0.0,           # vd=v(in,out) dv=deriv(...) x1.loc=par(...)
     WV / "diff2_9.tr0": 0.0,        # v(x1.xl.n1,x1.xl.b): WaveView lists x1.xl.v(n1,b)
     WV / "l340_9.tr0": 0.0,         # 344 names: the header goes on in a second block
+    WV / "names2_9.tr0": 0.0,       # xt.pw=p(xt.x2.r2), my$x=par(...), par('rval'): WaveView lists xt.power(pw)...
 }
 POST_2013 = ("rc.tr0", "rc.ac0", "rc.sw0", "two.tr0", "single.tr0", "single.ac0", "single.sw0")
 MEASURES = (HERE / "test.mt0", WV / "rc.mt0", WV / "rc.ma0", WV / "rc.ms0", WV / "two.mt0", WV / "d1.mt0",
@@ -153,6 +154,16 @@ class TestParity(Base):
                 want = read_traces(HERE / "test_9601.tr0", ["v(vo"], xrange=window)
                 self.assertEqual(got.data["TIME"][0].size, size)
                 self.assert_same(got, want, 0.0)
+
+    def test_names_without_the_header(self):
+        # names2.tr0 is the post_version 2013 twin of names2_9.tr0: no header for the Python
+        # reader. Named expressions get the file's names; named probes keep WaveView's names, and
+        # an unnamed par('rval') cannot be told from rval=par(...).
+        got = api.list_traces(WV / "names2.tr0", engine="waveview")["traces"]
+        twin = api.list_traces(WV / "names2_9.tr0")["traces"]
+        self.assertEqual(got[4:7], twin[4:7])                       # my$x q[0] dv$
+        self.assertEqual(got[:4], ["v_top", "v_xt_x2_deep", "p_xt_pw", "i_xt_io"])
+        self.assertEqual(got[7:9], ["rval", "temper"])
 
     def test_power_and_par_selection(self):
         for names in (["p(rbus)"], ["p_rbus"], ["myexpr"]):
@@ -268,10 +279,40 @@ class TestMeasures(Base):
                 got = measure.read_measures(path, engine="waveview")
                 want = measure.read_measures(path)
                 self.assertEqual(got.names, [n for n in want.names if n != "alter#"])
-                self.assertEqual((got.title, got.params, got.rows, got.failed),
-                                 (want.title, want.params, want.rows, want.failed))
+                self.assertEqual((got.title, got.params, got.rows, got.failed, got.truncated),
+                                 (want.title, want.params, want.rows, want.failed, want.truncated))
                 for name in got.names:
                     self.assert_values(got.values[name], want.values[name], 1e-15, msg=name)
+
+    def test_cut_files_and_a_long_title(self):
+        # WaveView reads the values of a cut row, also a value that the cut makes short, and it
+        # cuts a long title: the engine takes the count of the values and the title from the file.
+        data = (WV / "rc.mt0").read_bytes()
+        row3 = data.index(b"  4.000e+03")
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, text in (("cut_rc.mt0", data[:data.index(b"2.781e-06", row3) + 9]),
+                               ("cut2_rc.mt0", data[:data.index(b"25.0000", row3) + 1]),
+                               ("title.mt0", data.replace(b"* rc sweep test", b"* " + b"a long title " * 9))):
+                with self.subTest(name):
+                    path = Path(tmp) / name
+                    path.write_bytes(text)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        got = measure.read_measures(path, engine="waveview")
+                        want = measure.read_measures(path)
+                    self.assertEqual((got.title, got.rows, got.truncated, got.failed),
+                                     (want.title, want.rows, want.truncated, want.failed))
+                    self.assertEqual(got.truncated, name != "title.mt0")
+                    for n in got.names:
+                        self.assert_values(got.values[n], want.values[n], 1e-15, msg=n)
+
+    def test_scan_that_stops_early(self):
+        # vmax = 1e34 in row 1 of 3: WaveView reads one value of vmax, and gives no error.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "big34.mt0"
+            path.write_bytes((WV / "rc.mt0").read_bytes().replace(b"0.9940", b"1.0e+34"))
+            with self.assertRaisesRegex(WaveViewError, "reads 1 of the 3 values of vmax"):
+                measure.read_measures(path, engine="waveview")
 
     def test_param_count_includes_index(self):
         for name, params in (("two.mt0", ["rval", "cval"]), ("d1.mt0", ["rval"]), ("mc.mt0", [])):
@@ -290,6 +331,18 @@ class TestMeasures(Base):
 
 
 class TestPaths(Base):
+    @unittest.skipIf(os.name == "nt", "POSIX applies a/link/.. after the link")
+    def test_path_through_a_symbolic_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run42 = Path(tmp) / "data" / "run42"
+            run42.mkdir(parents=True)
+            shutil.copy(WV / "rc9.tr0", run42.parent / "rc9.tr0")
+            (Path(tmp) / "results").mkdir()
+            (Path(tmp) / "results" / "latest").symlink_to(run42)
+            shutil.copy(WV / "single.tr0", Path(tmp) / "results" / "rc9.tr0")     # not the file
+            path = Path(tmp) / "results" / "latest" / ".." / "rc9.tr0"
+            self.assert_same(waveview.read_traces(path, ["v(out"]), read_traces(path, ["v(out"]), 0.0)
+
     def test_spaces_and_accents(self):
         # sx_open_sim_file_read splits its argument as a Tcl list, and it cannot open a
         # non-ASCII path; the scripts pass one list element and fall back to the 8.3 short
@@ -365,11 +418,88 @@ class TestFailures(Base):
                     warnings.simplefilter("ignore")
                     ts = waveview.read_traces(cut, ["v(out"])
                 self.assertEqual((ts.truncated, ts.sweep_values, ts.data["v_out"]), (True, [], []), name)
-            flat = Path(tmp) / "trunc_9601.tr0"
-            flat.write_bytes((HERE / "test_9601.tr0").read_bytes()[:26328])
-            with self.assertRaisesRegex(WaveViewError, "points for .* x values in trace 0; the file is probably "
-                                                       "truncated"):
-                waveview.read_traces(flat)
+            # WaveView prints "not complete" for an unswept file and an ASCII file too. It reads
+            # fewer points of a cut binary file than the Python engine, and the same points of a
+            # cut ASCII file. A cut Nutmeg plot keeps the sweeps of its Dimensions that it reaches.
+            dims, rca = (WV / "dims.raw").read_bytes(), (WV / "rca.tr0").read_bytes()
+            for name, data, sweeps, same in (
+                    ("trunc_9601.tr0", (HERE / "test_9601.tr0").read_bytes()[:26328], [0], False),
+                    ("cut_rca.tr0", rca[:int(len(rca) * 0.97)], [0, 1, 2], True),
+                    ("cut_dims2.raw", dims[:dims.index(b" 3\t")], [0, 1], True),
+                    ("cut_dims.raw", dims[:dims.index(b"\n 3\t")], [0], True)):
+                with self.subTest(name):
+                    cut = Path(tmp) / name
+                    cut.write_bytes(data)
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        ts = waveview.read_traces(cut)
+                        want = read_traces(cut)
+                    self.assertEqual((ts.truncated, ts.sweep_indices, want.sweep_indices), (True, sweeps, sweeps))
+                    self.assertTrue(any("probably truncated" in str(w.message) for w in caught))
+                    for n in ts.selected:
+                        for a, b in zip(ts.data[n], want.data[n]):
+                            self.assertGreater(a.size, 0, n)
+                            if same:
+                                self.assertEqual(a.size, b.size, n)
+                            self.assert_values(a, b[:a.size], 1e-15, msg=n)
+            # Each selection keeps the points that every signal has: in cut_t9601.tr0 i(vs) has
+            # no point of the partial row. A cut Nutmeg plot keeps the complete points of nutmeg.py.
+            cut = Path(tmp) / "trunc_9601.tr0"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                sizes = {a[0].size for names in (None, ["v(vo"], ["i(vs"])
+                         for a in waveview.read_traces(cut, names).data.values()}
+            self.assertEqual(len(sizes), 1, sizes)
+            p3 = dims.index(b"\n 3\t") + 1
+            x_end = p3 + dims[p3:].index(b"\n") + 1
+            vo_end = x_end + dims[x_end:].index(b"\n")
+            for name, size in (("cutn_index.raw", p3 + 2), ("cutn_row.raw", x_end + 7), ("cutn_value.raw", vo_end + 8)):
+                cut = Path(tmp) / name
+                cut.write_bytes(dims[:size])
+                for names in (None, ["v(out)"], ["i(v1)"]):
+                    with self.subTest(name, names=names), warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        ts, want = waveview.read_traces(cut, names), read_traces(cut, names)
+                        self.assertEqual((ts.truncated, ts.sweep_indices), (True, want.sweep_indices))
+                        self.assert_same(ts, want, 1e-15)
+            # WaveView reads no point of a file cut inside its only data block.
+            cut = Path(tmp) / "cut_big9.tr0"
+            big9 = (WV / "big9.tr0").read_bytes()
+            cut.write_bytes(big9[:int(len(big9) * 0.95)])
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                ts = waveview.read_traces(cut, ["v(in"])
+            self.assertEqual((ts.truncated, [a.size for a in ts.data["v_in"]]), (True, [0]))
+
+    def test_scan_that_stops_early(self):
+        # WaveView ends its scan of v(g34), v(h34) and v(g36) (values of 5e33 to 1e36) after 100
+        # of 122 points, and gives no error: the engine checks the count of each signal.
+        for names in (["v(g36"], ["v(g33", "v(h34"]):
+            with self.subTest(names[-1]), self.assertRaisesRegex(WaveViewError, "reads 100 of the 122 points"):
+                waveview.read_traces(WV / "big9.tr0", names)
+        self.assert_same(waveview.read_traces(WV / "big9.tr0", ["v(g33", "v(in"]),
+                         read_traces(WV / "big9.tr0", ["v(g33", "v(in"]), 0.0)
+
+    def test_signals_with_their_own_x_points(self):
+        # post=3: v(a) and v(b) have 7 points each, at other times. The Python reader rejects the file.
+        with self.assertRaisesRegex(WaveViewError, "v\\(b\\) has other x points than v\\(a\\); extract one signal"):
+            waveview.read_traces(WV / "post3.tr0", ["v(a", "v(b"])
+        for name, x in (("v(a", [0, 1e-9, 2e-9, 4e-9]), ("v(b", [0, 1.5e-9, 2.5e-9, 4e-9])):
+            ts = waveview.read_traces(WV / "post3.tr0", [name])
+            self.assertEqual(ts.selected[0], "TIME")
+            for t in x:     # the pwl breakpoints are among the x points of the signal
+                self.assertTrue(np.isclose(ts.data["TIME"][0], t, rtol=0, atol=1e-15).any(), (name, t))
+
+    def test_nutmeg_values_beyond_the_limit(self):
+        for name in ("nutbig.raw", "nutinf.raw"):
+            with self.subTest(name), self.assertRaisesRegex(WaveViewError, "above 1e\\+30"):
+                waveview.read_traces(WV / name)
+
+    def test_name_with_a_latin1_byte(self):
+        ts = waveview.read_traces(WV / "latin1.raw", ["v(\u00e9)"])
+        self.assertEqual(ts.selected, ["time", "v_\u00e9"])
+        self.assert_values(ts.data["v_\u00e9"][0], [0.0, 0.5, 1.0], 0.0)
+        self.assertEqual(waveview.read_traces(WV / "latin1.raw").selected, ["time", "v_\u00e9", "v_x"])
 
     def test_nothing_is_written_beside_the_scripts(self):
         # WaveView writes ace_tcl.log beside the script it runs; the engine runs a copy.

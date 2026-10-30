@@ -3,17 +3,22 @@
 test/waveview/fake_wv.py stands in for WaveView on any OS: it serves real output of
 the Tcl scripts, recorded on WaveView O-2018.09-SP2 (Windows 11, CRLF line ends), from
 test/waveview/canned/. The HSPICE files in test/waveview/ come from HSPICE P-2019.06
-running the .sp netlists beside them: rc/two/single are binary post_version 2013 (the
-Python reader rejects them), rc9/two9/odd/dc2 binary 9601, rca/twoa/deep ASCII, and
-d1.mt0/mc.mt0 measure files. ng_dc.raw comes from ngspice-47; dims.raw and dupnut.raw
-are written by hand. The tests against the real WaveView are in test_waveview_e2e.py.
+running the .sp netlists beside them: rc/two/single/names2 are binary post_version 2013
+(the Python reader rejects them), rc9/two9/odd/dc2/names2_9/big9 binary 9601, rca/twoa/deep
+ASCII, post3 an HSPICE post=3 file, and d1.mt0/mc.mt0 measure files. ng_dc.raw comes from
+ngspice-47; dims.raw, dupnut.raw, nutinf.raw, nutbig.raw and latin1.raw are written by hand.
+The canned outputs of cut files (cut_*, trunc_*) come from copies cut as the tests cut
+them. The tests against the real WaveView are in test_waveview_e2e.py.
 """
 import asyncio
 import json
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import warnings
@@ -26,7 +31,7 @@ HERE = Path(__file__).parent.resolve()
 WV = HERE / "waveview"
 FAKE = WV / "fake_wv.py"
 
-from spice_result_parser import api, measure, waveview  # noqa: E402
+from spice_result_parser import api, measure, nutmeg, waveview  # noqa: E402
 from spice_result_parser.reader import read_header, read_traces  # noqa: E402
 from spice_result_parser.waveview import WaveViewError  # noqa: E402
 
@@ -195,6 +200,20 @@ class TestNames(unittest.TestCase):
         # dv=deriv('...'), ig=integ('...') and the .noise columns: the file has the bare name.
         for wv_name, raw in (("deriv(dv)", "dv"), ("integ(ig)", "ig"), ("noise(outnoise)", "outnoise")):
             self.assertEqual(waveview.raw_name(wv_name, False), raw)
+        # Names with $ # [ ] < > (my$x=par(...)): HSPICE allows them; an operator is not a name.
+        for wv_name, raw in (("par(my$x)", "my$x"), ("par(q[0])", "q[0]"), ("deriv(dv$)", "dv$"),
+                             ("integ(ig#)", "ig#"), ("par(w<1>)", "w<1>"), ("par(v(in)*3)", "par(v(in)*3"),
+                             ("par(rval*2)", "par(rval*2")):
+            self.assertEqual(waveview.raw_name(wv_name, False), raw)
+
+    def test_header_names(self):
+        # The file's bare name of a named probe or expression, and an unnamed expression.
+        for unfolded, own in (("v(vo)", "vo"), ("v(xt.vo)", "xt.vo"), ("power(xt.pw)", "xt.pw"),
+                              ("par(my$x)", "my$x"), ("par(rv)", "par(rv"), ("v(out)", "v(out")):
+            self.assertTrue(waveview._is_own_name(unfolded, own), (unfolded, own))
+        for unfolded, own in (("v(x1.vo)", "vo"), ("v(a)", "v(b"), ("power(r9)", "p(r9"), ("v(xt.inner)", "1:inner")):
+            self.assertFalse(waveview._is_own_name(unfolded, own), (unfolded, own))
+        self.assertEqual(waveview._unfold("xt.x2.v(deep)"), "v(xt.x2.deep)")
 
     def test_sweep_conditions(self):
         # One value per parameter in parameter order, as %g: 'M' (mega) of the withname
@@ -304,6 +323,20 @@ class TestListTraces(FakeWaveView):
                 self.assertEqual(got["traces"], api.list_traces(WV / name)["traces"])
                 self.assertEqual(waveview.read_header(WV / name).raw_names, read_header(WV / name).raw_names)
 
+    def test_hierarchical_named_probes_and_expressions(self):
+        # xt.pw=p(xt.x2.r2): WaveView lists xt.power(pw). par('rval'): par(rval), as a named rval=par().
+        want = ["top", "xt_x2_deep", "xt_pw", "xt_io", "my$x", "q[0]", "dv$", "par_rval", "par_temper", "par_v",
+                "v_in"]
+        self.assertEqual(api.list_traces(WV / "names2_9.tr0")["traces"], want)
+        self.assertEqual(api.list_traces(WV / "names2_9.tr0", engine="waveview")["traces"], want)
+        ts = waveview.read_traces(WV / "names2_9.tr0", ["xt.pw", "par(rval"])
+        self.assertEqual(ts.selected, ["TIME", "xt_pw", "par_rval"])
+        # Without the header (post_version 2013): a named probe keeps WaveView's name, and an
+        # unnamed par('rval') cannot be told from rval=par(...).
+        got = api.list_traces(WV / "names2.tr0", engine="waveview")["traces"]
+        self.assertEqual(got, ["v_top", "v_xt_x2_deep", "p_xt_pw", "i_xt_io", "my$x", "q[0]", "dv$", "rval", "temper",
+                               "par_v", "v_in"])
+
     def test_hierarchical_differential_probes(self):
         # WaveView lists v(x1.xl.n1,x1.xl.b) as x1.xl.v(n1,b), and v(x1.xl.n1,b) as it is.
         got = api.list_traces(WV / "diff2_9.tr0", engine="waveview")
@@ -341,6 +374,21 @@ class TestListTraces(FakeWaveView):
         # extract.tcl addresses a signal by its name: refuse, as both columns would get one signal.
         with self.assertRaisesRegex(WaveViewError, "two signals named v\\(out\\).*engine='python'"):
             api.list_traces(WV / "dupnut.raw", engine="waveview")
+
+    def test_post3_file(self):
+        # In an HSPICE post=3 file each signal has its own x points, and WaveView gives no x name.
+        header, listing = waveview._listing(str(WV / "post3.tr0"), 0, "magphase")
+        self.assertEqual((header.x_name, listing.shared_x), ("TIME", False))
+        for path in (TR, WV / "rc.tr0", WV / "rca.tr0", WV / "twoa.tr0"):    # binary 9601 and 2013, ASCII
+            self.assertTrue(waveview._shared_x(str(path)), path.name)
+        self.assertTrue(waveview._listing(str(NUTMEG), 0, "magphase")[1].shared_x)
+
+    def test_header_read_sets_no_warnings_filter(self):
+        # A warnings filter is not safe in threads: an overlap leaves "ignore" for the process.
+        with mock.patch.object(waveview.warnings, "catch_warnings", side_effect=AssertionError("a filter")), \
+                mock.patch.object(waveview.warnings, "simplefilter", side_effect=AssertionError("a filter")):
+            self.assertEqual(api.list_traces(WV / "named3_9.tr0", engine="waveview")["traces"],
+                             api.list_traces(WV / "named3_9.tr0")["traces"])
 
     def test_post_version_2013_sweep(self):
         with self.assertRaisesRegex(ValueError, "unsupported post_version '2013'"):
@@ -442,12 +490,37 @@ class TestReadTraces(FakeWaveView):
                 waveview.read_traces(TR, ["nope"])
         self.assertEqual([c.args[0] for c in run.call_args_list], ["list_traces.tcl"])
 
-    def test_point_count_mismatch_says_truncated(self):
-        short = [(np.arange(3.0), {"v(vo)": np.arange(2.0)})]
+    def test_point_count_mismatch(self):
+        # A complete file: the points must be WaveView's count of them (2605 for test_9601.tr0).
+        short = [(np.arange(3.0), {"v(vo)": np.arange(3.0)})]
         with mock.patch.object(waveview, "_parse_points", return_value=short):
-            with self.assertRaisesRegex(WaveViewError, "wrote 2 points for v\\(vo\\) and 3 x values in trace 0; "
-                                                       "the file is probably truncated"):
+            with self.assertRaisesRegex(WaveViewError, "reads 3 of the 2605 points of v\\(vo\\): WaveView stops "
+                                                       "early on some values of about 1e34"):
                 waveview.read_traces(TR, ["v(vo"])
+        short = [(np.arange(3.0), {"v(vo)": np.arange(2.0)})]
+        with mock.patch.object(waveview, "_parse_points", return_value=short), \
+                mock.patch.object(waveview, "_check_counts"):
+            with self.assertRaisesRegex(WaveViewError, "wrote 2 points for v\\(vo\\) and 3 x values in trace 0: "
+                                                       "the signals have their own x points"):
+                waveview.read_traces(TR, ["v(vo"])
+
+    def test_scan_that_stops_early(self):
+        # WaveView ends the scan of v(g36) (up to 1e36) after 100 of its 122 points, without an error.
+        with self.assertRaisesRegex(WaveViewError, "reads 100 of the 122 points of v\\(g36\\)"):
+            waveview.read_traces(WV / "big9.tr0", ["v(g36"])
+        with self.assertRaisesRegex(WaveViewError, "reads 100 of the 122 points of v\\(g34\\)"):
+            waveview.read_traces(WV / "big9.tr0", ["v(g33", "v(g34"])
+        self.assert_same_traces(waveview.read_traces(WV / "big9.tr0", ["v(g33", "v(in"]),
+                                read_traces(WV / "big9.tr0", ["v(g33", "v(in"]))
+        # Also when WaveView says that the file is not complete: no trim of the other signals.
+        run = waveview.run_script
+        cut = lambda *a: run(*a) + "   *** waveform file 'big9.tr0' not complete ! ***\r\n"
+        with mock.patch.object(waveview, "run_script", side_effect=cut), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for names in (["v(g36", "v(in"], ["v(in", "v(g36"]):
+                with self.subTest(names), self.assertRaisesRegex(WaveViewError, "reads 100 of the 122 points of "
+                                                                                "v\\(g36\\)"):
+                    waveview.read_traces(WV / "big9.tr0", names)
 
     def test_truncated_sweep(self):
         # rc9.tr0 cut inside sweep 1: WaveView reads sweep 0 only, the header declares 3.
@@ -472,8 +545,9 @@ class TestReadTraces(FakeWaveView):
 
     def test_no_complete_sweep(self):
         # A swept file cut inside sweep 0: WaveView lists the parameter, and no sweep.
-        for name, source, warning in (("cut_rc9.tr0", "rc9.tr0", "declares 3 sweeps and WaveView reads 0 complete"),
-                                      ("cut_rc.tr0", "rc.tr0", ": WaveView reads 0 complete sweeps")):
+        for name, source, warning in (("cut_rc9.tr0", "rc9.tr0", "declares 3 sweeps and WaveView reads 0: the file is "
+                                                                 "probably truncated, and WaveView drops its partial"),
+                                      ("cut_rc.tr0", "rc.tr0", ": WaveView reads no complete sweep: the file")):
             with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / name
                 path.write_bytes((WV / source).read_bytes()[:1200])
@@ -489,6 +563,132 @@ class TestReadTraces(FakeWaveView):
                     warnings.simplefilter("ignore")
                     with self.assertRaisesRegex(ValueError, "holds 0 sweeps \\(none\\) \\(the file is truncated\\)"):
                         waveview.read_traces(path, sweeps=[0])
+
+    def cut(self, tmp, name, source, size):
+        """A copy of source cut to size bytes (size < 1: that part of the file), as the canned files were made."""
+        data = Path(source).read_bytes()
+        path = Path(tmp) / name
+        path.write_bytes(data[:size if size >= 1 else int(len(data) * size)])
+        return path
+
+    def test_truncation_from_the_console(self):
+        # WaveView prints "waveform file ... not complete" for a cut file: also for a 2013 file
+        # (no header for the Python reader), an unswept file and an ASCII file.
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, source, size, sweeps, lost in (("cut_t9601.tr0", TR, 0.6, [0], "its last sweep is partial"),
+                                                     ("cut_rca.tr0", WV / "rca.tr0", 0.97, [0, 1, 2],
+                                                      "its last sweep is partial")):
+                with self.subTest(name):
+                    path = self.cut(tmp, name, source, size)
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        ts = waveview.read_traces(path)
+                        want = read_traces(path)
+                    messages = [str(w.message) for w in caught]
+                    self.assertTrue(any("WaveView reports that the file is not complete: the file is probably "
+                                        f"truncated, and {lost}" in m for m in messages), messages)
+                    self.assertEqual((ts.truncated, ts.sweep_indices), (True, sweeps))
+                    self.assertEqual(want.sweep_indices, sweeps)
+                    for n in ts.selected:       # the points that WaveView reads are the file's points
+                        for got, ref in zip(ts.data[n], want.data[n]):
+                            self.assertGreater(got.size, 0)
+                            np.testing.assert_array_equal(got, ref[:got.size].astype(np.float64), err_msg=n)
+            # The partial sweep of an ASCII file: WaveView keeps it, as the Python engine does.
+            self.assertEqual([a.size for a in ts.data["v_out"]], [a.size for a in want.data["v_out"]])
+            # In cut_t9601.tr0, i(vs) has no point of the partial last row (-npoints 1228, the
+            # others 1229): every selection keeps 1228 points.
+            path = self.cut(tmp, "cut_t9601.tr0", TR, 0.6)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                for names in (None, ["v(vo"], ["i(vs"]):
+                    ts = waveview.read_traces(path, names)
+                    self.assertEqual({a[0].size for a in ts.data.values()}, {1228}, names)
+
+    def test_cut_inside_the_only_data_block(self):
+        # WaveView reads no point of a binary file cut inside its first data block ("error
+        # reading waveform file"). The Python engine reads its complete points.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.cut(tmp, "cut_big9.tr0", WV / "big9.tr0", 0.95)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                ts = waveview.read_traces(path, ["v(in"])
+            self.assertEqual((ts.truncated, ts.sweep_indices, [a.size for a in ts.data["v_in"]]), (True, [0], [0]))
+            self.assertTrue(any("not complete" in str(w.message) for w in caught))
+
+    def test_truncated_nutmeg_dimensions(self):
+        # dims.raw (Dimensions: 3,2: 3 sweeps of 2 points) cut after 3 of its 6 points: the
+        # sweeps that the file reaches, the last one partial, as nutmeg.py reads them.
+        with tempfile.TemporaryDirectory() as tmp:
+            data = (WV / "dims.raw").read_bytes()
+            path = self.cut(tmp, "cut_dims2.raw", WV / "dims.raw", data.index(b" 3\t"))
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                ts = waveview.read_traces(path, ["v(out)"])
+                want = nutmeg.read_nutmeg_traces(path, ["v(out)"])
+            self.assertEqual((ts.truncated, ts.sweep_indices), (True, [0, 1]))
+            self.assertEqual([a.tolist() for a in ts.data["v_out"]], [[0.0, 0.5], [1.0]])
+            self.assertEqual([a.tolist() for a in want.data["v_out"]], [[0.0, 0.5], [1.0]])
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with self.assertRaisesRegex(ValueError, "sweep index 2 out of range"):
+                    waveview.read_traces(path, sweeps=[2])
+            # Cut inside its last line: that value can be cut short, so the point is dropped.
+            path = self.cut(tmp, "cut_dims.raw", WV / "dims.raw", data.index(b"\n 3\t"))
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                ts = waveview.read_traces(path, ["v(out)"])
+                want = nutmeg.read_nutmeg_traces(path, ["v(out)"])
+            self.assertEqual([a.tolist() for a in ts.data["v_out"]], [[0.0, 0.5]])
+            self.assertEqual([a.tolist() for a in want.data["v_out"]], [[0.0, 0.5]])
+            # Cut inside point 3: after its index, inside v(out) (WaveView reads 4 points of v(out)
+            # and 3 of i(v1)), and inside i(v1) (WaveView reads 4 points of each, the last one
+            # short). Every selection keeps the 3 complete points, as nutmeg.py.
+            p3 = data.index(b"\n 3\t") + 1
+            x_end = p3 + data[p3:].index(b"\n") + 1
+            vo_end = x_end + data[x_end:].index(b"\n")
+            for name, size in (("cutn_index.raw", p3 + 2), ("cutn_row.raw", x_end + 7), ("cutn_value.raw", vo_end + 8)):
+                path = self.cut(tmp, name, WV / "dims.raw", size)
+                for names in (None, ["v(out)"], ["i(v1)"]):
+                    with self.subTest(name, names=names), warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        self.assert_same_traces(waveview.read_traces(path, names), nutmeg.read_nutmeg_traces(path, names))
+
+    def test_file_that_grows_between_the_two_runs(self):
+        # The simulator ends one more sweep after list_traces.tcl: keep the sweeps of the listing.
+        parse = waveview._parse_points
+        with mock.patch.object(waveview, "_parse_points", side_effect=lambda *a: (lambda t: t + t[-1:])(parse(*a))):
+            ts = waveview.read_traces(WV / "rc.tr0", ["v(out"])
+        self.assertEqual(ts.sweep_indices, [0, 1, 2])
+        with mock.patch.object(waveview, "_parse_points", side_effect=lambda *a: parse(*a)[:2]):
+            with self.assertRaisesRegex(WaveViewError, "wrote 2 traces; its listing has 3 \\(the file can have "
+                                                       "changed"):
+                waveview.read_traces(WV / "rc.tr0", ["v(out"])
+
+    def test_signals_with_their_own_x_points(self):
+        # post=3: extract.tcl checks the x points (SRP_XCHECK) and stops at the first other x.
+        with mock.patch.object(waveview, "_run", wraps=waveview._run) as run:
+            with self.assertRaisesRegex(WaveViewError, "the signals have their own x points .*post=3.*v\\(a\\) has "
+                                                       "other x points than v\\(0\\)"):
+                waveview.read_traces(WV / "post3.tr0", ["v_0", "v_a"])
+        self.assertEqual([c.kwargs.get("xcheck") for c in run.call_args_list], [None, True])
+        with mock.patch.object(waveview, "_run", wraps=waveview._run) as run:
+            waveview.read_traces(TR, ["v(vo"])
+        self.assertEqual(run.call_args_list[1].kwargs["xcheck"], False)
+
+    def test_nutmeg_values_beyond_the_limit(self):
+        # WaveView reads 1e35 as 1e30, and inf changes the whole plot (x becomes 0, 0, 0, -1e30).
+        for name in ("nutbig.raw", "nutinf.raw"):
+            with self.subTest(name):
+                with self.assertRaisesRegex(WaveViewError, "above 1e\\+30 .* engine='python'"):
+                    waveview.read_traces(WV / name)
+                self.assertEqual(len(nutmeg.read_nutmeg_traces(WV / name).data["v_s"][0]), 4 if "inf" in name else 3)
+
+    def test_name_with_a_latin1_byte(self):
+        # WaveView gives the bytes of the file: the scripts write each name as valid UTF-8.
+        ts = waveview.read_traces(WV / "latin1.raw")
+        self.assertEqual(ts.selected, ["time", "v_\u00e9", "v_x"])
+        np.testing.assert_array_equal(ts.data["v_\u00e9"][0], [0.0, 0.5, 1.0])
+        self.assertEqual(waveview.read_traces(WV / "latin1.raw", ["v(\u00e9)"]).selected, ["time", "v_\u00e9"])
 
     def test_named_and_differential_probes(self):
         for name in ("named3_9.tr0", "expr.tr0", "diff2_9.tr0"):
@@ -644,6 +844,19 @@ class TestReadTraces(FakeWaveView):
         with self.assertRaisesRegex(WaveViewError, "no result after 0.5 s; set SRP_WAVEVIEW_TIMEOUT"):
             waveview.read_header(TR)
 
+    def test_clean_up_error_does_not_hide_the_error(self):
+        # On Windows a WaveView that outlives a timeout holds its files in the temporary folder.
+        self.fake("sleep")
+        os.environ["SRP_WAVEVIEW_TIMEOUT"] = "0.5"
+        made, mkdtemp = [], tempfile.mkdtemp
+        with mock.patch.object(tempfile, "mkdtemp", side_effect=lambda **k: made.append(mkdtemp(**k)) or made[-1]), \
+                mock.patch("os.unlink", side_effect=PermissionError(13, "in use")), \
+                mock.patch("os.rmdir", side_effect=PermissionError(13, "in use")):
+            with self.assertRaisesRegex(WaveViewError, "no result after 0.5 s"):
+                waveview.read_header(TR)
+        for folder in made:
+            shutil.rmtree(folder)
+
     @unittest.skipIf(os.name == "nt", "POSIX process groups")
     def test_timeout_stops_what_a_launcher_started(self):
         # wv can be a launcher script: the timeout stops also the WaveView it started.
@@ -663,6 +876,62 @@ class TestReadTraces(FakeWaveView):
         else:
             os.kill(pid, 9)
             self.fail("the child of the launcher is still running")
+
+    @unittest.skipIf(os.name == "nt", "POSIX process groups")
+    def test_stop_all(self):
+        # WaveView runs in its own session: a caller that a signal stops calls stop_all first.
+        self.fake("launcher")
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "pid"
+            os.environ["SRP_FAKE_PID"] = str(pid_file)
+            errors = []
+
+            def read():
+                try:
+                    waveview.read_header(TR)
+                except WaveViewError as exc:
+                    errors.append(str(exc))
+
+            thread = threading.Thread(target=read)
+            thread.start()
+            for _ in range(100):
+                if pid_file.exists() and pid_file.read_text():
+                    break
+                time.sleep(0.1)
+            self.assertEqual(len(waveview._running), 1)
+            waveview.stop_all()
+            thread.join(30)
+            self.assertFalse(thread.is_alive())
+            pid = int(pid_file.read_text())
+        self.assertEqual(waveview._running, set())
+        self.assertEqual(len(errors), 1)
+        self.assertIn("no srp_done", errors[0])
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(pid, 9)
+            self.fail("the child of the launcher is still running")
+
+    @unittest.skipIf(os.name == "nt", "POSIX applies a/link/.. after the link")
+    def test_path_through_a_symbolic_link(self):
+        # results/latest/../rc.tr0 with latest -> data/run42 is data/rc.tr0 for the kernel and for
+        # the Python reads of the header; os.path.abspath would give results/rc.tr0.
+        with tempfile.TemporaryDirectory() as tmp:
+            run42 = Path(tmp) / "data" / "run42"
+            run42.mkdir(parents=True)
+            (run42.parent / "rc.tr0").write_bytes((WV / "rc.tr0").read_bytes())
+            (Path(tmp) / "results").mkdir()
+            (Path(tmp) / "results" / "latest").symlink_to(run42)
+            (Path(tmp) / "results" / "rc.tr0").write_bytes(b"not this file")
+            path = Path(tmp) / "results" / "latest" / ".." / "rc.tr0"
+            with mock.patch.object(waveview, "run_script", wraps=waveview.run_script) as run:
+                ts = waveview.read_traces(path, ["v(out"])
+            self.assertEqual({c.args[1]["SRP_IN"] for c in run.call_args_list}, {os.path.realpath(path)})
+            self.assertEqual(ts.sweep_indices, [0, 1, 2])
 
     def test_non_ascii_temporary_folder_in_an_error(self):
         # Windows can give WaveView "?" for such a folder: then no script runs at all.
@@ -741,6 +1010,47 @@ class TestReadMeasures(FakeWaveView):
             ms = measure.read_measures(WV / "mdup.mt0", ["vmax#*"])
         self.assertEqual(ms.names, ["index", "rval", "vmax", "vmax#3"])
 
+    def test_truncated_measure_file(self):
+        # rc.mt0 cut inside row 3, and cut inside its last listed value (25.0000 -> 2): WaveView
+        # reads the values of that row; the engine counts the values of the file text.
+        data = (WV / "rc.mt0").read_bytes()
+        row3 = data.index(b"  4.000e+03")
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, size in (("cut_rc.mt0", data.index(b"2.781e-06", row3) + 9),
+                               ("cut2_rc.mt0", data.index(b"25.0000", row3) + 1)):
+                with self.subTest(name):
+                    path = Path(tmp) / name
+                    path.write_bytes(data[:size])
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        got = measure.read_measures(path, engine="waveview")
+                        want = measure.read_measures(path)
+                    self.assertEqual((got.rows, got.truncated, got.failed), (2, True, {"never": 2}))
+                    self.assertEqual((want.rows, want.truncated, want.failed), (2, True, {"never": 2}))
+                    self.assertTrue(all(v.size == 2 for v in got.values.values()))
+                    np.testing.assert_array_equal(got.values["temper"], [25.0, 25.0])
+                    self.assertEqual(sum("file ends with an incomplete row; keeping 2 complete rows" in str(w.message)
+                                         for w in caught), 2)
+
+    def test_scan_that_stops_early(self):
+        # rc.mt0 with vmax = 1e34 in row 1: WaveView reads 1 of its 3 values, without an error.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "big34.mt0"
+            path.write_bytes((WV / "rc.mt0").read_bytes().replace(b"0.9940", b"1.0e+34"))
+            with self.assertRaisesRegex(WaveViewError, "reads 1 of the 3 values of vmax"):
+                measure.read_measures(path, engine="waveview")
+            self.assertEqual(measure.read_measures(path).values["vmax"].tolist(), [1e34, 0.9258, 0.7733])
+
+    def test_long_title(self):
+        # WaveView cuts a long title: the title comes from the .TITLE line of the file.
+        data = (WV / "rc.mt0").read_bytes()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "title.mt0"
+            path.write_bytes(data.replace(b"* rc sweep test", b"* " + b"a long title that goes on " * 5 + b"to the end"))
+            got = measure.read_measures(path, engine="waveview")
+            self.assertEqual(got.title, measure.read_measures(path).title)
+            self.assertTrue(got.title.endswith("goes on to the end"), got.title)
+
     def test_srp_signals_of_the_caller_is_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "signals.txt").write_text("vmax\n")
@@ -785,6 +1095,15 @@ class TestMcpOutputs(FakeWaveView):
 
     def tools(self):
         return {t.name: t for t in asyncio.run(self.m.server.list_tools())}
+
+    def test_signal_stops_waveview_first(self):
+        with mock.patch.object(waveview, "stop_all") as stop, mock.patch.object(self.m.os, "_exit") as end:
+            self.m._stop(signal.SIGTERM, None)
+        stop.assert_called_once_with()
+        end.assert_called_once_with(128 + signal.SIGTERM)
+        with mock.patch.object(self.m.server, "run"), mock.patch.object(self.m.signal, "signal") as handler:
+            self.m.main()
+        self.assertIn(mock.call(signal.SIGTERM, self.m._stop), handler.call_args_list)
 
     def test_every_tool_takes_engine(self):
         for name, tool in self.tools().items():
