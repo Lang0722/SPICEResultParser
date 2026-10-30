@@ -167,6 +167,12 @@ If a file ends part-way through a row, `read_measures` keeps its complete rows. 
 gives a `RuntimeWarning` and sets `ms.truncated` to `True`. If you pass a measure file to
 `read_traces` or `list_traces`, they raise a `ValueError` that names `read_measures`.
 
+A measure can have the name of a `.data` parameter, of `index` or of `temper`. Then two
+columns have one name. The second column gets the suffix `#<column>`, for example
+`vmax#3`, and a `RuntimeWarning` names the repeated names. If another column already
+has that name, the suffix is added again (`vmax#3#3`). Thus no value is lost:
+`ms.values["vmax"]` holds the parameter, and `ms.values["vmax#3"]` holds the measure.
+
 
 ## Nutmeg rawfiles
 

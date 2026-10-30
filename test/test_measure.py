@@ -79,6 +79,15 @@ class TestSweptFile(unittest.TestCase):
         np.testing.assert_array_equal(ms.values["vdd"], [0.9, 1.0, 1.1])
         np.testing.assert_array_equal(ms.values["tpw"], [1.0e-10, 1.1e-10, 1.2e-10])
 
+    def test_repeated_names(self):
+        # A repeat gets '#<column>'; a name that another column has gets one more suffix.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            names = measure._unique("f.mt0", ["vmax", "vmax#2", "vmax", "vmax", "alter#"])
+        self.assertEqual(names, ["vmax", "vmax#2", "vmax#2#2", "vmax#3", "alter#"])
+        self.assertEqual([str(w.message) for w in caught],
+                         ["f.mt0: repeated measure names disambiguated with '#<column>': vmax"])
+
     def test_failed_measure_is_nan(self):
         ms = read_measures(self.path)
         np.testing.assert_array_equal(np.isnan(ms.values["tpd"]), [False, True, False])

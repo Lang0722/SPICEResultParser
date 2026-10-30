@@ -63,6 +63,25 @@ def _leading_columns(all_names: List[str], param_count: int) -> Tuple[List[str],
     return index, all_names[len(index):param_count]
 
 
+def _unique(path: str, names: List[str]) -> List[str]:
+    """Make the names 1:1 with columns: a repeat (a measure named as a .data parameter,
+    index or temper) gets a '#<column_index>' suffix, as reader._uniquify does for traces."""
+    seen, taken, out, repeated = set(), set(names), [], []
+    for i, name in enumerate(names):
+        if name in seen:
+            repeated.append(name)
+            name = f"{name}#{i}"
+            while name in taken:            # another column has that name (HSPICE allows '#')
+                name += f"#{i}"
+            taken.add(name)
+        seen.add(name)
+        out.append(name)
+    if repeated:
+        warnings.warn(f"{path}: repeated measure names disambiguated with '#<column>': "
+                      f"{', '.join(sorted(set(repeated)))}", RuntimeWarning)
+    return out
+
+
 def _select(all_names: List[str], always: List[str], names) -> List[str]:
     """Kept columns in file order: `always` plus every exact or glob match of names."""
     if names is None:
@@ -85,6 +104,8 @@ def read_measures(path, names=None, engine: Optional[str] = None) -> MeasureSet:
     column and the swept parameters are always kept, so each row stays identifiable.
     A value written as `failed` becomes NaN and is counted in `failed`. A file that ends
     part-way through a row keeps its complete rows, with a RuntimeWarning and `truncated` True.
+    A repeated name (a measure named as a .data parameter, index or temper) gets a
+    '#<column>' suffix from its second column on (vmax#3), with a RuntimeWarning.
     engine: "python" or "waveview" (waveview.read_measures); None uses SRP_ENGINE, else "python".
     """
     from . import waveview          # imported here: waveview.py builds on this module
@@ -109,7 +130,7 @@ def read_measures(path, names=None, engine: Optional[str] = None) -> MeasureSet:
     if _LAST_NAME not in tokens:
         raise ValueError(f"{path}: measure names do not end with {_LAST_NAME!r}")
     end = tokens.index(_LAST_NAME) + 1
-    all_names, value_tokens = tokens[:end], tokens[end:]
+    all_names, value_tokens = _unique(path, tokens[:end]), tokens[end:]
     ncols = len(all_names)
     nrows = len(value_tokens) // ncols
     if len(value_tokens) % ncols:

@@ -548,21 +548,21 @@ def read_measures(path, names=None) -> measure.MeasureSet:
         raise WaveViewError("WaveView (read_measures.tcl): the output does not start with 'srp_measures'")
     marks = list(_RECORD.finditer(text, 0, end))
     title = ""
-    all_names: List[str] = []
-    columns: Dict[str, np.ndarray] = {}
+    wv_names: List[str] = []
+    arrays: List[np.ndarray] = []
     for i, mark in enumerate(marks):
         if mark.group(1) == "title":
             title = mark.group(2)
         elif mark.group(1) == "column":
-            name = mark.group(2)
-            all_names.append(name)
-            if name not in columns:     # a measure named as a parameter: the first column, as measure.py
-                stop = marks[i + 1].start() if i + 1 < len(marks) else end
-                columns[name] = _floats(text[mark.end():stop], path)
+            stop = marks[i + 1].start() if i + 1 < len(marks) else end
+            wv_names.append(mark.group(2))
+            arrays.append(_floats(text[mark.end():stop], path))
+    all_names = measure._unique(path, wv_names)
+    columns = dict(zip(all_names, arrays))
     index, params = measure._leading_columns(all_names, param_count)
     kept = measure._select(all_names, index + params, names)
     values = {name: columns[name] for name in kept}
     failed = {name: int(np.isnan(v).sum()) for name, v in values.items() if np.isnan(v).any()}
-    nrows = int(columns[all_names[0]].size) if all_names else 0
+    nrows = int(arrays[0].size) if arrays else 0
     return measure.MeasureSet(path=path, title=title, params=params, names=kept, values=values, failed=failed,
                               nrows=nrows, truncated=False)

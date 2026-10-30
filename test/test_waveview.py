@@ -719,17 +719,27 @@ class TestReadMeasures(FakeWaveView):
         self.assertEqual((mc.names, mc.title, mc.rows), (["index", "tr"], "* monte carlo", 3))
 
     def test_measure_with_the_name_of_a_parameter(self):
-        # .data tab rval vmax with .meas vmax, index and temper: two columns of each name.
-        # Both engines keep the first column of a name: the parameter values, the row index.
-        got = measure.read_measures(WV / "mdup.mt0", engine="waveview")
-        want = measure.read_measures(WV / "mdup.mt0")
+        # .data tab rval vmax with .meas vmax, index and temper: two columns of each name. The
+        # second one gets the suffix #<column>, in both engines, so that no value is lost.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            got = measure.read_measures(WV / "mdup.mt0", engine="waveview")
+            want = measure.read_measures(WV / "mdup.mt0")
+        self.assertEqual(want.names, ["index", "rval", "vmax", "vmax#3", "a_very_long_measure_name_number_one",
+                                      "a_very_long_measure_name_number_two", "temper", "index#7", "d$x", "temper#9",
+                                      "alter#"])
         self.assertEqual(got.names, want.names[:-1])
-        self.assertEqual(got.names.count("vmax"), 2)
         self.assertEqual(got.params, ["rval", "vmax"])
+        self.assertEqual(sum("repeated measure names disambiguated with '#<column>': index, temper, vmax"
+                             in str(w.message) for w in caught), 2)
         for name in got.values:
-            np.testing.assert_array_equal(got.values[name], want.values[name], err_msg=name)
-        np.testing.assert_array_equal(got.values["vmax"], [1.0, 2.0])
-        np.testing.assert_array_equal(got.values["index"], [1.0, 2.0])
+            np.testing.assert_allclose(got.values[name], want.values[name], rtol=1e-15, err_msg=name)
+        for name, values in (("vmax", [1.0, 2.0]), ("vmax#3", [0.9969, 0.9461]), ("index", [1.0, 2.0]),
+                             ("index#7", [0.6, 0.6]), ("temper", [0.5982, 0.5832]), ("temper#9", [25.0, 25.0])):
+            np.testing.assert_allclose(got.values[name], values, rtol=1e-15, err_msg=name)
+        with self.assertWarnsRegex(RuntimeWarning, "repeated measure names"):
+            ms = measure.read_measures(WV / "mdup.mt0", ["vmax#*"])
+        self.assertEqual(ms.names, ["index", "rval", "vmax", "vmax#3"])
 
     def test_srp_signals_of_the_caller_is_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
