@@ -50,6 +50,8 @@ The header block is the very first block in the binary file. It contains a stand
 
 The data section of the header block is a single long string (no newlines in the actual file). The string has several fields in a fixed order:
 
+A long header does not fit in one block. Then HSPICE continues the header text in the next blocks, until the block that holds the terminator `$&%#`. Each of these blocks has its own block head and block tail. HSPICE ends each block at the end of a name field, at about 8 KB of text: a first block of 8168, 8176 or 8184 bytes, for example. That is about 330 short names, or fewer when the names have 16 characters or more (HSPICE gives such a name a 32-character field). The data blocks start after the block that holds the terminator. Join the text of all these blocks before you read the fields.
+
 - **Simulation variable and format descriptor**: A number, either 20 or 24 digits long (depending on format). This encodes:
 	- The first 4 digits: number of monitored variables (e.g., `0005` for 5 variables)
 	- The next 12 or 16 digits: not used by the parser (reserved or unknown purpose)

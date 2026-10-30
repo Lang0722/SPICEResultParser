@@ -260,12 +260,20 @@ def _read_binary_header(f, path: str, ac_format: str = "magphase") -> Header:
     version = text[20:24].strip() or text[16:20].strip()
     if version not in ("9601", "2001"):
         raise ValueError(f"{path}: unsupported post_version {version!r}; only 9601 and 2001 are supported")
-    index = 1
-    while _TERMINATOR not in text:      # a long variable list (above ~330 names) goes on in the next blocks
+    # A header longer than one block (about 8 KB of text) goes on in the next blocks,
+    # each cut at a name field, until the block that holds the terminator.
+    index, recent = 1, text
+    while _TERMINATOR not in recent:
+        start = f.tell()
         more = _read_block(f, index, 1)
         if more is None:
             raise ValueError(f"{path}: header terminator {_TERMINATOR} not found")
-        text += more.decode("utf-8", errors="replace")
+        if b"\0" in more:               # a data block: a header without the terminator, read as it is
+            f.seek(start)
+            break
+        chunk = more.decode("utf-8", errors="replace")
+        recent = text[-len(_TERMINATOR) + 1:] + chunk     # the terminator can be split over two blocks
+        text += chunk
         index += 1
     marker = text.find("Reserved.")
     if marker < 0:

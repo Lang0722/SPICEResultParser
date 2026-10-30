@@ -48,7 +48,7 @@ def write_binary(path, version, raw_names, type_codes, sweeps, block_bytes=8192,
     block_bytes: payload size per block, or a sequence of sizes cycled through
     (to build files with non-uniform blocks).
     header_bytes: split the header text into blocks of this size, as HSPICE does with a
-    long variable list (its first block holds 8184 bytes).
+    long variable list (its first block holds about 8 KB, cut at the end of a name field).
     Returns the flat value stream that was written.
     """
     dtype = np.dtype("<f4") if version == "9601" else np.dtype("<f8")
