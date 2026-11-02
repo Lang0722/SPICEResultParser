@@ -1206,7 +1206,7 @@ class TestApi(unittest.TestCase):
         self.assertEqual(sizes, [10] * 6)
 
     def test_default_caps(self):
-        self.assertEqual(api.SUMMARY_MAX_POINTS, 20000)
+        self.assertEqual(api.SUMMARY_MAX_POINTS, 1000)
         self.assertEqual(api.PLOT_MAX_POINTS, 5000)
 
 class TestFileOutputs(unittest.TestCase):
@@ -1405,10 +1405,27 @@ class TestFileOutputs(unittest.TestCase):
         ts = read_traces(self.path, ["v_a"])
         fig = api.make_figure(ts)
         sizes = [line.get_xdata().size for line in fig.axes[0].get_lines()]
-        self.assertEqual(sizes, [50, 50, 50])
+        self.assertTrue(all(8 < s <= 50 for s in sizes), sizes)
         first = fig.axes[0].get_lines()[0]
         self.assertEqual(first.get_xdata()[0], ts.data["TIME"][0][0])
         self.assertEqual(first.get_xdata()[-1], ts.data["TIME"][0][-1])
+        for line, y in zip(fig.axes[0].get_lines(), ts.data["v_a"]):     # the envelope keeps the extremes
+            self.assertEqual((line.get_ydata().min(), line.get_ydata().max()), (y.min(), y.max()))
+
+    def test_figure_keeps_a_one_sample_spike(self):
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest("matplotlib not installed")
+        t = np.linspace(0, 1e-6, 100_001)
+        v = np.zeros_like(t)
+        v[54_321] = 1.0                                          # narrower than any stride
+        path = self.dir / "spike.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(a"], [1, 1], [([], np.c_[t, v])])
+        line = api.make_figure(read_traces(path)).axes[0].get_lines()[0]
+        self.assertLessEqual(line.get_xdata().size, api.PLOT_MAX_POINTS)
+        self.assertEqual(line.get_ydata().max(), 1.0)
+        self.assertIn(t[54_321], line.get_xdata())
 
     def test_npz_trace_names_that_collide_with_savez_parameters(self):
         d = np.arange(12.0).reshape(4, 3)
@@ -1649,15 +1666,15 @@ class TestScan(unittest.TestCase):
         self.assertIsNone(read_traces(path, ["v_a"]).xrange)
 
     def test_float32_values_are_written_short_in_json(self):
-        data = np.array([[0.0, 0.1], [1e-9, 0.2], [2e-9, 0.3]])
+        data = np.array([[0.0, 0.1], [1e-9, 0.7], [2e-9, 0.3]])
         path = self.dir / "short.tr0"
         fixtures.write_binary(path, "9601", ["TIME", "v(a", "vdd"], [1, 1], [([1.1], data)])
         summary = api.extract(path, output="summary", downsample=3)
         self.assertEqual(summary["sweep_values"], [[1.1]])             # not 1.100000023841858
         self.assertEqual(summary["x_range"], [0.0, 2e-09])
-        self.assertEqual(summary["ranges"], {"v_a": [0.1, 0.3]})
-        self.assertEqual(summary["stats"]["v_a"][0]["y"], [0.1, 0.2, 0.3])
-        self.assertEqual(api.list_traces(path)["ranges"], {"v_a": [0.1, 0.3]})
+        self.assertEqual(summary["ranges"], {"v_a": [0.1, 0.7]})
+        self.assertEqual(summary["stats"]["v_a"][0]["y"], [0.1, 0.7, 0.3])
+        self.assertEqual(api.list_traces(path)["ranges"], {"v_a": [0.1, 0.7]})
         # still exact: the short decimal reads back as the very float32 the file holds
         self.assertEqual(np.float32(summary["stats"]["v_a"][0]["max"]), read_traces(path).data["v_a"][0].max())
         self.assertEqual(api._json_floats(np.array([np.nan, np.inf, 1.5], np.float32)), [None, None, 1.5])

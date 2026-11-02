@@ -12,9 +12,12 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from . import reduce
 from .reader import TraceSet, nan_min_max, read_header, read_traces, resolve_columns, scan, validate_range
+from .reduce import check_tolerance
 
 OUTPUTS = ("arrays", "csv", "npz", "summary", "png")
+TOLERANCE_OUTPUTS = ("text", "summary")         # the outputs whose points the reduction chooses
 
 
 def list_traces(path, plot: int = 0, ac_format: str = "magphase", names=None,
@@ -85,7 +88,8 @@ def _decimate(ts: TraceSet, downsample: int) -> None:
             ts.data[name][i] = ts.data[name][i][idx]
 
 
-SUMMARY_MAX_POINTS = 20000      # cap on x/y points serialised in one summary, over all traces and sweeps
+SUMMARY_MAX_POINTS = 1000       # cap on x/y points serialised in one summary, over all traces and sweeps:
+                                # about 12k tokens of JSON, so a summary fits an agent's context
 
 
 def _json_float(v) -> Optional[float]:
@@ -162,28 +166,44 @@ def overview(ts: TraceSet) -> dict:
     }
 
 
-def summarize(ts: TraceSet, downsample: Optional[int] = None) -> dict:
+def summarize(ts: TraceSet, downsample: Optional[int] = None, tolerance: Optional[float] = None) -> dict:
     """JSON-serialisable description of ts: the file facts and overview(ts), then under
-    "stats" per trace and per sweep count, min, max, mean, first and last; points are
-    decimated.
+    "stats" per trace and per sweep count, min, max, mean, first and last, and points
+    when downsample or tolerance is given.
 
     The statistics cover every point in ts. A TraceSet already decimated (extract with
     output="arrays" and downsample) gives statistics of the decimated points.
     min, max and mean skip NaN values; they are null only when a trace holds nothing else.
 
-    Points (x and y lists in stats) are emitted only when downsample is given. The
-    SUMMARY_MAX_POINTS budget is shared evenly by the (trace, sweep) series, but each
-    series keeps at least 2 points, so the cap holds only up to SUMMARY_MAX_POINTS / 2
-    series. The statistics always grow with the number of series: select a few names or
-    sweeps on large files. NaN and infinities are emitted as null.
+    Points are x and y lists of real samples, chosen per trace and sweep by
+    reduce.breakpoints: straight lines between them stay within tolerance (default
+    reduce.DEFAULT_TOLERANCE) of every sample, as a fraction of the trace's range over ts
+    (for an AC _Mag trace, its range in dB). max_error gives the bound met, which is
+    larger than tolerance only when the points ran out first. A series holds at most
+    downsample points, and all of them at most SUMMARY_MAX_POINTS, shared evenly by the
+    (trace, sweep) series (at least 2 each, so the cap holds only up to
+    SUMMARY_MAX_POINTS / 2 series). The statistics always grow with the number of
+    series: select a few names or sweeps on large files. NaN and infinities are emitted
+    as null.
     """
     h = ts.header
     x = ts.data[h.x_name]
-    if downsample is not None:
+    with_points = downsample is not None or tolerance is not None
+    if with_points:
         series = max(1, (len(ts.selected) - 1) * len(ts.sweep_values))
-        downsample = min(downsample, max(2, SUMMARY_MAX_POINTS // series))
+        cap = max(2, SUMMARY_MAX_POINTS // series)
+        if downsample is not None:
+            cap = min(cap, downsample)
+        tolerance = reduce.DEFAULT_TOLERANCE if tolerance is None else tolerance
+        floor = 4 * float(np.finfo(h.dtype).eps)
+        log = reduce.log_frequency(h)
+        x_criteria = [reduce.x_criterion(a, log) for a in x]
     stats = {}
     for name in ts.selected[1:]:
+        if with_points:
+            db = reduce.in_db(h, name)
+            criteria = [reduce.y_criterion(a, db) for a in ts.data[name]]
+            span = reduce.finite_span(criteria)
         per_sweep = []
         for i, arr in enumerate(ts.data[name]):
             a = np.asarray(arr)
@@ -192,11 +212,11 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None) -> dict:
                 lo, hi = nan_min_max(a)
                 entry.update(min=_json_float(lo), max=_json_float(hi), mean=_json_float(_nan_mean(a)),
                              first=_json_float(a[0]), last=_json_float(a[-1]))
-                if downsample is not None:
-                    idx = decimation_indices(a.size, downsample)
-                    xs, ys = (x[i], a) if idx is None else (x[i][idx], a[idx])
-                    entry["x"] = _json_floats(xs)
-                    entry["y"] = _json_floats(ys)
+                if with_points:
+                    idx, error = reduce.breakpoints(x_criteria[i], [criteria[i]], [span], tolerance, cap, floor)
+                    entry["x"] = _json_floats(x[i][idx])
+                    entry["y"] = _json_floats(a[idx])
+                    entry["max_error"] = None if math.isinf(error) else float(f"{error:.3g}")
             per_sweep.append(entry)
         stats[name] = per_sweep
     return {"path": h.path, "format": h.version, "analysis": h.analysis, "plot": h.plot,
@@ -282,9 +302,9 @@ def _require_matplotlib():
 def make_figure(ts: TraceSet, yrange: Optional[Tuple[float, float]] = None, title: Optional[str] = None):
     """A matplotlib Figure with one line per trace per sweep; log x axis for AC results.
 
-    Lines longer than PLOT_MAX_POINTS are decimated to evenly spaced points (first and
-    last kept) before drawing, so a spike narrower than the stride can be missed. Plot a
-    narrower `xrange` around it, or raise `api.PLOT_MAX_POINTS`, to see it.
+    A line longer than PLOT_MAX_POINTS is drawn from its envelope (reduce.envelope): the
+    first, last, lowest and highest sample of equal runs of samples, so the drawing looks
+    as with every point and a one-sample spike still shows.
     """
     Figure = _require_matplotlib()
     h = ts.header
@@ -298,11 +318,11 @@ def make_figure(ts: TraceSet, yrange: Optional[Tuple[float, float]] = None, titl
                 params = ", ".join(f"{p}={v:g}" for p, v in zip(h.sweep_params, ts.sweep_values[i]))
                 label = f"{name} [{params or ts.sweep_indices[i]}]"
             x = ts.data[h.x_name][i]
-            idx = decimation_indices(y.size, PLOT_MAX_POINTS)
+            idx = reduce.envelope(y, PLOT_MAX_POINTS)
             if idx is not None:
                 x, y = x[idx], y[idx]
             ax.plot(x, y, linewidth=1, label=label)
-    if h.analysis == "ac":
+    if reduce.log_frequency(h):
         ax.set_xscale("log")
     if yrange is not None:
         ax.set_ylim(*yrange)
@@ -337,10 +357,19 @@ def write_file(ts: TraceSet, output: str, dest=None, yrange=None, title: Optiona
     return dest
 
 
+def reject_tolerance(output: str, tolerance) -> None:
+    """tolerance chooses the points of text and summary only: refuse it elsewhere rather
+    than let a caller believe a file was reduced."""
+    if tolerance is not None and output not in TOLERANCE_OUTPUTS:
+        raise ValueError(f"tolerance applies to text and summary only, not to output={output!r}: "
+                         f"arrays, csv and npz keep every point (downsample thins them evenly), "
+                         f"and png draws every point's envelope")
+
+
 def extract(path, names=None, sweeps=None, output: str = "arrays",
             downsample: Optional[int] = None, dest=None,
             xrange: Optional[Sequence[float]] = None, yrange: Optional[Sequence[float]] = None,
-            plot: int = 0, ac_format: str = "magphase"):
+            plot: int = 0, ac_format: str = "magphase", tolerance: Optional[float] = None):
     """Read selected traces and return them as arrays, a summary dict, or a written file path.
 
     xrange=(lo, hi) keeps only the rows whose x value (TIME, FREQ or the sweep
@@ -349,7 +378,10 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
     every output. yrange=(lo, hi) sets the vertical axis limits of the png plot; other
     outputs do not use it, but a malformed yrange still raises.
     downsample=N keeps N evenly spaced points per sweep (first and last kept; at least 2).
-    For "summary" it sets the x/y points emitted, and None emits statistics only.
+    For "summary" it caps the x/y points listed per trace and sweep, which the reduction
+    chooses (see summarize); with neither downsample nor tolerance, summary lists none.
+    tolerance (summary only) is the error bound of those points, a fraction of each
+    trace's range (default 0.01).
     dest names the csv/npz/png file (default <input>_<ext>_traces.<output> beside the
     input); it must not be the input file, and other outputs reject it.
     plot selects one plot of a Nutmeg rawfile (0-based); see list_traces for the list.
@@ -359,6 +391,8 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
     if output not in OUTPUTS:
         raise ValueError(f"output must be one of {OUTPUTS}, not {output!r}")
     downsample = check_downsample(downsample)
+    tolerance = check_tolerance(tolerance)
+    reject_tolerance(output, tolerance)
     xrange = validate_range("xrange", xrange)
     yrange = validate_range("yrange", yrange, finite=True)
     if output in ("csv", "npz", "png"):
@@ -369,7 +403,7 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
         _require_matplotlib()
     ts = read_traces(path, names, sweeps, plot, xrange, ac_format)
     if output == "summary":
-        return summarize(ts, downsample)
+        return summarize(ts, downsample, tolerance)
     if downsample is not None:
         _decimate(ts, downsample)
     if output == "arrays":

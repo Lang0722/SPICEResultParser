@@ -110,7 +110,9 @@ The `extract` parameters work as follows:
   20 traces at 136 MB peak RSS instead of 555 MB.
 - `yrange` sets the vertical limits of the plot.
 - `sweeps=[...]` selects sweeps. An index that the file does not hold is an error.
-- `downsample=N` keeps N evenly spaced points.
+- `downsample=N` keeps N evenly spaced points. For `summary`, it caps the listed points.
+- `tolerance` (for `summary`) sets how closely the listed points follow each trace. See
+  [Shape-preserving reduction](#shape-preserving-reduction).
 - `dest` names the csv, npz or png file. `extract` checks `dest` before it reads the
   input file. `dest` can never be the input file.
 
@@ -140,7 +142,7 @@ pip install "spice_result_parser[mcp,plot] @ git+https://github.com/Lang0722/SPI
 The server has three tools:
 
 - `list_traces(path, names, plot, ac_format, header_only)`
-- `extract(path, names, sweeps, output, downsample, dest, xrange, yrange, plot, ac_format)`
+- `extract(path, names, sweeps, output, downsample, tolerance, dest, xrange, yrange, plot, ac_format)`
 - `read_measures(path, names, rows)`
 
 `list_traces` and `extract` accept HSPICE result files and Nutmeg rawfiles. `plot`
@@ -154,18 +156,45 @@ Over MCP, the `output` parameter of `extract` takes one of these values:
 
 | `output` | Result |
 |---|---|
-| `text` (default) | A readable report: the x range and point count, per-trace min/max, then a table with x once and one column per trace. The server rounds values to 6 significant digits. The report holds at most 500 rows, 20 tables and 16 trace columns. |
-| `summary` | JSON with exact floats: the fields of `list_traces` for the selected data, per-trace and per-sweep statistics, plus downsampled points when you set `downsample`. |
+| `text` (default) | A readable report: the x range and point count, per-trace min/max, then a table with x once and one column per trace. The table shows the samples that the shape-preserving reduction keeps. The server rounds values to 6 significant digits. The report holds at most 500 rows, 20 tables and 16 trace columns. |
+| `summary` | JSON with exact floats: the fields of `list_traces` for the selected data and per-trace and per-sweep statistics. With `tolerance` or `downsample`, it also lists the points that the reduction keeps. |
 | `csv`, `npz`, `png` | The server writes the file. It returns the absolute path as `dest`, with the x range, point count and trace ranges of the written data. |
 
 The server never sends full arrays inline.
+
+### Shape-preserving reduction
+
+A waveform can have millions of points, but an agent can read only a few hundred
+numbers. Thus `text` and `summary` do not send evenly spaced points. They send the
+fewest real samples that keep the shape of each trace. The method is a greedy
+Douglas-Peucker simplification:
+
+- The reduction never computes a value. Each row is a sample from the file.
+- Straight lines between the rows stay within `tolerance` of every sample. `tolerance`
+  is a fraction of the range of each trace in the selection. The default is 0.01 (1%).
+  The header of the report gives the bound that the rows meet.
+- The rows always include the first and last samples, the lowest and highest sample of
+  each trace, and both sides of each NaN or infinite run.
+- A peak, an edge or a one-sample glitch stays visible. A straight part needs two rows.
+- For AC data, the reduction uses a log-frequency axis and compares `_Mag` in dB.
+- If the row budget runs out first, the report gives the error that it reached instead.
+
+For example, a 200,001-point step response with ringing and a 1 ns glitch needs 38 rows
+at 1%. These rows show the step, each ringing peak, the settling and the glitch. 20
+evenly spaced rows showed none of them.
+
+The tolerance is relative to the selected range. Thus an `xrange` on a small-signal part,
+for example the settling tail, shows that part in detail. A smaller `tolerance` gives
+more rows everywhere. `csv`, `npz` and the Python arrays keep every point. `png` draws
+the envelope of every point (the first, last, lowest and highest sample of each run of
+samples), so a narrow spike stays visible.
 
 The tools match trace and measure names the way SPICE does. If no name matches
 exactly, they ignore case, so `V(OUT)` selects `v(out)`. An unknown name gives an error
 that suggests similar names and lists the available names.
 
-`spice_result_parser.mcp_server.format_text(ts, points)` returns the `text` report for any
-`TraceSet`. It does not need the `mcp` package.
+`spice_result_parser.mcp_server.format_text(ts, points, tolerance)` returns the `text`
+report for any `TraceSet`. It does not need the `mcp` package.
 
 `read_measures` returns a text table of an HSPICE measure file. The table shows the
 swept parameters, the measures that failed, and one row per simulation.

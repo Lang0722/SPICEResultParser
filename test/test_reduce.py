@@ -1,0 +1,365 @@
+"""Tests for the shape-preserving reduction (reduce.py) and the outputs that use it."""
+import asyncio
+import json
+import sys
+import tempfile
+import time
+import unittest
+import warnings
+from pathlib import Path
+
+import numpy as np
+
+HERE = Path(__file__).parent.resolve()
+sys.path.insert(0, str(HERE))
+
+import fixtures  # noqa: E402
+
+from spice_result_parser import api, reduce  # noqa: E402
+from spice_result_parser.reader import read_traces  # noqa: E402
+
+
+def polyline_error(x, y, keep):
+    """Largest vertical distance from any sample to the straight lines between the kept
+    samples, computed independently of reduce.breakpoints (a repeated x is a vertical jump;
+    a non-finite sample counts only where the lines through it are finite)."""
+    worst = 0.0
+    for a, b in zip(keep[:-1], keep[1:]):
+        inside = np.arange(a + 1, b)
+        if not inside.size:
+            continue
+        with np.errstate(invalid="ignore", over="ignore"):
+            if x[b] != x[a]:
+                line = y[a] + (y[b] - y[a]) * (x[inside] - x[a]) / (x[b] - x[a])
+                err = np.abs(y[inside] - line)
+            else:
+                err = np.maximum(np.maximum(min(y[a], y[b]) - y[inside], y[inside] - max(y[a], y[b])), 0)
+        err = err[np.isfinite(err)]
+        if err.size:
+            worst = max(worst, float(err.max()))
+    return worst
+
+
+def signals(n=4001, seed=0):
+    rng = np.random.default_rng(seed)
+    t = np.linspace(0, 1e-6, n)
+    step = np.where(t < 2e-7, 0.0, 1.2 * (1 - np.exp(-(t - 2e-7) / 3e-8) * np.cos(2 * np.pi * 2e7 * (t - 2e-7))))
+    return t, {
+        "sine": np.sin(2 * np.pi * 5e6 * t),
+        "ringing step": step,
+        "noise": rng.standard_normal(n),
+        "glitch": np.where((t > 6e-7) & (t < 6.02e-7), 0.4, 0.0),
+        "ramp": 3.0 * t / 1e-6,
+    }
+
+
+class TestBreakpoints(unittest.TestCase):
+    def test_every_sample_is_within_the_tolerance(self):
+        t, sig = signals()
+        for name, y in sig.items():
+            span = reduce.finite_span([y])
+            for tol in (0.1, 0.01, 0.001):
+                with self.subTest(signal=name, tolerance=tol):
+                    keep, reached = reduce.breakpoints(t, [y], [span], tol)
+                    self.assertEqual((keep[0], keep[-1]), (0, t.size - 1))
+                    self.assertTrue(np.all(np.diff(keep) > 0))
+                    self.assertLessEqual(reached, tol)
+                    self.assertLessEqual(polyline_error(t, y, keep), tol * span * (1 + 1e-9))
+                    self.assertAlmostEqual(polyline_error(t, y, keep) / span, reached, places=12)
+
+    def test_smaller_tolerance_keeps_more(self):
+        t, sig = signals()
+        y = sig["ringing step"]
+        counts = [reduce.breakpoints(t, [y], [reduce.finite_span([y])], tol)[0].size
+                  for tol in (0.1, 0.01, 0.001)]
+        self.assertLess(counts[0], counts[1])
+        self.assertLess(counts[1], counts[2])
+        self.assertLess(counts[2], t.size / 4)
+
+    def test_straight_lines_need_two_samples(self):
+        t, sig = signals()
+        keep, reached = reduce.breakpoints(t, [sig["ramp"]], [3.0], 0.0, floor=4 * np.finfo(float).eps)
+        self.assertEqual(keep.tolist(), [0, t.size - 1])
+        self.assertLess(reached, 1e-12)                          # rounding only
+
+    def test_tolerance_zero_keeps_every_corner(self):
+        t = np.arange(7.0)
+        y = np.array([0.0, 1, 2, 2, 2, 5, 8])                   # corners at 2, 4; 1, 3, 6 lie on lines
+        keep, _ = reduce.breakpoints(t, [y], [8.0], 0.0, floor=4 * np.finfo(float).eps)
+        self.assertEqual(keep.tolist(), [0, 2, 4, 6])
+
+    def test_budget_keeps_the_worst_first_and_reports_the_error_left(self):
+        t, sig = signals()
+        y, span = sig["ringing step"], reduce.finite_span([sig["ringing step"]])
+        for budget in (2, 3, 5, 10, 20):
+            keep, reached = reduce.breakpoints(t, [y], [span], 0.0001, budget)
+            self.assertEqual(keep.size, budget)
+            self.assertGreater(reached, 0.0001)                  # the budget binds before the tolerance
+            self.assertAlmostEqual(polyline_error(t, y, keep) / span, reached, places=12)
+        keep, _ = reduce.breakpoints(t, [y], [span], 0.0001, 3)
+        self.assertEqual(int(keep[1]), int(np.argmax(y)))        # room for one more: the overshoot peak
+        keep, _ = reduce.breakpoints(t, [y], [span], 0.0001, 2)
+        self.assertEqual(keep.tolist(), [0, t.size - 1])         # no room: the ends alone
+
+    def test_each_trace_keeps_its_exact_extremes(self):
+        t, sig = signals()
+        for name, y in sig.items():
+            keep, _ = reduce.breakpoints(t, [y], [reduce.finite_span([y])], 0.05)
+            self.assertIn(int(np.argmax(y)), keep.tolist(), name)
+            self.assertIn(int(np.argmin(y)), keep.tolist(), name)
+
+    def test_traces_share_their_samples(self):
+        t = np.linspace(0, 1, 2001)
+        early = np.where(t < 0.2, np.sin(40 * t), 0.0)           # busy early, flat late
+        late = np.where(t > 0.8, np.sin(40 * t), 0.0)
+        spans = [reduce.finite_span([early]), reduce.finite_span([late])]
+        keep, reached = reduce.breakpoints(t, [early, late], spans, 0.01)
+        self.assertLessEqual(reached, 0.01)
+        for y, span in zip((early, late), spans):
+            self.assertLessEqual(polyline_error(t, y, keep), 0.01 * span * (1 + 1e-9))
+        self.assertTrue((t[keep] < 0.2).sum() > 5 and (t[keep] > 0.8).sum() > 5)
+        self.assertLess(((t[keep] > 0.3) & (t[keep] < 0.7)).sum(), 2)   # nothing happens there
+
+    def test_a_trace_without_range_needs_no_sample(self):
+        t = np.linspace(0, 1, 101)
+        keep, reached = reduce.breakpoints(t, [np.full(101, 2.5), np.full(101, np.nan)], [0.0, 0.0], 0.01)
+        self.assertEqual((keep.tolist(), reached), ([0, 100], 0.0))
+
+    def test_nan_and_inf_runs_stay_visible(self):
+        t = np.arange(12.0)
+        y = np.array([0, 1, 2, np.nan, np.nan, 5, 6, np.inf, 8, 9, -np.inf, 11.0])
+        keep, _ = reduce.breakpoints(t, [y], [reduce.finite_span([y])], 0.5)
+        for i in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11):               # both sides of every change of kind
+            self.assertIn(i, keep.tolist())
+        self.assertEqual(reduce.finite_span([y]), 11.0)
+
+    def test_too_many_boundaries_for_the_budget(self):
+        t = np.arange(100.0)
+        y = np.where(np.arange(100) % 2, np.nan, 1.0)            # a gap at every other sample
+        keep, reached = reduce.breakpoints(t, [y], [0.0], 0.01, 10)
+        self.assertLessEqual(keep.size, 10)
+        self.assertEqual((keep[0], keep[-1]), (0, 99))
+        self.assertEqual(reached, np.inf)
+
+    def test_repeated_x_is_a_vertical_jump(self):
+        t = np.array([0.0, 1, 1, 2, 3])                          # a PWL step: two samples at t = 1
+        y = np.array([0.0, 0, 1, 1, 1])
+        keep, reached = reduce.breakpoints(t, [y], [1.0], 0.01)
+        self.assertEqual(keep.tolist(), [0, 1, 2, 4])
+        self.assertEqual(reached, 0.0)
+
+    def test_a_glitch_survives_a_huge_trace(self):
+        t = np.linspace(0, 1e-6, 1_000_001)
+        y = np.zeros_like(t)
+        y[777_777] = 1.0                                         # one sample
+        keep, _ = reduce.breakpoints(t, [y], [1.0], 0.01, 50)
+        self.assertIn(777_777, keep.tolist())
+
+    def test_speed_on_a_million_points(self):
+        t = np.linspace(0, 1e-6, 1_000_000)
+        ys = [np.sin(2 * np.pi * k * t / 1e-6) + (t > 5e-7) for k in (3, 7)]
+        start = time.perf_counter()
+        keep, _ = reduce.breakpoints(t, ys, [reduce.finite_span([y]) for y in ys], 0.01, 500)
+        self.assertLess(time.perf_counter() - start, 5.0)
+        self.assertLessEqual(keep.size, 500)
+
+
+class TestCriteria(unittest.TestCase):
+    def lowpass(self):
+        f = np.logspace(0, 8, 161)                              # 20 points per decade
+        h = 1 / (1 + 1j * f / 1e3) ** 2                         # -40 dB/decade above 1 kHz
+        return f, np.abs(h)
+
+    def test_frequency_is_reduced_on_a_log_axis(self):
+        # on a log axis the -40 dB/decade asymptote is a straight line: no point needed on it,
+        # while the knee around 1 kHz needs several; on a linear axis the same line is curved
+        f, mag = self.lowpass()
+        db = reduce.y_criterion(mag, True)
+        span = reduce.finite_span([db])
+        log, _ = reduce.breakpoints(reduce.x_criterion(f, True), [db], [span], 0.01)
+        linear, _ = reduce.breakpoints(reduce.x_criterion(f, False), [db], [span], 0.01)
+        self.assertGreaterEqual(int(((f[log] > 1e2) & (f[log] < 1e4)).sum()), 2)
+        self.assertLessEqual(int((f[log] > 1e5).sum()), 1)       # the end only
+        self.assertGreater(int((f[linear] > 1e5).sum()), 3)
+
+    def test_magnitude_in_db_keeps_the_roll_off(self):
+        f, mag = self.lowpass()
+        x = reduce.x_criterion(f, True)
+        in_db, _ = reduce.breakpoints(x, [reduce.y_criterion(mag, True)],
+                                      [reduce.finite_span([reduce.y_criterion(mag, True)])], 0.01)
+        linear, _ = reduce.breakpoints(x, [mag], [reduce.finite_span([mag])], 0.01)
+        stop = lambda keep: int((f[keep] > 1e5).sum())           # noqa: E731
+        self.assertLessEqual(stop(linear), 1)                    # linear: below 1% of the peak it is "flat"
+        self.assertGreaterEqual(stop(in_db), 1)                  # dB: the straight -40 dB/decade line ends there
+        self.assertTrue(np.all(reduce.y_criterion(np.array([1.0, 0.1, 0.0]), True)[:2] == [0.0, -20.0]))
+        self.assertEqual(reduce.y_criterion(np.array([0.0]), True)[0], -np.inf)
+
+    def test_which_traces_use_log_frequency_and_db(self):
+        h = read_traces(HERE / "test_9601.ac0", ["v(vo)"]).header
+        self.assertTrue(reduce.log_frequency(h))
+        self.assertTrue(reduce.in_db(h, "v_vo_Mag"))
+        self.assertFalse(reduce.in_db(h, "v_vo_Phase"))
+        db = read_traces(HERE / "test_9601.ac0", ["v(vo)"], ac_format="db").header
+        self.assertFalse(reduce.in_db(db, "v_vo_dB"))          # already in dB
+        tr = read_traces(HERE / "test_9601.tr0", ["v(vo"]).header
+        self.assertFalse(reduce.log_frequency(tr))
+        self.assertTrue(np.array_equal(reduce.x_criterion(np.array([0.0, 1.0]), True), [0.0, 1.0]))
+
+
+class TestEnvelope(unittest.TestCase):
+    def test_short_lines_are_drawn_whole(self):
+        self.assertIsNone(reduce.envelope(np.arange(10.0), 10))
+
+    def test_extremes_and_ends_are_kept(self):
+        rng = np.random.default_rng(4)
+        y = rng.standard_normal(100_000)
+        y[31_415] = 50.0
+        y[27_182] = -50.0
+        keep = reduce.envelope(y, 400)
+        self.assertLessEqual(keep.size, 400)
+        self.assertEqual((keep[0], keep[-1]), (0, y.size - 1))
+        self.assertTrue({31_415, 27_182} <= set(keep.tolist()))
+        runs = np.array_split(np.arange(y.size), 100)            # every run's own min and max survive
+        for run in runs[:5]:
+            self.assertIn(run[0] + int(np.argmax(y[run])), keep.tolist())
+
+    def test_nan_runs(self):
+        y = np.full(1000, np.nan)
+        y[500] = 1.0
+        keep = reduce.envelope(y, 40)
+        self.assertIn(500, keep.tolist())
+
+
+class TestTolerance(unittest.TestCase):
+    def test_validation(self):
+        self.assertIsNone(reduce.check_tolerance(None))
+        self.assertEqual(reduce.check_tolerance(0), 0.0)
+        self.assertEqual(reduce.check_tolerance(1), 1.0)
+        self.assertEqual(reduce.check_tolerance(np.float32(0.5)), 0.5)
+        for bad in (True, "0.01", -0.1, 1.5, float("nan"), [0.01]):
+            with self.assertRaisesRegex(ValueError, "tolerance"):
+                reduce.check_tolerance(bad)
+
+    def test_file_outputs_refuse_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for output in ("arrays", "csv", "npz", "png"):
+                with self.assertRaisesRegex(ValueError, "tolerance applies to text and summary only"):
+                    api.extract(HERE / "test_9601.tr0", output=output, tolerance=0.01,
+                                dest=None if output == "arrays" else str(Path(tmp) / f"o.{output}"))
+
+
+class TestOutputs(unittest.TestCase):
+    """The reduction as an agent sees it: text rows and summary points."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        t = np.linspace(0, 100e-9, 200_001)
+        v = np.where(t < 10e-9, 0.0, 1.2 * (1 - np.exp(-(t - 10e-9) / 2e-9) * np.cos(2 * np.pi * 0.5e9 * (t - 10e-9))))
+        v[(t > 70e-9) & (t < 71e-9)] += 0.35                   # a 1 ns glitch
+        cls.path = Path(cls.tmp.name) / "step.tr0"
+        fixtures.write_binary(cls.path, "2001", ["TIME", "v(out"], [1, 1], [([], np.c_[t, v])])
+        cls.t, cls.v = t, v
+        from spice_result_parser import mcp_server
+        cls.m = mcp_server
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def rows(self, text):
+        lines = text.splitlines()
+        start = next(i for i, line in enumerate(lines) if line.split()[:1] == ["TIME"])
+        return np.array([[float(c) for c in line.split()] for line in lines[start + 1:]])
+
+    def test_text_shows_the_peak_and_the_glitch(self):
+        text = self.m.format_text(read_traces(self.path))
+        head = text.splitlines()[0]
+        self.assertIn("200001 points (", head)
+        self.assertIn(" shown, each trace within 1% of its range)", head)
+        rows = self.rows(text)
+        self.assertLess(len(rows), 60)
+        peak = int(np.argmax(self.v[self.t < 60e-9]))
+        self.assertIn(round(self.t[peak], 15), [round(x, 15) for x in rows[:, 0]])   # when the overshoot peaks
+        glitch = rows[(rows[:, 0] >= 70e-9) & (rows[:, 0] <= 71e-9)]
+        self.assertTrue(np.any(np.abs(glitch[:, 1] - 1.55) < 1e-3))                   # the glitch is there
+        # the rows are real samples
+        for x, y in rows:
+            i = int(np.argmin(np.abs(self.t - x)))
+            self.assertAlmostEqual(y, self.v[i], delta=1e-5 * 2)
+
+    def test_a_tighter_tolerance_shows_more(self):
+        ts = read_traces(self.path)
+        coarse, fine = self.m.format_text(ts, tolerance=0.05), self.m.format_text(ts, tolerance=0.002)
+        self.assertLess(len(self.rows(coarse)), len(self.rows(fine)))
+        self.assertIn("within 0.2% of its range", fine.splitlines()[0])
+
+    def test_a_window_on_a_small_signal_shows_its_detail(self):
+        # the tolerance is relative to the selection's range: on the settling tail that range
+        # is millivolts, so the window shows the ringing the whole view rounds away
+        whole = self.rows(self.m.format_text(read_traces(self.path)))
+        tail = self.rows(self.m.format_text(read_traces(self.path, xrange=(20e-9, 60e-9))))
+        self.assertLess(((whole[:, 0] >= 20e-9) & (whole[:, 0] <= 60e-9)).sum(), 3)
+        self.assertGreater(len(tail), 15)
+        span = tail[:, 1].max() - tail[:, 1].min()
+        self.assertLess(span, 0.02)
+        # a window that still holds the whole swing keeps the same detail: the range did not change
+        swing = self.rows(self.m.format_text(read_traces(self.path, xrange=(10e-9, 14e-9))))
+        self.assertEqual(len(swing), ((whole[:, 0] >= 10e-9) & (whole[:, 0] <= 14e-9)).sum())
+
+    def test_summary_points(self):
+        s = api.extract(self.path, output="summary", tolerance=0.01)
+        entry = s["stats"]["v_out"][0]
+        self.assertLessEqual(entry["max_error"], 0.01)
+        self.assertLess(len(entry["x"]), 60)
+        keep = np.searchsorted(self.t, entry["x"])
+        span = s["ranges"]["v_out"][1] - s["ranges"]["v_out"][0]
+        self.assertLessEqual(polyline_error(self.t, self.v, keep), 0.01 * span * (1 + 1e-9))
+        self.assertNotIn("x", api.extract(self.path, output="summary")["stats"]["v_out"][0])
+        capped = api.extract(self.path, output="summary", downsample=5)["stats"]["v_out"][0]
+        self.assertEqual(len(capped["x"]), 5)
+        self.assertGreater(capped["max_error"], 0.01)
+        json.dumps(s, allow_nan=False)
+
+    def test_constant_traces_are_one_line(self):
+        text = self.m.format_text(read_traces(HERE / "test_9601.ac0"))
+        self.assertIn("constant: v_0_Mag = 0, v_0_Phase = 0, v_vs_Mag = 1, v_vs_Phase = 0", text)
+        heading = [l.split() for l in text.splitlines() if l.lstrip().startswith("HERTZ")]
+        self.assertEqual(heading, [["HERTZ", "v_vo_Mag", "v_vo_Phase", "i_vs_Mag", "i_vs_Phase"]])
+        self.assertIn("_Mag compared in dB", text.splitlines()[0])
+        self.assertNotIn("v_0_Mag", text.split("constant:")[1].split("\n", 1)[1])
+
+
+class TestMcpTolerance(unittest.TestCase):
+    def setUp(self):
+        try:
+            import mcp  # noqa: F401
+        except ImportError:
+            self.skipTest("mcp package not installed")
+        from spice_result_parser import mcp_server
+
+        self.m = mcp_server
+
+    def test_schema(self):
+        tools = {t.name: t for t in asyncio.run(self.m.server.list_tools())}
+        schema = getattr(tools["extract"], "inputSchema", None) or tools["extract"].input_schema
+        self.assertIn("tolerance", schema["properties"])
+        self.assertIn("fraction of each trace's range", schema["properties"]["tolerance"]["description"])
+        self.assertLess(len(tools["extract"].description), 1400)
+
+    def test_errors_reach_the_client(self):
+        path = str(HERE / "test_9601.tr0")
+        with self.assertRaisesRegex(self.m.ToolError, "tolerance applies to text and summary only"):
+            self.m.extract(path, output="csv", tolerance=0.01)
+        with self.assertRaisesRegex(self.m.ToolError, "tolerance must be between 0 and 1"):
+            self.m.extract(path, tolerance=5)
+
+    def test_text_and_summary(self):
+        path = str(HERE / "test_9601.tr0")
+        self.assertIn("within 5% of its range", self.m.extract(path, ["v(vo"], tolerance=0.05))
+        out = self.m.extract(path, ["v(vo"], output="summary", tolerance=0.05)
+        self.assertLessEqual(out["stats"]["v_vo"][0]["max_error"], 0.05)
+
+
+if __name__ == "__main__":
+    unittest.main()

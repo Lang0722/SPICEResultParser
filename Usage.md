@@ -72,7 +72,7 @@ ts.sweep_indices                                  # original sweep index of each
 
 extract("run.tr0", ["v(out)"], output="csv")      # -> 'run_tr0_traces.csv' beside the input
 extract("run.tr0", ["v(out)"], output="npz", dest="out.npz", downsample=1000)
-extract("run.tr0", ["v(out)"], output="summary", downsample=200)   # JSON-friendly stats + points
+extract("run.tr0", ["v(out)"], output="summary", tolerance=0.01)   # stats + the points within 1%
 
 # Region of interest: xrange keeps only rows with lo <= x <= hi (any output);
 # yrange sets the plot's vertical limits (png only). png needs matplotlib:
@@ -114,7 +114,9 @@ keeps none. An index that the file does not hold raises a `ValueError` that name
 sweep count.
 
 `downsample=N` keeps `N` evenly spaced points per sweep. `N` is an integer, at least 2.
-`downsample` always keeps the first and last points.
+`downsample` always keeps the first and last points. For `summary`, `downsample` is
+the most points that it lists per trace and sweep. The reduction chooses them (see
+[Shape-preserving reduction](#shape-preserving-reduction)).
 
 If you read the file while the simulator still writes it, the reader returns the partial
 last sweep. In that case, `ts.truncated` is `True`.
@@ -139,12 +141,56 @@ s["x_range"], s["points"], s["ranges"]["v_out"]  # the selection as a whole
 s["stats"]["v_out"][2]["max"]                     # one sweep: index 2 of sweep_indices
 ```
 
-`summary` reports statistics of every point that it gets. With `downsample=N`, `summary`
-adds `N` x/y points per (trace, sweep) to `stats`. When there are at most 10000 such
-series, it adds at most 20000 points in total. The size of the summary grows with the
-number of traces times the number of sweeps. On large files, select a few traces or
-sweeps. If you call `summarize` on a TraceSet that `extract` already downsampled,
-`summarize` reports statistics of the downsampled points.
+`summary` reports statistics of every point that it gets. With `tolerance` or
+`downsample`, each entry of `stats` also lists the points that the reduction keeps
+(`x`, `y`) and the error that they leave (`max_error`, a fraction of the range of the
+trace). Without either, `summary` lists no points. All the lists together hold at most
+1000 points (about 12k tokens of JSON), shared by the (trace, sweep) series, with at
+least 2 for each series. The size of the summary grows with the number of traces times
+the number of sweeps. On large files, select a few traces or sweeps. If you call
+`summarize` on a TraceSet that `extract` already downsampled, `summarize` reports
+statistics of the downsampled points.
+
+## Shape-preserving reduction
+
+An agent cannot read millions of points. Evenly spaced points do not help: they miss
+peaks, edges and glitches. Thus the `text` report and the points of `summary` show the
+fewest real samples that keep the shape of each trace. `spice_result_parser.reduce`
+implements this reduction. It is a greedy Douglas-Peucker simplification with a
+vertical error bound:
+
+1. It keeps the first and last samples, and both sides of each change between finite
+   values, NaN and infinity. Thus a gap or an overflow stays visible.
+2. It keeps the lowest and highest sample of each trace, so a peak shows with its
+   exact value and position.
+3. It draws straight lines between the kept samples. It finds the sample that is
+   farthest from its line, as a fraction of the range of its trace, and keeps it.
+4. It repeats step 3 until every sample is within `tolerance` of the lines, or until the
+   row budget runs out.
+
+The reduction never computes a value: each row is a sample of the file. The error
+bound also limits the error of the area under a trace (the charge of a current) to
+`tolerance` times the range times the duration. In the `text` report, the traces of one
+table share their rows. Thus every row holds real samples at the same x.
+
+| Parameter | Effect |
+|---|---|
+| `tolerance` | The error bound, as a fraction of the range of each trace in the selection. The default is 0.01 (1%). With 0, only samples on a straight line are dropped. |
+| `downsample` | For `text`, the most rows per table. For `summary`, the most points per trace and sweep. |
+| `xrange` | The range is that of the selection. Thus a window on a small-signal part (settling, ripple) shows that part in detail. |
+
+For AC data (and noise), the reduction measures along a log-frequency axis, and it
+compares a linear `_Mag` trace in dB. On a Bode plot, the roll-off is then as accurate
+as the passband. The values shown stay in the `ac_format` that you selected.
+
+The `png` plot draws each line from its envelope. The envelope is the first, last,
+lowest and highest sample of each run of samples. Thus a spike of one sample stays
+visible. `csv`, `npz` and the Python arrays keep every point.
+
+```python
+from spice_result_parser import reduce
+idx, error = reduce.breakpoints(x, [y], [reduce.finite_span([y])], 0.01)  # indices into x and y
+```
 
 The reader applies `xrange` while the file streams. It never stores rows outside the
 closed interval, so peak memory follows the window and not the column length. With a 10%
@@ -290,7 +336,7 @@ pip install 'spice_result_parser[mcp]'
 ```
 
 Tools: `list_traces(path, names, plot, ac_format, header_only)`, `extract(path, names,
-sweeps, output, downsample, dest, xrange, yrange, plot, ac_format)` and
+sweeps, output, downsample, tolerance, dest, xrange, yrange, plot, ac_format)` and
 `read_measures(path, names, rows)`. `list_traces` and `extract` accept HSPICE result
 files and Nutmeg rawfiles. `read_measures` accepts HSPICE measure files. `plot` selects
 one plot of a rawfile. `ac_format` names AC traces as above. `list_traces` and `extract`
@@ -308,8 +354,8 @@ Over MCP, `output` is one of these values:
 
 - `text` (default)
 - `summary`: the `list_traces` fields for the selected data, `sweep_indices`, and
-  per-trace and per-sweep `stats` as JSON with exact floats, plus downsampled points when
-  you set `downsample`
+  per-trace and per-sweep `stats` as JSON with exact floats, plus the points that the
+  reduction keeps when you set `tolerance` or `downsample`
 - `csv` or `npz`: write a file
 - `png`: write a plot
 
@@ -348,9 +394,15 @@ directory of the server. The server can run in a different directory from the ag
    in [0, 2e-08]`. If the window keeps no point, the line starts with
    `no points in xrange` and the text ends there.
 5. A `trace min max` table over every point (NaN values skipped).
-6. One table per sweep, with x once and one column per trace. Each table holds
-   `downsample` evenly spaced rows, first and last included. All the tables together
-   hold at most 500 rows.
+6. One table per sweep, with x once and one column per trace. The rows are the samples
+   that the [shape-preserving reduction](#shape-preserving-reduction) keeps. The header
+   gives their count and the error bound that they meet, for example
+   `200001 points (38 shown, each trace within 1% of its range)`. A table holds at most
+   `downsample` rows. All the tables together hold at most 500 rows and 2000 numbers. If
+   that budget runs out first, the header gives the error that it reached.
+
+A trace that holds one value in the whole selection does not get a column. A
+`constant:` line names it with its value, for example `constant: v_0 = 0`.
 
 When there are more than 20 tables, `text` shows only the first 10 and the last 10. One
 line counts the tables that it omits. If one row per (sweep, trace) pair gives more than
@@ -362,8 +414,8 @@ counts the traces that the text omits. Select fewer `names` to see them.
 
 `text` rounds values to 6 significant digits. NaN and infinity print as `nan`/`inf`.
 
-`spice_result_parser.mcp_server.format_text(ts, points=20)` renders any `TraceSet` as
-the same text. The module imports without the `mcp` package. Only `srp-mcp` itself
+`spice_result_parser.mcp_server.format_text(ts, points=None, tolerance=0.01)` renders any
+`TraceSet` as the same text. `points` is the most rows per table. The module imports without the `mcp` package. Only `srp-mcp` itself
 needs it.
 
 `xrange=[lo, hi]` restricts every output to the rows whose x value lies in that closed
@@ -376,11 +428,14 @@ request the magnitude and the phase in separate calls.
 `downsample` is optional over MCP. If you leave it unset, its default depends on the
 output:
 
-- `text`: 20 rows per table
+- `text`: the rows that `tolerance` needs, within the budget
 - `summary`: statistics only
 - `csv` and `npz`: no downsampling at all, so these keep every point
 
 A value below 2 is an error for every output.
+
+`tolerance` applies to `text` and `summary` only. With `csv`, `npz` or `png` it is an
+error, because these keep or draw every point.
 
 `dest` names the output file for `csv`/`npz`/`png`. A `dest` value with `text` or
 `summary` output is an error. The server does not restrict `dest` to the input's

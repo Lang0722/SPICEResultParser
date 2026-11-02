@@ -42,7 +42,7 @@ try:
 except ImportError:
     ToolAnnotations = None
 
-from . import api, measure
+from . import api, measure, reduce
 from .reader import AC_FORMATS
 
 server = FastMCP("spice-result-parser") if FastMCP is not None else None
@@ -100,6 +100,8 @@ TEXT_MAX_TABLES = 20    # tables one text result may hold: the first and the las
 TEXT_MAX_STATS = 100    # min/max rows per (sweep, trace); above it, one row per trace over all
                         # sweeps, and at most this many traces
 TEXT_MAX_TRACES = 16    # trace columns in the point tables; the min/max table lists more
+TEXT_MAX_CELLS = 2000   # numbers the point tables may hold, x included: bounds wide tables
+TEXT_MAX_CONSTANTS = 20 # traces named on the "constant:" line
 MAX_RUNS = 32           # split a sweep on x restarts only up to this many runs
 MCP_MAX_RANGES = 100    # traces whose [min, max] one JSON result lists; names= narrows to others
 
@@ -159,27 +161,71 @@ def _plot_extent(ts) -> str:
     return f"the whole plot has {ts.plot_points} points with {ts.header.x_name} in {_interval(ts.plot_x_range)}"
 
 
-def format_text(ts, points: int = 20) -> str:
-    """Agent-readable text for a TraceSet: a header, per-trace min/max, then one row
-    per sample with x once and one column per trace.
+def _constant_value(arrays):
+    """The value every sample of the arrays holds (NaN equal to NaN); None when they vary
+    or hold no sample."""
+    value = None
+    for a in arrays:
+        a = np.asarray(a)
+        if not a.size:
+            continue
+        if value is None:
+            value = a[0]
+        same = np.isnan(a) if np.isnan(value) else a == value
+        if not same.all():
+            return None
+    return value
 
-    Numbers are rounded to 6 significant digits; NaN and infinity print as nan/inf.
-    The header gives the x range of the data and, when an x window was applied, a line
-    gives the whole plot's point count and x range. `points` rows are shown per table
-    (evenly spaced, first and last kept), at most TEXT_MAX_ROWS in total; the header
-    says how many points exist and, when rows were dropped, how many are shown. Each
-    sweep gets its own table, and a sweep whose x restarts (a nested .dc written flat)
-    one table per run. Of more than TEXT_MAX_TABLES tables only the first and the last
-    TEXT_MAX_TABLES // 2 are shown, and the min/max table holds one row per trace over
-    all sweeps when per-sweep rows would exceed TEXT_MAX_STATS. The point tables hold at
-    most TEXT_MAX_TRACES traces and the min/max table at most TEXT_MAX_STATS; a line
-    counts the traces left out.
+
+def _percent(fraction: float) -> str:
+    return f"{100 * fraction:.3g}%"
+
+
+def _fidelity(tolerance: float, reached: float, floor: float, db: bool) -> str:
+    """What the rows shown guarantee: the error bound met, or the one the row budget left."""
+    note = "; _Mag compared in dB" if db else ""
+    if reached <= max(tolerance, floor):
+        return f"each trace within {_percent(tolerance)} of its range{note}"
+    narrow = "the row budget ran out; narrow xrange or select fewer traces"
+    if math.isinf(reached):
+        return f"no error bound: {narrow}"
+    return f"each trace within {_percent(reached)} of its range, not {_percent(tolerance)}: {narrow}{note}"
+
+
+def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFAULT_TOLERANCE) -> str:
+    """Agent-readable text for a TraceSet: a header, per-trace min/max, then a table per
+    sweep with x once and one column per trace.
+
+    The tables do not show every point. They show the fewest real samples such that
+    straight lines between them stay within `tolerance` (a fraction of each trace's range
+    over the selection) of every sample: reduce.breakpoints, shared by the traces of a
+    table. On AC data the rows are chosen on a log-frequency axis, with _Mag compared in
+    dB. The header gives the x range, the point count and, when rows were dropped, how
+    many are shown and the error bound they meet. A table holds at most `points` rows
+    (None: no limit but the budget); all of them hold at most TEXT_MAX_ROWS rows and
+    TEXT_MAX_CELLS numbers. When the budget runs out first, the header gives the bound
+    reached instead. A trace that holds one value is named on a "constant:" line instead.
+
+    Numbers are rounded to 6 significant digits; NaN and infinity print as nan/inf, and
+    a change into or out of them is always shown. When an x window was applied, a line
+    gives the whole plot's point count and x range. Each sweep gets its own table, and a
+    sweep whose x restarts (a nested .dc written flat) one table per run. Of more than
+    TEXT_MAX_TABLES tables only the first and the last TEXT_MAX_TABLES // 2 are shown, and
+    the min/max table holds one row per trace over all sweeps when per-sweep rows would
+    exceed TEXT_MAX_STATS. The point tables hold at most TEXT_MAX_TRACES traces and the
+    min/max table at most TEXT_MAX_STATS; a line counts the traces left out.
     """
     h = ts.header
     x_name, traces = h.x_name, ts.selected[1:]
     nsweeps = len(ts.sweep_values)
     total = sum(int(ts.data[x_name][i].size) for i in range(nsweeps))
-    columns = traces[:TEXT_MAX_TRACES]
+    constant = {}
+    for name in traces:
+        value = _constant_value(ts.data[name])
+        if value is not None:
+            constant[name] = value
+    varying = [name for name in traces if name not in constant]
+    columns = varying[:TEXT_MAX_TRACES]
 
     # (label, slice, sweep index) per table
     tables = []
@@ -197,22 +243,31 @@ def format_text(ts, points: int = 20) -> str:
         half = TEXT_MAX_TABLES // 2
         hidden = len(tables) - 2 * half
         tables = tables[:half] + [None] + tables[-half:]
-    per_table = max(2, min(points, TEXT_MAX_ROWS // max(1, len(tables) - bool(hidden))))
+    budget = min(TEXT_MAX_ROWS, TEXT_MAX_CELLS // (1 + len(columns)))
+    per_table = max(2, budget // max(1, len(tables) - bool(hidden)))
+    if points is not None:
+        per_table = max(2, min(per_table, points))
 
+    log = reduce.log_frequency(h)
+    db = {name: reduce.in_db(h, name) for name in columns}
+    spans = {name: reduce.finite_span(reduce.y_criterion(a, db[name]) for a in ts.data[name])
+             for name in columns}
+    floor = 4 * float(np.finfo(h.dtype).eps)
     body: List[str] = []
-    shown = 0
-    for table in tables:
+    shown, reached = 0, 0.0
+    for table in tables if columns else []:
         if table is None:
             tip = "pass sweeps=[...] to see them" if nsweeps > 1 else "output='csv' writes every point"
             body.append(f"-- {hidden} tables not shown; {tip} --")
             continue
         label, sl, i = table
         x = ts.data[x_name][i][sl]
-        idx = api.decimation_indices(x.size, per_table)
-        cols = [x] + [ts.data[name][i][sl] for name in columns]
-        if idx is not None:
-            cols = [c[idx] for c in cols]
-        shown += int(cols[0].size)
+        idx, error = reduce.breakpoints(
+            reduce.x_criterion(x, log), [reduce.y_criterion(ts.data[name][i][sl], db[name]) for name in columns],
+            [spans[name] for name in columns], tolerance, per_table, floor)
+        reached = max(reached, error)
+        cols = [x[idx]] + [ts.data[name][i][sl][idx] for name in columns]
+        shown += int(idx.size)
         rows = [[x_name, *columns]] + [[_num(v) for v in row] for row in zip(*cols)]
         if label:
             body.append(f"-- {label} --")
@@ -224,8 +279,8 @@ def format_text(ts, points: int = 20) -> str:
     head += f" | {total} points"
     if nsweeps > 1:
         head += f" in {nsweeps} sweeps"
-    if shown < total:
-        head += f" ({shown} shown)"
+    if body and shown < total:
+        head += f" ({shown} shown, {_fidelity(tolerance, reached, floor, any(db.values()))})"
     if len(h.plot_names) > 1:
         head += f" | plot {h.plot}: {h.plot_names[h.plot]} (file has {len(h.plot_names)} plots)"
     lines = [TRUNCATED_LINE] if ts.truncated else []
@@ -242,9 +297,13 @@ def format_text(ts, points: int = 20) -> str:
         return "\n".join(lines)
     if ts.xrange is not None:
         lines.append(f"window: xrange {_interval(ts.xrange)}; {_plot_extent(ts)}")
-    if traces:
-        listed = traces[:TEXT_MAX_STATS]
-        if nsweeps <= 1 or nsweeps * len(traces) <= TEXT_MAX_STATS:
+    if constant:
+        named = [f"{name} = {_num(v)}" for name, v in list(constant.items())[:TEXT_MAX_CONSTANTS]]
+        more = len(constant) - len(named)
+        lines.append("constant: " + ", ".join(named) + (f", and {more} more" if more else ""))
+    if varying:
+        listed = varying[:TEXT_MAX_STATS]
+        if nsweeps <= 1 or nsweeps * len(varying) <= TEXT_MAX_STATS:
             stats = [["trace", "min", "max"]]
             for i in range(nsweeps):
                 tag = f"[{ts.sweep_indices[i]}]" if nsweeps > 1 else ""
@@ -254,12 +313,13 @@ def format_text(ts, points: int = 20) -> str:
             stats = [[f"trace (all {nsweeps} sweeps)", "min", "max"]]
             stats += [[name, *_min_max(ts.data[name])] for name in listed]
         lines += ["", *_table(stats)]
-        if len(listed) < len(traces):
-            lines.append(f"-- {len(traces) - len(listed)} more traces not shown; select fewer names --")
-    if len(columns) < len(traces):
-        lines += ["", f"-- the tables below show the first {len(columns)} of {len(traces)} traces; "
+        if len(listed) < len(varying):
+            lines.append(f"-- {len(varying) - len(listed)} more traces not shown; select fewer names --")
+    if len(columns) < len(varying):
+        lines += ["", f"-- the tables below show the first {len(columns)} of {len(varying)} traces; "
                       f"select names to see the others --"]
-    lines += ["", *body]
+    if body:
+        lines += ["", *body]
     return "\n".join(lines)
 
 
@@ -375,9 +435,19 @@ def extract(
                     "\"summary\": JSON with exact numbers. \"csv\" / \"npz\": write every "
                     "point to a file. \"png\": write a plot image.")] = "text",
     downsample: Annotated[Optional[int], Field(
-        description="Evenly spaced points kept per sweep, first and last included; at least "
-                    "2. Default: text 20 rows per table, csv/npz every point, summary no "
-                    "points (statistics only). png draws at most 5000 points per line.")] = None,
+        description="csv/npz: keep this many evenly spaced points per sweep, first and last "
+                    "included (default: every point). text: at most this many rows per table. "
+                    "summary: list at most this many x/y points per trace and sweep (default: "
+                    "none, statistics only). At least 2. png always draws every point's "
+                    "envelope.")] = None,
+    tolerance: Annotated[Optional[float], Field(
+        description="text and summary: how far straight lines between the rows shown may "
+                    "stray from any point, as a fraction of each trace's range in the "
+                    "selection (default 0.01 = 1%; 0 drops only points on a straight line). "
+                    "Rows are real samples, each trace's min and max among them. The range is "
+                    "the selection's, so an xrange on a small-signal part (settling, ripple) "
+                    "shows it in detail; lower tolerance for more rows anywhere. AC: chosen on "
+                    "log frequency, _Mag compared in dB. An error with csv, npz and png.")] = None,
     dest: Annotated[Optional[str], Field(
         description="Output path for csv/npz/png (an absolute path is best); replaces an "
                     "existing file, but never the input. Default: <input>_<ext>_traces.<output> "
@@ -400,16 +470,17 @@ def extract(
     with xrange to zoom in; use csv or npz to hand every point to other tools.
 
     text: "TRUNCATED" first when the simulation had not finished writing; a header
-    (analysis, x and its range, point count, "(n shown)" when rows were dropped); with
-    xrange, the whole plot's extent; a min/max table; then one table per sweep with x
-    once and a column per trace (at most 16), at most 500 rows. Of more than 20 tables
-    the first and last 10 are shown. Values have 6 significant digits.
+    (analysis, x range, point count, rows shown and their error bound); with xrange, the
+    whole plot's extent; constant traces on one line; a min/max table; then a table per
+    sweep with x once and a column per trace (at most 16). The rows are real samples:
+    the fewest whose straight lines stay within tolerance of every point, so peaks,
+    edges and glitches stay. Values have 6 significant digits.
 
     The JSON outputs hold list_traces' fields for the data read: x, x_range, points,
     sweeps, truncated, traces, ranges (at most 100; then a "note").
     summary: also sweep_values, sweep_indices and stats: per trace and sweep count,
-    min, max, mean (NaN skipped), first, last, plus x/y points when downsample is set.
-    Exact floats; NaN and inf become null. It grows with traces x sweeps: select a few.
+    min, max, mean (NaN skipped), first, last; with downsample or tolerance, x/y points
+    chosen the same way and their max_error. NaN and inf become null.
     csv, npz, png: the file is written; the result adds output, dest (absolute),
     sweep_indices when sweeps was given, and for png size [w, h]. For AC, plot the
     magnitude and the phase separately.
@@ -419,6 +490,8 @@ def extract(
     if output not in MCP_OUTPUTS:
         raise ValueError(f"output must be one of {MCP_OUTPUTS}, not {output!r}")
     downsample = api.check_downsample(downsample)
+    tolerance = api.check_tolerance(tolerance)
+    api.reject_tolerance(output, tolerance)
     xrange = api.validate_range("xrange", xrange)
     yrange = api.validate_range("yrange", yrange, finite=True)
     if output in ("text", "summary"):
@@ -426,8 +499,8 @@ def extract(
             raise ValueError(f"dest applies to csv, npz and png only, not to output={output!r}")
         ts = api.extract(path, names, sweeps, "arrays", xrange=xrange, plot=plot, ac_format=ac_format)
         if output == "text":
-            return format_text(ts, 20 if downsample is None else downsample)
-        return _json_result(api.summarize(ts, downsample), ts)
+            return format_text(ts, downsample, reduce.DEFAULT_TOLERANCE if tolerance is None else tolerance)
+        return _json_result(api.summarize(ts, downsample, tolerance), ts)
     api.resolve_dest(path, output, dest)             # fail before the read, not after it
     if output == "png":
         api._require_matplotlib()
