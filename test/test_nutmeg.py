@@ -966,7 +966,7 @@ class TestFormatText(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def text(self, path, names=None, points=20, **kw):
+    def text(self, path, names=None, points=None, **kw):
         return self.m.format_text(api.extract(path, names, output="arrays", **kw), points)
 
     def test_importable_without_mcp(self):
@@ -993,22 +993,26 @@ class TestFormatText(unittest.TestCase):
         self.assertEqual([l.split() for l in lines[6:]], [["0", "0"], ["1", "1"]])   # a straight line: two rows
         self.assertEqual(t.count("v_v-sweep"), 2)   # header and column heading, never per trace
 
-    def test_points_keeps_first_and_last(self):
+    def test_points_too_few_for_the_tolerance_give_an_envelope(self):
         t = self.text(ASCII, ["v_out"], points=3)
         lines = t.splitlines()
-        self.assertTrue(lines[0].startswith("transient | x: time in [0, 2e-08] | 80 points (3 shown, each trace "
-                                            "within "))
-        self.assertIn("not 1%: the row budget ran out", lines[0])
-        table = lines[lines.index("", 2) + 1:]                    # after the min/max table
-        self.assertEqual(table[0].split(), ["time", "v_out"])
-        rows = [l.split() for l in table[1:]]
+        self.assertTrue(lines[0].startswith("transient | x: time in [0, 2e-08] | 80 points (an envelope of 3 x "
+                                            "slices: too dense to follow every trace within 1% in 3 rows; "
+                                            "narrow xrange to see the waveform)"))
+        table = lines[lines.index(f"-- envelope: each row is a slice with every trace's min and max --") + 1:]
+        self.assertEqual(table[0].split(), ["time_from", "time_to", "min(v_out)", "max(v_out)"])
+        rows = [[float(v) for v in l.split()] for l in table[1:]]
         self.assertEqual(len(rows), 3)
-        self.assertEqual((rows[0][0], rows[-1][0]), ("0", "2e-08"))
+        self.assertEqual((rows[0][0], rows[-1][1]), (0.0, 2e-08))
+        y = read_traces(ASCII, ["v_out"]).data["v_out"][0]
+        self.assertAlmostEqual(min(r[2] for r in rows), y.min(), places=5)     # real extremes, every slice
+        self.assertAlmostEqual(max(r[3] for r in rows), y.max(), places=5)
 
     def test_ac_plot(self):
-        t = self.text(BIN, ["v(out)"], plot=1, points=6)
+        t = self.text(BIN, ["v(out)"], plot=1, points=None)
         lines = t.splitlines()
-        self.assertTrue(lines[0].startswith("ac | x: frequency in [1, 1e+09] | 46 points (6 shown, "))
+        self.assertTrue(lines[0].startswith("ac | x: frequency in [1, 1e+09] | 46 points ("))
+        self.assertIn("shown, each trace within 1% of its range; _Mag compared in dB)", lines[0])
         self.assertEqual(lines[1], self.m.AC_LEGEND["magphase"])
         self.assertEqual(lines[7].split(), ["frequency", "v_out_Mag", "v_out_Phase"])
         self.assertEqual(lines[8].split()[0], "1")
@@ -1023,14 +1027,14 @@ class TestFormatText(unittest.TestCase):
         sweeps = []
         rng = np.random.default_rng(5)
         for n, r in ((150, 1000.0), (97, 2000.0), (231, 3000.0)):
-            data = rng.random((n, 2))
-            data[:, 0] = np.linspace(0, 1e-6, n)
+            data = np.c_[np.linspace(0, 1e-6, n), np.linspace(0, r / 1000, n)]   # a ramp per sweep
             sweeps.append(([r], data))
         path = self.dir / "ms.tr0"
         fixtures.write_binary(path, "2001", ["TIME", "v(a", "r1"], [1, 1], sweeps)
         t = self.text(path, points=3)
         lines = t.splitlines()
-        self.assertTrue(lines[0].startswith("transient | x: TIME in [0, 1e-06] | 478 points in 3 sweeps (9 shown, "))
+        self.assertEqual(lines[0], "transient | x: TIME in [0, 1e-06] | 478 points in 3 sweeps (6 shown, each "
+                                   "trace within 1% of its range)")
         self.assertEqual(lines[3].split()[0], "v_a[0]")
         self.assertEqual(lines[5].split()[0], "v_a[2]")
         self.assertEqual([l for l in lines if l.startswith("--")],
@@ -1038,7 +1042,7 @@ class TestFormatText(unittest.TestCase):
         self.assertEqual(lines[-1].split()[0], "1e-06")
         # one sweep kept: plain table, no sweep labels
         one = self.text(path, points=3, sweeps=[2])
-        self.assertTrue(one.startswith("transient | x: TIME in [0, 1e-06] | 231 points (3 shown, "))
+        self.assertTrue(one.startswith("transient | x: TIME in [0, 1e-06] | 231 points (2 shown, "))
         self.assertNotIn("--", one)
         self.assertNotIn("v_a[", one)                             # no per-sweep tags
 
@@ -1102,9 +1106,16 @@ class TestFormatText(unittest.TestCase):
 
     def test_row_cap(self):
         t = self.m.format_text(api.extract(HERE / "test_9601.tr0", ["v_vo"]), 10 ** 6, tolerance=0)
-        self.assertIn(f"({self.m.TEXT_MAX_ROWS} shown, each trace within ", t.splitlines()[0])
-        self.assertIn("not 0%: the row budget ran out", t.splitlines()[0])
-        self.assertEqual(len(t.splitlines()), 6 + self.m.TEXT_MAX_ROWS)
+        lines = t.splitlines()
+        self.assertIn(f"(an envelope of {self.m.TEXT_MAX_ROWS} x slices: too dense to follow every trace "
+                      f"within 0% in {self.m.TEXT_MAX_ROWS} rows", lines[0])
+        # adaptive time steps leave some slices without a sample: the label says so
+        label = ("-- envelope: each row is a slice with every trace's min and max; slices without a sample "
+                 "are left out --")
+        rows = [[float(v) for v in l.split()] for l in lines[lines.index(label) + 2:]]
+        self.assertLessEqual(len(rows), self.m.TEXT_MAX_ROWS)
+        self.assertGreater(len(rows), 100)
+        self.assertTrue(any(a[1] != b[0] for a, b in zip(rows, rows[1:])))   # the gaps are visible
 
     def test_many_sweeps_are_capped(self):
         rng = np.random.default_rng(9)
@@ -1119,13 +1130,17 @@ class TestFormatText(unittest.TestCase):
         heads = [l for l in lines if l.startswith("--")]
         self.assertEqual(len(heads), self.m.TEXT_MAX_TABLES + 1)
         self.assertIn("-- 40 tables not shown; pass sweeps=[...] to see them --", heads)
-        self.assertEqual(heads[0], "-- sweep 0: r1=0 --")
-        self.assertEqual(heads[-1], "-- sweep 59: r1=59 --")
+        self.assertEqual(heads[0], "-- sweep 0: r1=0; envelope: each row is a slice with every trace's min and max --")
+        self.assertEqual(heads[-1], "-- sweep 59: r1=59; envelope: each row is a slice with every trace's min and max --")
         self.assertIn("(all 60 sweeps)", lines[2])                # one min/max row per trace
         self.assertEqual(lines[3].split()[0], "v_a")
         self.assertEqual(lines[4].split()[0], "v_b")
-        self.assertIn("(400 shown, ", lines[0])                    # 20 tables of 20 rows
-        self.assertIn(f"({self.m.TEXT_MAX_ROWS} shown, ", self.text(path, points=100).splitlines()[0])
+        # 20 tables share 500 rows and 2000 numbers: 6 numbers a slice, so 16 slices each
+        self.assertIn("(an envelope of 16 x slices per table: too dense to follow every trace within 1% in "
+                      "25 rows per table; narrow xrange to see the waveform)", lines[0])
+        self.assertIn("in 20 rows per table", self.text(path, points=20).splitlines()[0])
+        rows = [l for l in lines if l.strip()[:1].isdigit()]
+        self.assertLessEqual(len(rows) * 6, self.m.TEXT_MAX_CELLS)
         self.assertEqual(lines[3].split()[1:], [self.m._num(min(d[:, 1].min() for _, d in sweeps)),
                                                 self.m._num(max(d[:, 1].max() for _, d in sweeps))])
 
@@ -1190,7 +1205,7 @@ class TestMcp(unittest.TestCase):
         out = self.m.extract(str(BIN), ["v(out)"], plot=2)
         self.assertIsInstance(out, str)
         self.assertTrue(out.startswith("dc sweep | x: v_v-sweep in [0, 1] | 5 points"))
-        self.assertIn("(6 shown, ", self.m.extract(str(BIN), ["v(out)"], plot=1, downsample=6))
+        self.assertIn("(an envelope of 6 x slices: ", self.m.extract(str(BIN), ["v(out)"], plot=1, downsample=6))
         tools = {t.name: t for t in asyncio.run(self.m.server.list_tools())}
         schema = getattr(tools["extract"], "inputSchema", None) or tools["extract"].input_schema
         self.assertEqual(schema["properties"]["output"]["default"], "text")

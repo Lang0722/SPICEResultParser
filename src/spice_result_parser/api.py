@@ -178,13 +178,15 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None, tolerance: Optiona
     Points are x and y lists of real samples, chosen per trace and sweep by
     reduce.breakpoints: straight lines between them stay within tolerance (default
     reduce.DEFAULT_TOLERANCE) of every sample, as a fraction of the trace's range over ts
-    (for an AC _Mag trace, its range in dB). max_error gives the bound met, which is
-    larger than tolerance only when the points ran out first. A series holds at most
-    downsample points, and all of them at most SUMMARY_MAX_POINTS, shared evenly by the
-    (trace, sweep) series (at least 2 each, so the cap holds only up to
-    SUMMARY_MAX_POINTS / 2 series). The statistics always grow with the number of
-    series: select a few names or sweeps on large files. NaN and infinities are emitted
-    as null.
+    (for an AC _Mag trace, its range in dB); max_error gives the bound met. A series too
+    dense to follow within its points (an oscillation, a switching node) gets an
+    "envelope" instead: {"from", "to", "min", "max"} lists, one entry per slice of x with
+    the slice's bounds and the trace's lowest and highest sample in it (reduce.peak_detect).
+    A series holds at most downsample points (or half as many slices), and all of them at
+    most SUMMARY_MAX_POINTS, shared evenly by the (trace, sweep) series (at least 2 each,
+    so the cap holds only up to SUMMARY_MAX_POINTS / 2 series). The statistics always grow
+    with the number of series: select a few names or sweeps on large files. NaN and
+    infinities are emitted as null.
     """
     h = ts.header
     x = ts.data[h.x_name]
@@ -214,9 +216,15 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None, tolerance: Optiona
                              first=_json_float(a[0]), last=_json_float(a[-1]))
                 if with_points:
                     idx, error = reduce.breakpoints(x_criteria[i], [criteria[i]], [span], tolerance, cap, floor)
-                    entry["x"] = _json_floats(x[i][idx])
-                    entry["y"] = _json_floats(a[idx])
-                    entry["max_error"] = None if math.isinf(error) else float(f"{error:.3g}")
+                    if error <= max(tolerance, floor):
+                        entry["x"] = _json_floats(x[i][idx])
+                        entry["y"] = _json_floats(a[idx])
+                        entry["max_error"] = float(f"{error:.3g}")
+                    else:                           # too dense to follow: a peak-detect envelope instead
+                        start, stop, mins, maxs = reduce.peak_detect(x[i], [a], max(2, cap // 2), log)
+                        entry["envelope"] = {"from": [float(f"{v:.6g}") for v in start.tolist()],
+                                             "to": [float(f"{v:.6g}") for v in stop.tolist()],
+                                             "min": _json_floats(mins[0]), "max": _json_floats(maxs[0])}
             per_sweep.append(entry)
         stats[name] = per_sweep
     return {"path": h.path, "format": h.version, "analysis": h.analysis, "plot": h.plot,

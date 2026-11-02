@@ -6,7 +6,10 @@ point lists and the png plot. csv, npz and arrays keep every point. Nothing here
 new values: every index returned points at a sample of the file.
 
 breakpoints() is a greedy Douglas-Peucker simplification with a vertical error bound, on
-several traces that share their x values. envelope() keeps the first, last, lowest and
+several traces that share their x values. When a signal is too dense for it within the
+rows available (an oscillation, a switching node), peak_detect() gives the overview
+instead: every trace's lowest and highest sample in each slice of x, as an
+oscilloscope's peak-detect mode shows it. envelope() keeps the first, last, lowest and
 highest sample of equal runs of samples, for drawing a line.
 """
 from __future__ import annotations
@@ -183,6 +186,51 @@ def breakpoints(x: np.ndarray, ys: Sequence[np.ndarray], spans: Sequence[float],
                 heapq.heappush(heap, (-r, s, e, j))
     reached = -heap[0][0] if heap else 0.0
     return np.array(sorted(keep), dtype=np.intp), reached
+
+
+def peak_detect(x: np.ndarray, ys: Sequence[np.ndarray], count: int, log: bool = False):
+    """The envelope of traces that share x, as an oscilloscope's peak-detect mode shows it:
+    the x range is cut into `count` slices of equal width (equal in log10 x on a log axis,
+    when every x is positive), and each slice that holds samples gives its bounds and every
+    trace's lowest and highest sample in it (NaN skipped; NaN when it holds nothing else).
+
+    It is the overview for a signal too dense to follow with breakpoints (an oscillation, a
+    switching node): its amplitude over x stays visible, and every value is a real sample.
+
+    Returns (start, stop, mins, maxs): the bounds of the non-empty slices, in x units, and
+    per trace an array of the lowest and of the highest sample of each.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    use_log = log and x.size > 0 and bool(np.all(x > 0))
+    xc = np.log10(x) if use_log else x
+    valid = np.isfinite(xc)
+    if not valid.any():
+        empty = np.empty(0)
+        return empty, empty, [empty for _ in ys], [empty for _ in ys]
+    all_valid = bool(valid.all())
+    order = None if all_valid else np.flatnonzero(valid)    # None: every sample, in file order
+    xv = xc if all_valid else xc[order]
+    lo, hi = float(xv.min()), float(xv.max())
+    count = max(1, int(count)) if hi > lo else 1
+    width = (hi - lo) / count if hi > lo else 1.0
+    slot = np.minimum(((xv - lo) / width).astype(np.intp), count - 1)
+    if np.any(np.diff(slot) < 0):                   # x not monotonic: group the samples by slice
+        sort = np.argsort(slot, kind="stable")
+        order = sort if order is None else order[sort]
+        slot = slot[sort]
+    starts = np.flatnonzero(np.r_[True, slot[1:] != slot[:-1]])
+    used = slot[starts]
+    edges = lo + width * np.arange(count + 1, dtype=np.float64)
+    edges[-1] = hi
+    if use_log:
+        edges = 10 ** edges
+    mins, maxs = [], []
+    for y in ys:
+        values = np.asarray(y) if order is None else np.asarray(y)[order]
+        with np.errstate(invalid="ignore"):
+            mins.append(np.fmin.reduceat(values, starts))
+            maxs.append(np.fmax.reduceat(values, starts))
+    return edges[used], edges[used + 1], mins, maxs
 
 
 def envelope(y: np.ndarray, max_points: int) -> Optional[np.ndarray]:

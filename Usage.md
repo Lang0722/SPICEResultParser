@@ -144,7 +144,9 @@ s["stats"]["v_out"][2]["max"]                     # one sweep: index 2 of sweep_
 `summary` reports statistics of every point that it gets. With `tolerance` or
 `downsample`, each entry of `stats` also lists the points that the reduction keeps
 (`x`, `y`) and the error that they leave (`max_error`, a fraction of the range of the
-trace). Without either, `summary` lists no points. All the lists together hold at most
+trace). If the points cannot follow the trace within `tolerance`, the entry holds an
+`envelope` instead: `from`, `to`, `min` and `max` lists with one value per slice (half as
+many slices as points). Without either parameter, `summary` lists no points. All the lists together hold at most
 1000 points (about 12k tokens of JSON), shared by the (trace, sweep) series, with at
 least 2 for each series. The size of the summary grows with the number of traces times
 the number of sweeps. On large files, select a few traces or sweeps. If you call
@@ -165,8 +167,22 @@ vertical error bound:
    exact value and position.
 3. It draws straight lines between the kept samples. It finds the sample that is
    farthest from its line, as a fraction of the range of its trace, and keeps it.
-4. It repeats step 3 until every sample is within `tolerance` of the lines, or until the
-   row budget runs out.
+4. It repeats step 3 until every sample is within `tolerance` of the lines.
+
+If the rows available cannot follow a signal within `tolerance`, the signal is too
+dense for this method. Examples are an oscillation of many cycles and a switching node.
+The reduction then shows an envelope, as the peak-detect mode of an oscilloscope does
+(`reduce.peak_detect`):
+
+- It cuts the x range into slices of equal width (equal in log frequency for AC data).
+- Each slice gives one row: its bounds (`TIME_from`, `TIME_to`), then the lowest and
+  highest sample of every trace in it (`min(v_out)`, `max(v_out)`).
+- A slice without a sample is left out. The label of the table then says so.
+- The `text` envelope has 100 slices, or `downsample` slices, within the budget. To see
+  the waveform itself, narrow `xrange`.
+
+An envelope row cannot be read as a waveform, so the agent cannot mistake the slices for
+a slow oscillation. Each value is still a sample of the file.
 
 The reduction never computes a value: each row is a sample of the file. The error
 bound also limits the error of the area under a trace (the charge of a current) to
@@ -398,8 +414,11 @@ directory of the server. The server can run in a different directory from the ag
    that the [shape-preserving reduction](#shape-preserving-reduction) keeps. The header
    gives their count and the error bound that they meet, for example
    `200001 points (38 shown, each trace within 1% of its range)`. A table holds at most
-   `downsample` rows. All the tables together hold at most 500 rows and 2000 numbers. If
-   that budget runs out first, the header gives the error that it reached.
+   `downsample` rows. All the tables together hold at most 500 rows and 2000 numbers. A
+   table that is too dense to follow in its rows is an envelope instead: one row per
+   slice of x, with every trace's min and max. The header says so, for example
+   `200001 points (an envelope of 100 x slices: too dense to follow every trace within
+   1% in 500 rows; narrow xrange to see the waveform)`.
 
 A trace that holds one value in the whole selection does not get a column. A
 `constant:` line names it with its value, for example `constant: v_0 = 0`.

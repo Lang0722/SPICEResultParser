@@ -177,11 +177,15 @@ Douglas-Peucker simplification:
   each trace, and both sides of each NaN or infinite run.
 - A peak, an edge or a one-sample glitch stays visible. A straight part needs two rows.
 - For AC data, the reduction uses a log-frequency axis and compares `_Mag` in dB.
-- If the row budget runs out first, the report gives the error that it reached instead.
+- A signal that is too dense to follow in the rows available (an oscillation, a switching
+  node) gets an envelope instead. Each row is then a slice of x with the lowest and
+  highest sample of every trace, as in the peak-detect mode of an oscilloscope.
 
 For example, a 200,001-point step response with ringing and a 1 ns glitch needs 38 rows
 at 1%. These rows show the step, each ringing peak, the settling and the glitch. 20
-evenly spaced rows showed none of them.
+evenly spaced rows showed none of them. An oscillator start-up of 1,000 cycles cannot be
+followed in 500 rows. Its envelope shows the growth of the amplitude over the whole run
+in 100 rows. A narrow `xrange` then shows the waveform of a few cycles.
 
 The tolerance is relative to the selected range. Thus an `xrange` on a small-signal part,
 for example the settling tail, shows that part in detail. A smaller `tolerance` gives

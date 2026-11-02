@@ -230,6 +230,56 @@ class TestEnvelope(unittest.TestCase):
         self.assertIn(500, keep.tolist())
 
 
+class TestPeakDetect(unittest.TestCase):
+    def brute_force(self, x, y, count, log=False):
+        """The slices and their extremes, one slice at a time."""
+        xc = np.log10(x) if log else x
+        edges = np.linspace(xc.min(), xc.max(), count + 1)
+        rows = []
+        for k in range(count):
+            inside = (xc >= edges[k]) & ((xc < edges[k + 1]) if k < count - 1 else (xc <= edges[k + 1]))
+            if inside.any():
+                bounds = (10 ** edges[k], 10 ** edges[k + 1]) if log else (edges[k], edges[k + 1])
+                rows.append((*bounds, np.nanmin(y[inside]), np.nanmax(y[inside])))
+        return np.array(rows)
+
+    def test_matches_slice_by_slice(self):
+        rng = np.random.default_rng(6)
+        x = np.sort(rng.uniform(0, 1e-6, 5000))
+        y = rng.standard_normal(5000)
+        start, stop, mins, maxs = reduce.peak_detect(x, [y, -y], 37)
+        ref = self.brute_force(x, y, 37)
+        np.testing.assert_allclose(np.c_[start, stop], ref[:, :2], rtol=1e-12)
+        np.testing.assert_array_equal(mins[0], ref[:, 2])
+        np.testing.assert_array_equal(maxs[0], ref[:, 3])
+        np.testing.assert_array_equal(mins[1], -maxs[0])           # every trace on the same slices
+        self.assertTrue(set(mins[0]) <= set(y) and set(maxs[0]) <= set(y))   # real samples
+
+    def test_empty_slices_are_left_out(self):
+        x = np.r_[np.linspace(0, 0.9, 50), np.linspace(9.1, 10, 50)]   # nothing between 0.9 and 9.1
+        start, stop, _, _ = reduce.peak_detect(x, [x], 10)
+        self.assertEqual(start.size, 2)
+        self.assertEqual((start[0], stop[0], start[1], stop[1]), (0.0, 1.0, 9.0, 10.0))
+        start, _, _, _ = reduce.peak_detect(np.array([0.0, 1.0, 10.0]), [np.zeros(3)], 10)
+        self.assertEqual(start.tolist(), [0.0, 1.0, 9.0])               # a sample on an edge opens the next slice
+
+    def test_unordered_x_nan_x_and_nan_values(self):
+        x = np.array([0.5, 0.1, np.nan, 0.9, 0.2, 0.6])
+        y = np.array([5.0, 1.0, 99.0, 9.0, np.nan, 6.0])
+        start, stop, mins, maxs = reduce.peak_detect(x, [y], 2)
+        np.testing.assert_allclose(np.c_[start, stop], [[0.1, 0.5], [0.5, 0.9]])
+        self.assertEqual((mins[0].tolist(), maxs[0].tolist()), ([1.0, 5.0], [1.0, 9.0]))   # 99 has no x
+
+    def test_log_axis_and_single_x(self):
+        f = np.logspace(0, 6, 61)
+        y = np.log10(f)
+        start, stop, mins, _ = reduce.peak_detect(f, [y], 6, log=True)
+        np.testing.assert_allclose(start, [1, 10, 100, 1e3, 1e4, 1e5])   # a decade each
+        np.testing.assert_allclose(mins[0], [0, 1, 2, 3, 4, 5])
+        start, stop, mins, _ = reduce.peak_detect(np.full(5, 2.0), [np.arange(5.0)], 10)
+        self.assertEqual((start.tolist(), stop.tolist(), mins[0].tolist()), ([2.0], [2.0], [0.0]))
+
+
 class TestTolerance(unittest.TestCase):
     def test_validation(self):
         self.assertIsNone(reduce.check_tolerance(None))
@@ -317,8 +367,9 @@ class TestOutputs(unittest.TestCase):
         self.assertLessEqual(polyline_error(self.t, self.v, keep), 0.01 * span * (1 + 1e-9))
         self.assertNotIn("x", api.extract(self.path, output="summary")["stats"]["v_out"][0])
         capped = api.extract(self.path, output="summary", downsample=5)["stats"]["v_out"][0]
-        self.assertEqual(len(capped["x"]), 5)
-        self.assertGreater(capped["max_error"], 0.01)
+        self.assertNotIn("x", capped)                            # 5 points cannot follow it: an envelope
+        self.assertEqual(len(capped["envelope"]["from"]), 2)
+        self.assertEqual(max(capped["envelope"]["max"]), entry["max"])
         json.dumps(s, allow_nan=False)
 
     def test_constant_traces_are_one_line(self):
@@ -328,6 +379,74 @@ class TestOutputs(unittest.TestCase):
         self.assertEqual(heading, [["HERTZ", "v_vo_Mag", "v_vo_Phase", "i_vs_Mag", "i_vs_Phase"]])
         self.assertIn("_Mag compared in dB", text.splitlines()[0])
         self.assertNotIn("v_0_Mag", text.split("constant:")[1].split("\n", 1)[1])
+
+
+class TestEnvelopeFallback(unittest.TestCase):
+    """A signal too dense to follow within the rows: an oscillator start-up, 1000 cycles."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        t = np.linspace(0, 1e-6, 200_001)
+        cls.t = t
+        cls.v = 0.6 + 0.6 * (1 - np.exp(-t / 2e-7)) * np.sin(2 * np.pi * 1e9 * t)
+        cls.path = Path(cls.tmp.name) / "osc.tr0"
+        fixtures.write_binary(cls.path, "2001", ["TIME", "v(osc"], [1, 1], [([], np.c_[t, cls.v])])
+        from spice_result_parser import mcp_server
+        cls.m = mcp_server
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def table(self, text):
+        lines = text.splitlines()
+        start = next(i for i, line in enumerate(lines) if line.split()[:1] in (["TIME"], ["TIME_from"]))
+        return lines[start].split(), np.array([[float(c) for c in line.split()] for line in lines[start + 1:]])
+
+    def test_text_shows_the_envelope_over_the_whole_run(self):
+        text = self.m.format_text(read_traces(self.path))
+        self.assertIn("200001 points (an envelope of 100 x slices: too dense to follow every trace within 1% in "
+                      "500 rows; narrow xrange to see the waveform)", text.splitlines()[0])
+        self.assertIn("-- envelope: each row is a slice with every trace's min and max --", text)
+        heading, rows = self.table(text)
+        self.assertEqual(heading, ["TIME_from", "TIME_to", "min(v_osc)", "max(v_osc)"])
+        self.assertEqual(len(rows), 100)
+        self.assertEqual((rows[0, 0], rows[-1, 1]), (0.0, 1e-6))   # the whole run, not one corner of it
+        swing = rows[:, 3] - rows[:, 2]
+        self.assertLess(swing[0], 0.2)                             # the start-up grows ...
+        self.assertGreater(swing[-1], 1.1)                         # ... to the full swing
+        self.assertTrue(np.all(np.diff(swing) > -1e-3))
+        self.assertLess(len(text), 6000)
+
+    def test_zooming_in_shows_the_waveform(self):
+        text = self.m.format_text(read_traces(self.path, xrange=(5e-7, 5.03e-7)))
+        self.assertIn(" shown, each trace within 1% of its range)", text.splitlines()[0])
+        heading, rows = self.table(text)
+        self.assertEqual(heading, ["TIME", "v_osc"])
+        self.assertGreater(len(rows), 3 * 8)                       # three cycles, each drawn
+
+    def test_a_sweep_can_mix_followed_and_enveloped_tables(self):
+        t = self.t[:20_001]
+        step = np.where(t < 5e-8, 0.0, 1.0)
+        sweeps = [([1.0], np.c_[t, step]), ([2.0], np.c_[t, self.v[:20_001]])]
+        path = Path(self.tmp.name) / "mixed.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(a", "case"], [1, 1], sweeps)
+        text = self.m.format_text(read_traces(path))
+        self.assertIn("1 of 2 tables as envelopes: too dense to follow every trace within 1% in 250 rows per "
+                      "table", text.splitlines()[0])
+        self.assertIn("-- sweep 0: case=1 --", text)
+        self.assertIn("-- sweep 1: case=2; envelope: each row is a slice with every trace's min and max --", text)
+
+    def test_summary_gives_the_envelope(self):
+        s = api.extract(self.path, output="summary", tolerance=0.01, downsample=100)
+        entry = s["stats"]["v_osc"][0]
+        self.assertNotIn("x", entry)
+        env = entry["envelope"]
+        self.assertEqual(len(env["from"]), 50)                     # 100 points' worth: 50 slices
+        self.assertEqual((env["from"][0], env["to"][-1]), (0.0, 1e-6))
+        self.assertEqual((min(env["min"]), max(env["max"])), (entry["min"], entry["max"]))
+        json.dumps(s, allow_nan=False)
 
 
 class TestMcpTolerance(unittest.TestCase):

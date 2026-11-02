@@ -101,6 +101,7 @@ TEXT_MAX_STATS = 100    # min/max rows per (sweep, trace); above it, one row per
                         # sweeps, and at most this many traces
 TEXT_MAX_TRACES = 16    # trace columns in the point tables; the min/max table lists more
 TEXT_MAX_CELLS = 2000   # numbers the point tables may hold, x included: bounds wide tables
+TEXT_ENVELOPE_SLICES = 100  # slices of an envelope table, when downsample does not set them
 TEXT_MAX_CONSTANTS = 20 # traces named on the "constant:" line
 MAX_RUNS = 32           # split a sweep on x restarts only up to this many runs
 MCP_MAX_RANGES = 100    # traces whose [min, max] one JSON result lists; names= narrows to others
@@ -181,16 +182,6 @@ def _percent(fraction: float) -> str:
     return f"{100 * fraction:.3g}%"
 
 
-def _fidelity(tolerance: float, reached: float, floor: float, db: bool) -> str:
-    """What the rows shown guarantee: the error bound met, or the one the row budget left."""
-    note = "; _Mag compared in dB" if db else ""
-    if reached <= max(tolerance, floor):
-        return f"each trace within {_percent(tolerance)} of its range{note}"
-    narrow = "the row budget ran out; narrow xrange or select fewer traces"
-    if math.isinf(reached):
-        return f"no error bound: {narrow}"
-    return f"each trace within {_percent(reached)} of its range, not {_percent(tolerance)}: {narrow}{note}"
-
 
 def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFAULT_TOLERANCE) -> str:
     """Agent-readable text for a TraceSet: a header, per-trace min/max, then a table per
@@ -203,8 +194,11 @@ def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFA
     dB. The header gives the x range, the point count and, when rows were dropped, how
     many are shown and the error bound they meet. A table holds at most `points` rows
     (None: no limit but the budget); all of them hold at most TEXT_MAX_ROWS rows and
-    TEXT_MAX_CELLS numbers. When the budget runs out first, the header gives the bound
-    reached instead. A trace that holds one value is named on a "constant:" line instead.
+    TEXT_MAX_CELLS numbers. A table whose rows cannot meet the tolerance is too dense to
+    follow (an oscillation, a switching node): it becomes an envelope instead, one row
+    per slice of x with every trace's lowest and highest sample (reduce.peak_detect;
+    TEXT_ENVELOPE_SLICES slices, or `points`), and the header says so. A trace that
+    holds one value is named on a "constant:" line instead.
 
     Numbers are rounded to 6 significant digits; NaN and infinity print as nan/inf, and
     a change into or out of them is always shown. When an x window was applied, a line
@@ -243,10 +237,14 @@ def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFA
         half = TEXT_MAX_TABLES // 2
         hidden = len(tables) - 2 * half
         tables = tables[:half] + [None] + tables[-half:]
+    shown_tables = max(1, len(tables) - bool(hidden))
     budget = min(TEXT_MAX_ROWS, TEXT_MAX_CELLS // (1 + len(columns)))
-    per_table = max(2, budget // max(1, len(tables) - bool(hidden)))
+    per_table = max(2, budget // shown_tables)
     if points is not None:
         per_table = max(2, min(per_table, points))
+    # an envelope row holds a slice's two bounds and every trace's min and max
+    slices = max(2, min(per_table, TEXT_ENVELOPE_SLICES if points is None else points,
+                        TEXT_MAX_CELLS // ((2 + 2 * len(columns)) * shown_tables)))
 
     log = reduce.log_frequency(h)
     db = {name: reduce.in_db(h, name) for name in columns}
@@ -254,7 +252,7 @@ def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFA
              for name in columns}
     floor = 4 * float(np.finfo(h.dtype).eps)
     body: List[str] = []
-    shown, reached = 0, 0.0
+    shown, followed, enveloped = 0, 0, 0
     for table in tables if columns else []:
         if table is None:
             tip = "pass sweeps=[...] to see them" if nsweeps > 1 else "output='csv' writes every point"
@@ -262,13 +260,25 @@ def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFA
             continue
         label, sl, i = table
         x = ts.data[x_name][i][sl]
+        values = [ts.data[name][i][sl] for name in columns]
         idx, error = reduce.breakpoints(
-            reduce.x_criterion(x, log), [reduce.y_criterion(ts.data[name][i][sl], db[name]) for name in columns],
+            reduce.x_criterion(x, log), [reduce.y_criterion(v, db[name]) for v, name in zip(values, columns)],
             [spans[name] for name in columns], tolerance, per_table, floor)
-        reached = max(reached, error)
-        cols = [x[idx]] + [ts.data[name][i][sl][idx] for name in columns]
-        shown += int(idx.size)
-        rows = [[x_name, *columns]] + [[_num(v) for v in row] for row in zip(*cols)]
+        if error <= max(tolerance, floor):
+            followed += 1
+            cols = [x[idx]] + [v[idx] for v in values]
+            rows = [[x_name, *columns]] + [[_num(v) for v in row] for row in zip(*cols)]
+        else:                                       # too dense to follow: show it as a peak-detect envelope
+            enveloped += 1
+            start, stop, mins, maxs = reduce.peak_detect(x, values, slices, log)
+            cols = [start, stop] + [c for pair in zip(mins, maxs) for c in pair]
+            heading = [f"{x_name}_from", f"{x_name}_to"] + [f"{k}({name})" for name in columns
+                                                            for k in ("min", "max")]
+            rows = [heading] + [[_num(v) for v in row] for row in zip(*cols)]
+            label = (f"{label}; " if label else "") + "envelope: each row is a slice with every trace's min and max"
+            if np.any(start[1:] != stop[:-1]):     # the simulator stepped over some slices
+                label += "; slices without a sample are left out"
+        shown += len(rows) - 1
         if label:
             body.append(f"-- {label} --")
         body.extend(_table(rows))
@@ -279,8 +289,17 @@ def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFA
     head += f" | {total} points"
     if nsweeps > 1:
         head += f" in {nsweeps} sweeps"
-    if body and shown < total:
-        head += f" ({shown} shown, {_fidelity(tolerance, reached, floor, any(db.values()))})"
+    if body:
+        each = " per table" if shown_tables > 1 else ""
+        fidelity = (f"each trace within {_percent(tolerance)} of its range"
+                    + ("; _Mag compared in dB" if any(db.values()) else ""))
+        dense = f"too dense to follow every trace within {_percent(tolerance)} in {per_table} rows{each}"
+        if not enveloped and shown < total:
+            head += f" ({shown} shown, {fidelity})"
+        elif enveloped and not followed:
+            head += f" (an envelope of {slices} x slices{each}: {dense}; narrow xrange to see the waveform)"
+        elif enveloped:
+            head += f" ({shown} rows shown, {fidelity}; {enveloped} of {enveloped + followed} tables as envelopes: {dense})"
     if len(h.plot_names) > 1:
         head += f" | plot {h.plot}: {h.plot_names[h.plot]} (file has {len(h.plot_names)} plots)"
     lines = [TRUNCATED_LINE] if ts.truncated else []
@@ -444,10 +463,12 @@ def extract(
         description="text and summary: how far straight lines between the rows shown may "
                     "stray from any point, as a fraction of each trace's range in the "
                     "selection (default 0.01 = 1%; 0 drops only points on a straight line). "
-                    "Rows are real samples, each trace's min and max among them. The range is "
-                    "the selection's, so an xrange on a small-signal part (settling, ripple) "
-                    "shows it in detail; lower tolerance for more rows anywhere. AC: chosen on "
-                    "log frequency, _Mag compared in dB. An error with csv, npz and png.")] = None,
+                    "Rows are real samples, each trace's min and max among them. A signal too "
+                    "dense for that in the rows (oscillation, switching) shows as an envelope "
+                    "of x slices instead; narrow xrange to see its waveform. The range is the "
+                    "selection's, so an xrange on a small-signal part (settling, ripple) shows "
+                    "it in detail; lower tolerance for more rows anywhere. AC: chosen on log "
+                    "frequency, _Mag compared in dB. An error with csv, npz and png.")] = None,
     dest: Annotated[Optional[str], Field(
         description="Output path for csv/npz/png (an absolute path is best); replaces an "
                     "existing file, but never the input. Default: <input>_<ext>_traces.<output> "
@@ -466,21 +487,22 @@ def extract(
 ):
     """Read selected traces from an HSPICE result file or a Nutmeg rawfile. Call
     list_traces first: its names, x_range, sweeps and ranges are what names, xrange,
-    sweeps and yrange take. Start with output="text" to look at the data, then narrow
-    with xrange to zoom in; use csv or npz to hand every point to other tools.
+    sweeps and yrange take. Start with text, zoom with xrange; csv or npz hand every
+    point to other tools.
 
     text: "TRUNCATED" first when the simulation had not finished writing; a header
     (analysis, x range, point count, rows shown and their error bound); with xrange, the
     whole plot's extent; constant traces on one line; a min/max table; then a table per
-    sweep with x once and a column per trace (at most 16). The rows are real samples:
-    the fewest whose straight lines stay within tolerance of every point, so peaks,
-    edges and glitches stay. Values have 6 significant digits.
+    sweep with x once and a column per trace (at most 16). Rows are real samples: the
+    fewest whose straight lines stay within tolerance of every point (peaks, edges,
+    glitches stay). Too dense for that (oscillation, switching): an envelope, a row
+    per x slice with each trace's min and max. 6 significant digits.
 
     The JSON outputs hold list_traces' fields for the data read: x, x_range, points,
     sweeps, truncated, traces, ranges (at most 100; then a "note").
     summary: also sweep_values, sweep_indices and stats: per trace and sweep count,
     min, max, mean (NaN skipped), first, last; with downsample or tolerance, x/y points
-    chosen the same way and their max_error. NaN and inf become null.
+    chosen the same way and their max_error, or an envelope. NaN and inf become null.
     csv, npz, png: the file is written; the result adds output, dest (absolute),
     sweep_indices when sweeps was given, and for png size [w, h]. For AC, plot the
     magnitude and the phase separately.

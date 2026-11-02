@@ -80,3 +80,33 @@ every point and a one-sample spike stays.
 - Min/max per bucket for text: keeps extremes but not the shape between them, and its
   size depends on the bucket count, not on the signal. Used for the png only.
 - Measurements and event lists: post-processing, out of scope for an extraction tool.
+
+## Envelope fallback (peak detect)
+
+The first version let the row budget stop the simplification and reported the error
+left. On dense signals that misled: for an oscillator start-up of 1,000 cycles (200,001
+points), the greedy order spent all 500 rows on the last quarter of the run, where the
+swing is largest, and the start-up stayed one straight line from 0 to 751 ns. The header
+said "within 98.3%", but the rows themselves told a wrong story.
+
+Now a table whose rows cannot meet the tolerance becomes an envelope, as an
+oscilloscope's peak-detect mode, M4 (Jugel et al., VLDB 2014), process historians' plot
+values and audio peak files all do for the same reason:
+
+- `reduce.peak_detect(x, ys, count, log)` cuts the x range into `count` slices of equal
+  width (equal in log10 x on a log axis), and each non-empty slice gives its bounds and
+  every trace's lowest and highest sample (NaN skipped). Equal width, not equal sample
+  counts: SPICE's adaptive time step would otherwise make slices of very different
+  durations. A slice without a sample is left out, and the table's label says so.
+- One row per slice (`TIME_from`, `TIME_to`, `min(v)`, `max(v)`), not the min and max
+  samples as ordinary rows: alternating max/min rows read like a slow oscillation, the
+  aliasing that peak detect exists to avoid.
+- `text`: 100 slices per table by default (`downsample` sets them), within the row and
+  number budget. The header says `an envelope of 100 x slices: too dense to follow every
+  trace within 1% in 500 rows; narrow xrange to see the waveform`; mixed sweeps say how
+  many tables are envelopes. On the oscillator: 100 rows, 4.6k characters, the amplitude
+  growth over the whole run (the simplification's 500 rows took 11.7k).
+- `summary`: an entry whose points cannot meet the tolerance gets `envelope: {from, to,
+  min, max}` with half as many slices as it had points, instead of `x`, `y`, `max_error`.
+
+The values stay real samples, so the fallback is still extraction, not post-processing.

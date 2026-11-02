@@ -1108,10 +1108,14 @@ class TestApi(unittest.TestCase):
         self.assertAlmostEqual(entry["mean"], float(col.mean()), places=12)
         self.assertEqual(entry["first"], float(col[0]))
         self.assertEqual(entry["last"], float(col[-1]))
-        self.assertEqual(len(entry["x"]), 4)
-        self.assertEqual(len(entry["y"]), 4)
-        self.assertEqual(entry["x"][0], float(self.sweeps[1][1][0, 0]))
-        self.assertEqual(entry["x"][-1], float(self.sweeps[1][1][-1, 0]))
+        # random data cannot be followed in 4 points: a peak-detect envelope of 2 slices instead
+        self.assertNotIn("x", entry)
+        env = entry["envelope"]
+        self.assertEqual([len(env[k]) for k in ("from", "to", "min", "max")], [2, 2, 2, 2])
+        x = self.sweeps[1][1][:, 0]
+        self.assertAlmostEqual(env["from"][0], float(x.min()), places=5)
+        self.assertAlmostEqual(env["to"][-1], float(x.max()), places=5)
+        self.assertEqual((min(env["min"]), max(env["max"])), (float(col.min()), float(col.max())))
         json.dumps(s)   # must be JSON serialisable
 
     def test_summary_without_downsample_has_no_points(self):
@@ -1121,7 +1125,9 @@ class TestApi(unittest.TestCase):
     def test_summary_on_sample_file(self):
         s = api.extract(HERE / "test_9601.tr0", ["v(vo"], output="summary", downsample=10)
         self.assertEqual(s["stats"]["v_vo"][0]["count"], 2605)
-        self.assertEqual(len(s["stats"]["v_vo"][0]["y"]), 10)
+        self.assertEqual(len(s["stats"]["v_vo"][0]["envelope"]["max"]), 5)    # rippled: 10 points, 5 slices
+        followed = api.extract(HERE / "test_9601.tr0", ["v(vo"], output="summary", tolerance=0.05)
+        self.assertLessEqual(followed["stats"]["v_vo"][0]["max_error"], 0.05)
 
     def test_bad_output(self):
         with self.assertRaisesRegex(ValueError, "output must be one of"):
@@ -1179,7 +1185,7 @@ class TestApi(unittest.TestCase):
         api.SUMMARY_MAX_POINTS = 100
         self.addCleanup(setattr, api, "SUMMARY_MAX_POINTS", original)
         out = api.extract(self.path, ["v_a"], output="summary", downsample=10_000_000)
-        self.assertEqual(len(out["stats"]["v_a"][2]["x"]), 100 // 3)     # budget shared by 3 sweeps
+        self.assertEqual(len(out["stats"]["v_a"][2]["envelope"]["min"]), 100 // 3 // 2)   # budget shared by 3 sweeps
         self.assertEqual(out["stats"]["v_a"][2]["count"], 2310)
 
     def test_summary_json_has_no_nan_tokens(self):
@@ -1202,8 +1208,8 @@ class TestApi(unittest.TestCase):
         api.SUMMARY_MAX_POINTS = 60                             # 2 traces x 3 sweeps -> 10 points each
         self.addCleanup(setattr, api, "SUMMARY_MAX_POINTS", original)
         out = api.extract(self.path, ["v_a", "v_b"], output="summary", downsample=1000)
-        sizes = [len(e["x"]) for name in ("v_a", "v_b") for e in out["stats"][name]]
-        self.assertEqual(sizes, [10] * 6)
+        sizes = [len(e["envelope"]["max"]) for name in ("v_a", "v_b") for e in out["stats"][name]]
+        self.assertEqual(sizes, [5] * 6)                         # random data: 10 points become 5 slices
 
     def test_default_caps(self):
         self.assertEqual(api.SUMMARY_MAX_POINTS, 1000)
@@ -2005,8 +2011,8 @@ class TestMcp(unittest.TestCase):
 
     def test_summary_is_json(self):
         out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="summary", downsample=20)
-        json.dumps(out)
-        self.assertEqual(len(out["stats"]["v_vo"][0]["x"]), 20)
+        json.dumps(out, allow_nan=False)
+        self.assertEqual(len(out["stats"]["v_vo"][0]["envelope"]["from"]), 10)
 
     def test_csv_tool_returns_dest_and_counts(self):
         dest = self.dir / "o.csv"
