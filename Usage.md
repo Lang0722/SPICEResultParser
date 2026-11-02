@@ -58,10 +58,11 @@ cost of Nutmeg ASCII is the text-to-float conversion, not the file size.
 from spice_result_parser import list_traces, extract
 
 list_traces("run.tr0")
-# {'path': 'run.tr0', 'format': '2001', 'analysis': 'tr', 'x': 'TIME',
-#  'traces': ['v_out', 'v_in', 'i_vdd'], 'sweep_params': ['r1'], 'sweep_count_hint': 3,
-#  'plot': 0, 'plots': []}
-# sweep_count_hint is 0 for a single-sweep file (it is the header's inner-sweep count).
+# {'path': 'run.tr0', 'format': '2001', 'analysis': 'tr', 'plot': 0, 'plots': [],
+#  'x': 'TIME', 'x_range': [0.0, 1e-07], 'points': 3003,
+#  'sweeps': 3, 'sweep_params': ['r1'], 'sweep_values': [[1000.0], [2000.0], [3000.0]],
+#  'truncated': False, 'traces': ['v_out', 'v_in', 'i_vdd'],
+#  'ranges': {'v_out': [-0.02, 1.21], 'v_in': [0.0, 1.2], 'i_vdd': [-0.0031, 0.0002]}}
 
 ts = extract("run.tr0", ["v(out)", "i_*"])        # names: sanitized, raw HSPICE, or glob
 ts.selected                                       # ['TIME', 'v_out', 'i_vdd']
@@ -81,6 +82,33 @@ extract("run.tr0", ["v(out)", "v(in)"], xrange=(1e-9, 5e-9), yrange=(0, 1.2), ou
 #   -> 'run_tr0_traces.png': one line per trace per sweep, log x axis for AC files
 ```
 
+`list_traces` tells you what the `extract` parameters can take. It reads the file once
+(`reader.scan`) and keeps no trace in memory. Its result has these keys:
+
+- `path`, `format`, `analysis`, `plot`, `plots`: the file and the plot that it reads.
+- `x` and `x_range`: the x variable and its `[min, max]`, for `xrange`.
+- `points`: the number of points over all sweeps.
+- `sweeps`, `sweep_params` and `sweep_values`: the number of sweeps (indices `0` to
+  `sweeps - 1`, for `sweeps=`) and the parameter values of each sweep.
+- `truncated`: `True` when the simulator did not finish writing the file.
+- `traces` and `ranges`: the trace names, and the `[min, max]` of each trace, for
+  `yrange`.
+
+The ranges skip NaN values. A range is `None` when a trace has no value that is not
+NaN. In JSON, NaN and infinite bounds become `null`. The API writes a float32 value (from
+a 9601 file) as its shortest decimal, for example `0.1` and not `0.10000000149011612`.
+That decimal reads back as the same float32.
+
+`list_traces(path, names=[...])` lists only the traces that `names` selects. It
+selects them as `extract` does. `ac_format` names the AC traces and sets the values that
+are ranged. `list_traces(path, header_only=True)` reads only the header. This is
+instant on any file. The result then has no `x_range`, `points`, `sweep_values`,
+`truncated` or `ranges`, and `sweeps` is the count that the header announces.
+
+`reader.scan(path, plot, ac_format, names)` returns the same facts as a `Scan` object,
+with the bounds in the dtype of the file and a point count per sweep (`sweep_points`).
+An unknown name in `names` fails before any data is read.
+
 `sweeps=[0, 2]` keeps only those sweeps. A bare `sweeps=1` is one index, and `sweeps=[]`
 keeps none. An index that the file does not hold raises a `ValueError` that names the
 sweep count.
@@ -99,18 +127,34 @@ raises `ValueError` in these cases:
 - `dest` is the input file itself.
 - You give `dest` with `output="arrays"` or `"summary"`.
 
+`summary` has the same keys as `list_traces`, in the same order, for the selected data
+(after `names`, `sweeps` and `xrange`). It adds `sweep_indices` and `stats`. `stats` holds,
+per trace and per sweep, `count`, `min`, `max`, `mean` (NaN skipped), `first` and `last`.
+Thus `traces` is always a list of names, in every result, and `ranges` is always one
+`[min, max]` per trace.
+
+```python
+s = extract("run.tr0", ["v(out)"], output="summary")
+s["x_range"], s["points"], s["ranges"]["v_out"]  # the selection as a whole
+s["stats"]["v_out"][2]["max"]                     # one sweep: index 2 of sweep_indices
+```
+
 `summary` reports statistics of every point that it gets. With `downsample=N`, `summary`
-adds `N` x/y points per (trace, sweep). When there are at most 10000 such series, it adds
-at most 20000 points in total. The size of the summary grows with the number of traces
-times the number of sweeps. On large files, select a few traces or sweeps. If you call
-`summarize` on a TraceSet that `extract` already downsampled, `summarize` reports
-statistics of the downsampled points.
+adds `N` x/y points per (trace, sweep) to `stats`. When there are at most 10000 such
+series, it adds at most 20000 points in total. The size of the summary grows with the
+number of traces times the number of sweeps. On large files, select a few traces or
+sweeps. If you call `summarize` on a TraceSet that `extract` already downsampled,
+`summarize` reports statistics of the downsampled points.
 
 The reader applies `xrange` while the file streams. It never stores rows outside the
 closed interval, so peak memory follows the window and not the column length. With a 10%
 window on the 490 MB file above, the reader read all twenty traces at 136 MB peak RSS
 instead of 555 MB. For one trace, the peak RSS was 51 MB instead of 90 MB. A sweep with
 no rows inside the window stays in the result, with empty arrays.
+
+The reader still sees every point, so a `TraceSet` also records the whole plot:
+`ts.plot_points` and `ts.plot_x_range` cover every sweep before `sweeps` and `xrange`
+select, and `ts.xrange` is the window that was applied (`None` for no window).
 
 Two different HSPICE variables can have the same name after the reader sanitizes it. For
 example, the reader replaces both `.` and `:` with `_`. The reader keeps one trace per
@@ -119,7 +163,13 @@ A `RuntimeWarning` names each sanitized name that repeats.
 
 In AC files each variable becomes two traces (`v_vo_Mag` and `v_vo_Phase`). Thus you
 cannot select the sanitized base name `v_vo` on its own. To select both, pass the raw
-name `v(vo)` or a glob such as `v_vo*`.
+name `v(vo)` or a glob such as `v_vo*`. If you give `v_vo`, the error tells you so.
+
+If a name matches no trace exactly, the reader tries it again and ignores case, because
+SPICE names are not case-sensitive: `V(VO)` and `TIME` select `v(vo)` and `time`. An
+exact match always wins. A name that still matches nothing raises a `ValueError` that suggests
+similar names, then lists the available traces. `read_measures` matches measure names
+in the same way.
 
 ## AC results: `ac_format`
 
@@ -178,9 +228,12 @@ One rawfile can hold several plots (`write out.raw tran1.all ac1.all dc1.all`).
 
 ```python
 list_traces("rc.raw")
-# {'path': 'rc.raw', 'format': 'nutmeg', 'analysis': 'tr', 'x': 'time',
-#  'traces': ['v_in', 'v_out', 'i_v1'], 'sweep_params': [], 'sweep_count_hint': 0,
-#  'plot': 0, 'plots': ['Transient Analysis', 'AC Analysis', 'DC transfer characteristic']}
+# {'path': 'rc.raw', 'format': 'nutmeg', 'analysis': 'tr', 'plot': 0,
+#  'plots': ['Transient Analysis', 'AC Analysis', 'DC transfer characteristic'],
+#  'x': 'time', 'x_range': [0.0, 2e-08], 'points': 80, 'sweeps': 1, 'sweep_params': [],
+#  'sweep_values': [[]], 'truncated': False, 'traces': ['v_in', 'v_out', 'i_v1'],
+#  'ranges': {'v_in': [0.0, 1.0], 'v_out': [0.0, 0.9960620286321555],
+#             'i_v1': [-0.0006336078866052209, 0.0006320435227811472]}}
 
 list_traces("rc.raw", plot=1)["traces"]        # ['v_in_Mag', 'v_in_Phase', 'v_out_Mag', ...]
 extract("rc.raw", ["v(out)"], plot=1)          # the AC plot: frequency, v_out_Mag, v_out_Phase
@@ -198,8 +251,9 @@ plot until the end of the file. The results are:
 - `ts.truncated` is `True`.
 - A `RuntimeWarning` names the number of complete points.
 
-`list_traces` works at any time while the run is in progress, because it reads only the
-header.
+`list_traces` works at any time while the run is in progress. It reads the data up to
+the last complete point and sets `truncated` to `True`. With `header_only=True` it
+reads only the header.
 
 The reader reads the batch ASCII layout (two tabs after the point index, no blank line
 between points) the same as the `write` layout.
@@ -235,47 +289,66 @@ pip install 'spice_result_parser[mcp]'
 {"mcpServers": {"spice": {"command": "srp-mcp"}}}
 ```
 
-Tools: `list_traces(path, plot)`, `extract(path, names, sweeps, output, downsample, dest, xrange,
-yrange, plot, ac_format)` and `read_measures(path, names, rows)`. `list_traces` and
-`extract` accept HSPICE result files and Nutmeg rawfiles. `read_measures` accepts HSPICE
-measure files. `plot` selects one plot of a rawfile. `extract`'s
-`ac_format` names AC traces as above, and `list_traces` lists them in the default
-`_Mag`/`_Phase` form.
+Tools: `list_traces(path, names, plot, ac_format, header_only)`, `extract(path, names,
+sweeps, output, downsample, dest, xrange, yrange, plot, ac_format)` and
+`read_measures(path, names, rows)`. `list_traces` and `extract` accept HSPICE result
+files and Nutmeg rawfiles. `read_measures` accepts HSPICE measure files. `plot` selects
+one plot of a rawfile. `ac_format` names AC traces as above. `list_traces` and `extract`
+take `path`, `names`, `plot` and `ac_format` with the same meaning, in the same order.
 
 The server marks `list_traces` and `read_measures` as read-only for the client. It marks
 `extract` as a tool that can overwrite files.
 
+`list_traces` returns the result described in
+[Low-memory trace API](#low-memory-trace-api). The agent calls it first and takes the
+`extract` parameters from it: `x_range` for `xrange`, `sweeps` and `sweep_values` for
+`sweeps`, and the trace `ranges` for `yrange`.
+
 Over MCP, `output` is one of these values:
 
 - `text` (default)
-- `summary`: statistics as JSON with exact floats, plus downsampled points when you set
-  `downsample`
+- `summary`: the `list_traces` fields for the selected data, `sweep_indices`, and
+  per-trace and per-sweep `stats` as JSON with exact floats, plus downsampled points when
+  you set `downsample`
 - `csv` or `npz`: write a file
 - `png`: write a plot
 
 The server never sends full arrays inline. When `output` is `csv`, `npz` or `png`,
-`extract` returns these fields:
+`extract` returns these fields, in this order:
 
 - `output`
-- the absolute `path`
-- `x`, `traces`
-- `sweeps` (the count), `points` (the total)
-- `truncated`
+- `dest`: the absolute path of the file that it wrote. In every result, `path` is the
+  input file.
+- `x`, `x_range`, `points` (the total), `sweeps` (the count)
 - `sweep_indices` when the call gives `sweeps`
+- `truncated`
+- `traces` and their `ranges` in the written data
 - for `png`, the pixel `size`
+
+A JSON result lists at most 100 trace ranges. If it lists fewer than it has, a `note`
+says so, and `names` gets the others. When an `xrange` keeps no point, a `note` gives the
+point count and the x range of the whole plot.
 
 The schema lists the valid `output` and `ac_format` values. `names` takes one string or
 a list.
 
+If the server cannot find a file with a relative path, the error names the working
+directory of the server. The server can run in a different directory from the agent.
+
 `text` is for an agent to read. It holds these parts, in this order:
 
 1. A line that says so, when the input file is truncated.
-2. A header, for example `transient | x: time | 522 points (20 shown)`. The header adds `in k sweeps` when there are several sweeps. It adds the
-   plot name when the rawfile holds several plots.
+2. A header, for example `transient | x: time in [0, 2e-08] | 522 points (20 shown)`. The
+   header gives the x range of the data. It adds `in k sweeps` when there are several
+   sweeps. It adds the plot name when the rawfile holds several plots.
 3. For an AC plot, a legend that names what the two columns of each complex trace hold
    (per `ac_format`).
-4. A `trace min max` table over every point (NaN values skipped).
-5. One table per sweep, with x once and one column per trace. Each table holds
+4. When the call gives `xrange`, a line that gives the point count and the x range of the
+   whole plot: `window: xrange [1e-09, 5e-09]; the whole plot has 522 points with time
+   in [0, 2e-08]`. If the window keeps no point, the line starts with
+   `no points in xrange` and the text ends there.
+5. A `trace min max` table over every point (NaN values skipped).
+6. One table per sweep, with x once and one column per trace. Each table holds
    `downsample` evenly spaced rows, first and last included. All the tables together
    hold at most 500 rows.
 
@@ -283,6 +356,9 @@ When there are more than 20 tables, `text` shows only the first 10 and the last 
 line counts the tables that it omits. If one row per (sweep, trace) pair gives more than
 100 rows, the min/max table holds one row per trace over all sweeps. When ngspice writes
 a nested `.dc` sweep flat, `text` splits it into one table per run of the inner variable.
+
+The point tables show at most 16 traces, and the min/max table at most 100. A line
+counts the traces that the text omits. Select fewer `names` to see them.
 
 `text` rounds values to 6 significant digits. NaN and infinity print as `nan`/`inf`.
 
@@ -323,5 +399,7 @@ order:
 5. A table with one column per kept measure. Failed values print as `failed`.
 
 The text shows `rows` evenly spaced rows (default 20, at least 2, at most 500).
+`names` selects measures as `extract` selects traces: by name or glob, with case ignored
+when nothing matches exactly.
 `spice_result_parser.mcp_server.format_measures(ms, rows=20)` renders any `MeasureSet`
 as the same text.

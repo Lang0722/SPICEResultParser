@@ -74,7 +74,8 @@ Python and numpy alone use about 29 MB of that memory.
 ```python
 from spice_result_parser import list_traces, extract
 
-list_traces("run.tr0")                              # header only: trace names, x variable, sweeps
+list_traces("run.tr0")                              # names, x range, points, sweeps, each trace's [min, max]
+list_traces("run.tr0", header_only=True)            # names and sweep count only: instant on any file
 ts = extract("run.tr0", ["v(out)", "i_*"])          # numpy arrays, one per trace per sweep
 extract("run.tr0", ["v(out)"], output="csv")        # or "npz", "summary", "png"
 extract("run.tr0", ["v(out)"], xrange=(1e-9, 5e-9), yrange=(0, 1.2), output="png")
@@ -94,6 +95,12 @@ from spice_result_parser import read_measures
 ms = read_measures("run.mt0", ["tpd*"])             # index and swept params always kept
 ms.values["tpd"]                                    # one value per row; NaN where it failed
 ```
+
+`list_traces` reads the file once to find the x range, the point count, the sweeps
+and their parameter values, and the `[min, max]` of each trace. It keeps no trace in
+memory. On a 126 MB 9601 file (20 traces, 1.5 M points), it took about 0.2 s at 37 MB
+peak RSS. Reading all 20 traces took 157 MB. Use these values to set the `extract`
+parameters.
 
 The `extract` parameters work as follows:
 
@@ -132,22 +139,30 @@ pip install "spice_result_parser[mcp,plot] @ git+https://github.com/Lang0722/SPI
 
 The server has three tools:
 
-- `list_traces(path, plot)`
+- `list_traces(path, names, plot, ac_format, header_only)`
 - `extract(path, names, sweeps, output, downsample, dest, xrange, yrange, plot, ac_format)`
 - `read_measures(path, names, rows)`
 
 `list_traces` and `extract` accept HSPICE result files and Nutmeg rawfiles. `plot`
 selects one plot of a Nutmeg rawfile. `read_measures` accepts HSPICE measure files.
 
+An agent calls `list_traces` first. Its result gives the values that the `extract`
+parameters take: the trace names, `x_range` for `xrange`, `sweeps` and `sweep_values`
+for `sweeps`, and the `ranges` of the traces for `yrange`.
+
 Over MCP, the `output` parameter of `extract` takes one of these values:
 
 | `output` | Result |
 |---|---|
-| `text` (default) | A readable report: per-trace min/max, then a table with x once and one column per trace. The server rounds values to 6 significant digits. The report holds at most 500 rows and 20 tables. |
-| `summary` | JSON with exact floats: per-trace statistics, plus downsampled points when you set `downsample`. |
-| `csv`, `npz`, `png` | The server writes the file and returns its absolute path. |
+| `text` (default) | A readable report: the x range and point count, per-trace min/max, then a table with x once and one column per trace. The server rounds values to 6 significant digits. The report holds at most 500 rows, 20 tables and 16 trace columns. |
+| `summary` | JSON with exact floats: the fields of `list_traces` for the selected data, per-trace and per-sweep statistics, plus downsampled points when you set `downsample`. |
+| `csv`, `npz`, `png` | The server writes the file. It returns the absolute path as `dest`, with the x range, point count and trace ranges of the written data. |
 
 The server never sends full arrays inline.
+
+The tools match trace and measure names the way SPICE does. If no name matches
+exactly, they ignore case, so `V(OUT)` selects `v(out)`. An unknown name gives an error
+that suggests similar names and lists the available names.
 
 `spice_result_parser.mcp_server.format_text(ts, points)` returns the `text` report for any
 `TraceSet`. It does not need the `mcp` package.

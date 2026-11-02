@@ -70,8 +70,19 @@ class TestSweptFile(unittest.TestCase):
         self.assertEqual(list(ms.values), ["index", "vdd", "tpw"])
 
     def test_unknown_measure_lists_available(self):
-        with self.assertRaisesRegex(ValueError, "unknown measure 'nope'.*tpd"):
+        with self.assertRaisesRegex(ValueError, r"^unknown measure 'nope'\. Available measures: index, vdd, tpd"):
             read_measures(self.path, ["nope"])
+
+    def test_unknown_measure_suggests_near_names(self):
+        with self.assertRaisesRegex(ValueError, r"unknown measure 'tpdd'; did you mean tpd\? Available"):
+            read_measures(self.path, ["tpdd"])
+        with self.assertRaisesRegex(ValueError, r"unknown measure 'tp'; did you mean tpd, tpw\? Available"):
+            read_measures(self.path, ["tp"])
+
+    def test_case_is_ignored_when_nothing_matches_exactly(self):
+        # HSPICE writes measure names in lower case; the netlist may say .measure TPD
+        self.assertEqual(read_measures(self.path, ["TPD"]).names, ["index", "vdd", "tpd"])
+        self.assertEqual(read_measures(self.path, ["TP*"]).names, ["index", "vdd", "tpd", "tpw"])
 
     def test_partial_last_row_is_dropped_with_warning(self):
         self.path.write_text(SWEPT + " 4.0000           1.2000\n")
@@ -97,7 +108,7 @@ class TestSweptFile(unittest.TestCase):
             read_measures(self.path)
 
     def test_not_a_measure_file(self):
-        with self.assertRaisesRegex(ValueError, "not an HSPICE measure file"):
+        with self.assertRaisesRegex(ValueError, "not an HSPICE measure file.*with list_traces and extract"):
             read_measures(HERE / "test_9601.tr0")
 
 

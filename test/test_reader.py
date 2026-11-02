@@ -623,8 +623,40 @@ class TestSelection(unittest.TestCase):
         self.assertEqual(ts.selected, ["TIME", "v_d"])
 
     def test_unknown_lists_available(self):
-        with self.assertRaisesRegex(ValueError, r"unknown trace 'nope'; available traces: TIME, v_a, v_b"):
+        with self.assertRaisesRegex(ValueError, r"^unknown trace 'nope'\. Available traces: TIME, v_a, v_b"):
             read_traces(self.path, ["nope"])
+
+    def test_case_is_ignored_when_nothing_matches_exactly(self):
+        # SPICE names are case-insensitive: a netlist's V(B) is the file's v(b
+        for req in ("V(B)", "V_B", "v(B", "V_*"):
+            ts = read_traces(self.path, [req])
+            self.assertIn("v_b", ts.selected, req)
+        self.assertEqual(read_traces(self.path, ["time"]).selected, ["TIME"])
+        self.assertEqual(read_traces(self.path, ["I_*"]).selected, ["TIME", "i_e", "i_f"])
+
+    def test_exact_case_wins_over_folded_case(self):
+        names = ["TIME", "v(a", "V(A"]
+        path = self.dir / "cases.tr0"
+        fixtures.write_binary(path, "2001", names, [1, 1, 1], [([], np.arange(9.0).reshape(3, 3))])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            self.assertEqual(read_traces(path, ["V(A)"]).selected, ["TIME", "V_A"])
+            self.assertEqual(read_traces(path, ["v_a"]).selected, ["TIME", "v_a"])
+
+    def test_unknown_name_suggests_near_names(self):
+        with self.assertRaisesRegex(ValueError, r"unknown trace 'v\(bb\)'; did you mean v_b\? Available"):
+            read_traces(self.path, ["v(bb)"])
+        with self.assertRaisesRegex(ValueError, r"unknown trace 'i_ef'; did you mean i_e, i_f\? Available"):
+            read_traces(self.path, ["i_ef"])
+
+    def test_ac_base_name_says_how_to_select_the_pair(self):
+        with self.assertRaisesRegex(ValueError, r"unknown trace 'v_vo': complex traces are split in two, "
+                                                r"v_vo_Mag and v_vo_Phase; 'v\(vo\)' or 'v_vo\*' selects both"):
+            read_traces(HERE / "test_9601.ac0", ["v_vo"])
+        with self.assertRaisesRegex(ValueError, "v_vo_dB and v_vo_Phase"):
+            read_traces(HERE / "test_9601.ac0", ["V_VO"], ac_format="db")
+        with self.assertRaisesRegex(ValueError, r"v_out_Mag and v_out_Phase; 'v\(out\)'"):
+            read_traces(HERE / "nutmeg_rc_bin.raw", ["v_out"], plot=1)
 
     def test_sweeps_filter(self):
         ts = read_traces(self.path, ["v_a"], sweeps=[1])
@@ -831,7 +863,7 @@ class TestStatsIgnoreNan(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_summary(self):
-        entry = api.summarize(read_traces(self.path))["traces"]["v_a"][0]
+        entry = api.summarize(read_traces(self.path))["stats"]["v_a"][0]
         self.assertEqual((entry["min"], entry["max"], entry["mean"]), (-2.0, 4.0, 0.875))
 
     def test_text(self):
@@ -845,7 +877,7 @@ class TestStatsIgnoreNan(unittest.TestCase):
         fixtures.write_binary(self.path, "2001", ["TIME", "v(a"], [1, 1], [([], d)])
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            entry = api.summarize(read_traces(self.path))["traces"]["v_a"][0]
+            entry = api.summarize(read_traces(self.path))["stats"]["v_a"][0]
         self.assertIsNone(entry["min"])
 
 
@@ -979,13 +1011,57 @@ class TestApi(unittest.TestCase):
     def test_list_traces(self):
         info = api.list_traces(HERE / "test_9601.tr0")
         self.assertEqual(info, {
-            "path": str(HERE / "test_9601.tr0"), "format": "9601", "analysis": "tr", "x": "TIME",
-            "traces": ["v_0", "v_vo", "v_vs", "i_vs"], "sweep_params": [], "sweep_count_hint": 0,
-            "plot": 0, "plots": [],
+            "path": str(HERE / "test_9601.tr0"), "format": "9601", "analysis": "tr", "plot": 0, "plots": [],
+            "x": "TIME", "x_range": [0.0, 0.01], "points": 2605, "sweeps": 1, "sweep_params": [],
+            "sweep_values": [[]], "truncated": False, "traces": ["v_0", "v_vo", "v_vs", "i_vs"],
+            "ranges": {"v_0": [0.0, 0.0], "v_vo": [0.0, 1.8477405e-05], "v_vs": [0.0, 5.0],
+                       "i_vs": [-0.005, 1.8477404e-08]},
         })
+        json.dumps(info, allow_nan=False)
         info = api.list_traces(self.path)
         self.assertEqual(info["sweep_params"], ["r1"])
-        self.assertEqual(info["sweep_count_hint"], 3)
+        self.assertEqual(info["sweeps"], 3)
+        self.assertEqual(info["sweep_values"], [[1000.0], [2000.0], [3000.0]])
+        self.assertEqual(info["points"], sum(d.shape[0] for _, d in self.sweeps))
+        everything = np.concatenate([d for _, d in self.sweeps])
+        self.assertEqual(info["x_range"], [everything[:, 0].min(), everything[:, 0].max()])
+        for col, name in enumerate(info["traces"], 1):
+            self.assertEqual(info["ranges"][name], [everything[:, col].min(), everything[:, col].max()])
+
+    def test_list_traces_header_only(self):
+        info = api.list_traces(self.path, header_only=True)
+        self.assertEqual(list(info), ["path", "format", "analysis", "plot", "plots", "x", "sweeps",
+                                      "sweep_params", "traces"])
+        self.assertEqual(info["sweeps"], 3)                                 # what the header announces
+        self.assertEqual(api.list_traces(HERE / "test_9601.tr0", header_only=True)["sweeps"], 1)
+        with mock.patch.object(api, "scan", side_effect=AssertionError("data read")):
+            api.list_traces(self.path, header_only=True)
+
+    def test_list_traces_names_narrow_traces_and_ranges(self):
+        info = api.list_traces(self.path, names=["v(b", "i_*"])
+        self.assertEqual(info["traces"], ["v_b", "i_e", "i_f"])
+        self.assertEqual(list(info["ranges"]), ["v_b", "i_e", "i_f"])
+        self.assertEqual(api.list_traces(self.path, names="TIME")["traces"], [])
+        self.assertEqual(list(reader.scan(self.path, names=["v_c"]).ranges), ["v_c"])
+        # an unknown name fails before the data is read
+        with mock.patch.object(reader, "_feed_data", side_effect=AssertionError("data read")):
+            with self.assertRaisesRegex(ValueError, "did you mean v_a"):
+                api.list_traces(self.path, names=["v_aa"])
+        from spice_result_parser import nutmeg
+        with mock.patch.object(nutmeg, "_read_data", side_effect=AssertionError("data read")):
+            with self.assertRaisesRegex(ValueError, "did you mean v_out"):
+                api.list_traces(HERE / "nutmeg_rc_bin.raw", names=["v_outt"])
+
+    def test_list_traces_and_summary_share_their_keys(self):
+        info = api.list_traces(self.path)
+        summary = api.extract(self.path, output="summary")
+        shared = ["path", "format", "analysis", "plot", "plots", "x", "x_range", "points", "sweeps",
+                  "sweep_params", "sweep_values", "truncated", "traces", "ranges"]
+        self.assertEqual([k for k in info if k in shared], shared)
+        self.assertEqual([k for k in summary if k in shared], shared)
+        for key in shared:
+            self.assertEqual(info[key], summary[key], key)              # whole file: same facts
+        self.assertEqual(list(summary)[-1], "stats")
 
     def test_decimation_indices(self):
         self.assertIsNone(api.decimation_indices(10, None))
@@ -1018,8 +1094,13 @@ class TestApi(unittest.TestCase):
         self.assertEqual(s["sweeps"], 3)
         self.assertEqual(s["sweep_values"], [[1000.0], [2000.0], [3000.0]])
         self.assertFalse(s["truncated"])
-        self.assertEqual(list(s["traces"]), ["v_a"])
-        entry = s["traces"]["v_a"][1]
+        self.assertEqual(s["traces"], ["v_a"])
+        self.assertEqual(list(s["stats"]), ["v_a"])
+        everything = np.concatenate([d for _, d in self.sweeps])
+        self.assertEqual(s["points"], everything.shape[0])
+        self.assertEqual(s["x_range"], [everything[:, 0].min(), everything[:, 0].max()])
+        self.assertEqual(s["ranges"], {"v_a": [everything[:, 1].min(), everything[:, 1].max()]})
+        entry = s["stats"]["v_a"][1]
         col = self.sweeps[1][1][:, 1]
         self.assertEqual(entry["count"], 977)
         self.assertEqual(entry["min"], float(col.min()))
@@ -1035,12 +1116,12 @@ class TestApi(unittest.TestCase):
 
     def test_summary_without_downsample_has_no_points(self):
         s = api.extract(self.path, ["v_a"], output="summary")
-        self.assertNotIn("x", s["traces"]["v_a"][0])
+        self.assertNotIn("x", s["stats"]["v_a"][0])
 
     def test_summary_on_sample_file(self):
         s = api.extract(HERE / "test_9601.tr0", ["v(vo"], output="summary", downsample=10)
-        self.assertEqual(s["traces"]["v_vo"][0]["count"], 2605)
-        self.assertEqual(len(s["traces"]["v_vo"][0]["y"]), 10)
+        self.assertEqual(s["stats"]["v_vo"][0]["count"], 2605)
+        self.assertEqual(len(s["stats"]["v_vo"][0]["y"]), 10)
 
     def test_bad_output(self):
         with self.assertRaisesRegex(ValueError, "output must be one of"):
@@ -1073,7 +1154,11 @@ class TestApi(unittest.TestCase):
         out = api.extract(self.path, ["v_a"], output="summary", xrange=(lo, hi))
         for i, (_, data) in enumerate(self.sweeps):
             mask = (data[:, 0] >= lo) & (data[:, 0] <= hi)
-            self.assertEqual(out["traces"]["v_a"][i]["count"], int(mask.sum()))
+            self.assertEqual(out["stats"]["v_a"][i]["count"], int(mask.sum()))
+        inside = np.concatenate([d[(d[:, 0] >= lo) & (d[:, 0] <= hi)] for _, d in self.sweeps])
+        self.assertEqual(out["points"], inside.shape[0])
+        self.assertEqual(out["x_range"], [inside[:, 0].min(), inside[:, 0].max()])
+        self.assertEqual(out["ranges"]["v_a"], [inside[:, 1].min(), inside[:, 1].max()])
 
     def test_yrange_does_not_change_arrays(self):
         plain = api.extract(self.path, ["v_a"])
@@ -1094,8 +1179,8 @@ class TestApi(unittest.TestCase):
         api.SUMMARY_MAX_POINTS = 100
         self.addCleanup(setattr, api, "SUMMARY_MAX_POINTS", original)
         out = api.extract(self.path, ["v_a"], output="summary", downsample=10_000_000)
-        self.assertEqual(len(out["traces"]["v_a"][2]["x"]), 100 // 3)     # budget shared by 3 sweeps
-        self.assertEqual(out["traces"]["v_a"][2]["count"], 2310)
+        self.assertEqual(len(out["stats"]["v_a"][2]["x"]), 100 // 3)     # budget shared by 3 sweeps
+        self.assertEqual(out["stats"]["v_a"][2]["count"], 2310)
 
     def test_summary_json_has_no_nan_tokens(self):
         d = np.arange(12.0).reshape(6, 2)
@@ -1109,15 +1194,15 @@ class TestApi(unittest.TestCase):
             out = api.extract(path, output="summary", downsample=100)
         json.dumps(out, allow_nan=False)                        # strict JSON must accept it
         self.assertEqual(out["sweep_values"][2], [2.0, None])
-        self.assertIsNone(out["traces"]["v_a"][0]["y"][2])
-        self.assertEqual(out["traces"]["v_a"][0]["min"], 1.0)  # statistics skip the NaN
+        self.assertIsNone(out["stats"]["v_a"][0]["y"][2])
+        self.assertEqual(out["stats"]["v_a"][0]["min"], 1.0)  # statistics skip the NaN
 
     def test_summary_cap_is_a_total_budget(self):
         original = api.SUMMARY_MAX_POINTS
         api.SUMMARY_MAX_POINTS = 60                             # 2 traces x 3 sweeps -> 10 points each
         self.addCleanup(setattr, api, "SUMMARY_MAX_POINTS", original)
         out = api.extract(self.path, ["v_a", "v_b"], output="summary", downsample=1000)
-        sizes = [len(e["x"]) for name in ("v_a", "v_b") for e in out["traces"][name]]
+        sizes = [len(e["x"]) for name in ("v_a", "v_b") for e in out["stats"][name]]
         self.assertEqual(sizes, [10] * 6)
 
     def test_default_caps(self):
@@ -1466,6 +1551,118 @@ class TestXrangeWhileReading(unittest.TestCase):
         self.assertLess(peaks[1], 0.25 * peaks[0], f"windowed {peaks[1]} vs full {peaks[0]} bytes")
 
 
+class TestScan(unittest.TestCase):
+    """reader.scan: one pass that keeps none of the data; and the plot extent read_traces records."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def assert_scan_matches_read(self, path, **kw):
+        s = reader.scan(path, **kw)
+        ts = read_traces(path, **kw)
+        x = ts.header.x_name
+        self.assertEqual(s.header.names, ts.header.names)
+        self.assertEqual(s.sweep_values, ts.sweep_values)
+        self.assertEqual(s.sweep_points, [a.size for a in ts.data[x]])
+        self.assertEqual(s.points, ts.plot_points)
+        whole = {name: np.concatenate(ts.data[name]) for name in ts.selected}
+        np.testing.assert_array_equal(s.x_range, (np.nanmin(whole[x]), np.nanmax(whole[x])))
+        np.testing.assert_array_equal(s.x_range, ts.plot_x_range)
+        self.assertEqual(list(s.ranges), ts.selected[1:])
+        for name in ts.selected[1:]:
+            np.testing.assert_array_equal(s.ranges[name], (np.nanmin(whole[name]), np.nanmax(whole[name])),
+                                          err_msg=name)
+            self.assertEqual(s.ranges[name][0].dtype, ts.data[name][0].dtype)   # bounds keep the dtype
+        self.assertEqual(s.truncated, ts.truncated)
+        return s
+
+    def test_sample_files_in_every_ac_format(self):
+        for name in ("test_9601.tr0", "test_2001.tr0", "test_9601.sw0", "test_9601.ac0"):
+            for ac_format in reader.AC_FORMATS:
+                with self.subTest(name=name, ac_format=ac_format):
+                    self.assert_scan_matches_read(HERE / name, ac_format=ac_format)
+
+    def test_sweeps_binary_and_ascii(self):
+        for version in ("9601", "2001"):
+            path, _ = make_multi(self.dir, version)
+            self.assertEqual(self.assert_scan_matches_read(path).sweep_points, [1500, 977, 2310])
+        path, _ = make_ascii(self.dir)
+        self.assertEqual(self.assert_scan_matches_read(path).sweep_values, [[1000.0], [2000.0]])
+        path, _, _ = make_ac(self.dir)
+        for ac_format in reader.AC_FORMATS:
+            self.assert_scan_matches_read(path, ac_format=ac_format)
+
+    def test_truncated_file(self):
+        path, _ = make_multi(self.dir, "2001", final_sentinel=False, drop_tail=3)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.assertTrue(self.assert_scan_matches_read(path).truncated)
+        self.assertTrue(any("partial" in str(w.message) for w in caught))
+
+    def test_nan_is_skipped_and_an_all_nan_trace_has_no_range(self):
+        d = np.column_stack([np.arange(4.0), [1.0, np.nan, -2.0, 4.0], [np.nan] * 4])
+        path = self.dir / "nan.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(a", "v(b"], [1, 1, 1], [([], d)])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            s = reader.scan(path)
+            info = api.list_traces(path)
+        self.assertEqual(s.ranges["v_a"], (-2.0, 4.0))
+        self.assertTrue(np.isnan(s.ranges["v_b"]).all())
+        self.assertEqual(info["ranges"], {"v_a": [-2.0, 4.0], "v_b": None})
+        json.dumps(info, allow_nan=False)
+
+    def test_file_without_data(self):
+        path = self.dir / "empty.tr0"
+        text = fixtures.header_text("2001", ["TIME", "v(a"], [1, 1], 0, 0)
+        path.write_bytes(fixtures._block(text.encode("utf-8")))
+        s = reader.scan(path)
+        self.assertEqual((s.sweep_points, s.points, s.truncated), ([], 0, False))
+        self.assertTrue(np.isnan(s.x_range).all())
+        info = api.list_traces(path)
+        self.assertEqual((info["sweeps"], info["x_range"], info["ranges"]), (0, None, {"v_a": None}))
+
+    def test_memory_does_not_follow_the_file(self):
+        data = np.random.default_rng(1).random((400_000, 8))
+        path = self.dir / "big.tr0"
+        fixtures.write_binary(path, "2001", ["TIME"] + [f"v(n{i}" for i in range(7)], [1] * 8, [([], data)])
+        tracemalloc.start()
+        try:
+            s = reader.scan(path)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(s.points, 400_000)
+        self.assertLess(peak, data.nbytes / 4, f"scan peak {peak} bytes for {data.nbytes} bytes of data")
+
+    def test_read_traces_records_the_plot_extent(self):
+        path, sweeps = make_multi(self.dir, "2001")
+        whole = np.concatenate([d for _, d in sweeps])
+        ts = read_traces(path, ["v_a"], sweeps=[1], xrange=(0.2, 0.3))
+        self.assertEqual(ts.plot_points, whole.shape[0])               # every sweep, no window
+        self.assertEqual(ts.plot_x_range, (whole[:, 0].min(), whole[:, 0].max()))
+        self.assertEqual(ts.xrange, (0.2, 0.3))
+        self.assertIsNone(read_traces(path, ["v_a"]).xrange)
+
+    def test_float32_values_are_written_short_in_json(self):
+        data = np.array([[0.0, 0.1], [1e-9, 0.2], [2e-9, 0.3]])
+        path = self.dir / "short.tr0"
+        fixtures.write_binary(path, "9601", ["TIME", "v(a", "vdd"], [1, 1], [([1.1], data)])
+        summary = api.extract(path, output="summary", downsample=3)
+        self.assertEqual(summary["sweep_values"], [[1.1]])             # not 1.100000023841858
+        self.assertEqual(summary["x_range"], [0.0, 2e-09])
+        self.assertEqual(summary["ranges"], {"v_a": [0.1, 0.3]})
+        self.assertEqual(summary["stats"]["v_a"][0]["y"], [0.1, 0.2, 0.3])
+        self.assertEqual(api.list_traces(path)["ranges"], {"v_a": [0.1, 0.3]})
+        # still exact: the short decimal reads back as the very float32 the file holds
+        self.assertEqual(np.float32(summary["stats"]["v_a"][0]["max"]), read_traces(path).data["v_a"][0].max())
+        self.assertEqual(api._json_floats(np.array([np.nan, np.inf, 1.5], np.float32)), [None, None, 1.5])
+
+
 class TestArgumentChecks(unittest.TestCase):
     """Arguments the reader and the API reject, with an error that names the problem."""
 
@@ -1579,8 +1776,8 @@ class TestPackage(unittest.TestCase):
     def test_exports(self):
         import spice_result_parser as hp
 
-        exported = {"Header", "TraceSet", "read_header", "read_traces", "list_traces", "extract",
-                    "write_file", "summarize", "MeasureSet", "read_measures"}
+        exported = {"Header", "TraceSet", "Scan", "read_header", "read_traces", "scan", "list_traces",
+                    "extract", "write_file", "summarize", "MeasureSet", "read_measures"}
         self.assertEqual(set(hp.__all__), exported)
         for name in exported:
             self.assertTrue(hasattr(hp, name), name)
@@ -1660,10 +1857,17 @@ class TestMcp(unittest.TestCase):
             path, _, _ = make_ac(tmp)
             out = self.m.list_traces(str(path))
             self.assertEqual(out["traces"][:2], ["v_a_Mag", "v_a_Phase"])
-            params = {t.name: set(self.schema(t)["properties"])
+            params = {t.name: list(self.schema(t)["properties"])
                       for t in asyncio.run(self.m.server.list_tools())}
-            self.assertEqual(params["list_traces"], {"path", "plot"})   # extract alone takes ac_format
-            self.assertIn("ac_format", params["extract"])
+            # list_traces takes the parameters extract has for naming and ranging traces, in the same order
+            self.assertEqual(params["list_traces"], ["path", "names", "plot", "ac_format", "header_only"])
+            self.assertEqual([p for p in params["extract"] if p in params["list_traces"]],
+                             ["path", "names", "plot", "ac_format"])
+            db = self.m.list_traces(str(path), ac_format="db")
+            self.assertEqual(db["traces"][:2], ["v_a_dB", "v_a_Phase"])
+            ts = read_traces(path, ["v(a"], ac_format="db")
+            self.assertEqual(db["ranges"]["v_a_dB"], [float(ts.data["v_a_dB"][0].min()),
+                                                      float(ts.data["v_a_dB"][0].max())])
             text = self.m.extract(str(path), ["v(a"], ac_format="realimag")
             self.assertIn(self.m.AC_LEGEND["realimag"], text)
             self.assertIn("v_a_Re", text)
@@ -1689,9 +1893,72 @@ class TestMcp(unittest.TestCase):
 
     def test_list_traces_documents_its_result(self):
         text = self.tools()["list_traces"].description
-        for field in ("path", "format", "analysis", "x", "traces", "sweep_params",
-                      "sweep_count_hint", "plot", "plots"):
+        out = self.m.list_traces(str(HERE / "test_9601.tr0"))
+        self.assertNotIn("sweep_count_hint", out)
+        for field in out:
             self.assertRegex(text, rf"\b{field}\b", field)
+
+    def test_extract_documents_its_json_results(self):
+        text = self.tools()["extract"].description
+        summary = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="summary")
+        csv_out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="csv",
+                                 dest=str(self.dir / "o.csv"), sweeps=[0])
+        for field in [*summary, *csv_out]:
+            if field not in ("path", "format", "analysis", "plot", "plots", "sweep_params"):
+                self.assertRegex(text, rf"\b{field}\b", field)
+
+    def test_list_traces_tool_gives_the_extents(self):
+        out = self.m.list_traces(str(HERE / "test_9601.tr0"), names=["v(vo)", "I(VS)"])
+        self.assertEqual(out["x_range"], [0.0, 0.01])
+        self.assertEqual(out["points"], 2605)
+        self.assertEqual(out["traces"], ["v_vo", "i_vs"])               # case is ignored as a fallback
+        self.assertEqual(out["ranges"], {"v_vo": [0.0, 1.8477405e-05], "i_vs": [-0.005, 1.8477404e-08]})
+        self.assertNotIn("note", out)
+        quick = self.m.list_traces(str(HERE / "test_9601.tr0"), header_only=True)
+        self.assertNotIn("ranges", quick)
+        self.assertEqual(quick["sweeps"], 1)
+
+    def test_wide_results_cap_the_ranges(self):
+        names = ["TIME"] + [f"v(n{i}" for i in range(150)]
+        data = np.random.default_rng(2).random((7, len(names)))
+        data[:, 0] = np.arange(7) * 1e-9
+        path = self.dir / "wide.tr0"
+        fixtures.write_binary(path, "2001", names, [1] * len(names), [([], data)])
+        out = self.m.list_traces(str(path))
+        self.assertEqual(len(out["traces"]), 150)                       # every name is still listed
+        self.assertEqual(list(out["ranges"]), out["traces"][:self.m.MCP_MAX_RANGES])
+        self.assertIn(f"first {self.m.MCP_MAX_RANGES} of 150 traces", out["note"])
+        self.assertNotIn("note", self.m.list_traces(str(path), names=["v_n149"]))
+        summary = self.m.extract(str(path), output="summary")
+        self.assertEqual(len(summary["ranges"]), self.m.MCP_MAX_RANGES)
+        self.assertEqual(len(summary["stats"]), 150)
+        self.assertIn("note", summary)
+        text = self.m.extract(str(path))
+        self.assertIn(f"-- {150 - self.m.TEXT_MAX_STATS} more traces not shown; select fewer names --", text)
+        self.assertIn(f"the tables below show the first {self.m.TEXT_MAX_TRACES} of 150 traces", text)
+        heading = [line.split() for line in text.splitlines() if line.lstrip().startswith("TIME")]
+        self.assertEqual(heading, [["TIME"] + out["traces"][:self.m.TEXT_MAX_TRACES]])   # x and 16 traces
+
+    def test_a_missed_window_says_where_the_data_is(self):
+        hint = "the whole plot has 2605 points with TIME in [0, 0.01]"
+        text = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], xrange=[1, 2])
+        self.assertIn(f"no points in xrange [1, 2]; {hint}", text)
+        summary = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="summary", xrange=[1, 2])
+        self.assertEqual((summary["points"], summary["x_range"]), (0, None))
+        self.assertEqual(summary["note"], f"no points in xrange [1, 2]; {hint}")
+        inside = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], xrange=[0.001, 0.002])
+        self.assertIn(f"window: xrange [0.001, 0.002]; {hint}", inside)
+        self.assertNotIn("note", self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="summary",
+                                                xrange=[0.001, 0.002]))
+
+    def test_relative_path_errors_name_the_server_directory(self):
+        import os
+
+        with self.assertRaisesRegex(self.m.ToolError, "server's working directory, " + re.escape(os.getcwd())):
+            self.m.list_traces("no_such_run.tr0")
+        with self.assertRaises(self.m.ToolError) as caught:
+            self.m.list_traces(str(self.dir / "no_such_run.tr0"))
+        self.assertNotIn("working directory", str(caught.exception))
 
     def test_plot_on_hspice_is_documented_as_an_error(self):
         props = self.schema(self.tools()["extract"])["properties"]
@@ -1722,14 +1989,18 @@ class TestMcp(unittest.TestCase):
     def test_summary_is_json(self):
         out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="summary", downsample=20)
         json.dumps(out)
-        self.assertEqual(len(out["traces"]["v_vo"][0]["x"]), 20)
+        self.assertEqual(len(out["stats"]["v_vo"][0]["x"]), 20)
 
-    def test_csv_tool_returns_path_and_counts(self):
+    def test_csv_tool_returns_dest_and_counts(self):
         dest = self.dir / "o.csv"
         out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="csv", dest=str(dest))
-        self.assertEqual(out["path"], str(dest))
+        self.assertEqual(list(out), ["output", "dest", "x", "x_range", "points", "sweeps", "truncated",
+                                     "traces", "ranges"])
+        self.assertEqual(out["dest"], str(dest))          # the parameter's name: path is always the input
         self.assertEqual(out["x"], "TIME")
+        self.assertEqual(out["x_range"], [0.0, 0.01])
         self.assertEqual(out["traces"], ["v_vo"])
+        self.assertEqual(out["ranges"], {"v_vo": [0.0, 1.8477405e-05]})
         self.assertEqual(out["sweeps"], 1)
         self.assertEqual(out["points"], 2605)
         self.assertNotIn("sweep_indices", out)            # only when sweeps= was given
@@ -1750,7 +2021,7 @@ class TestMcp(unittest.TestCase):
         out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="png", dest=str(dest),
                              xrange=[lo, hi], yrange=[-2.0, 2.0])
         self.assertEqual(out["output"], "png")
-        self.assertEqual(out["path"], str(dest))
+        self.assertEqual(out["dest"], str(dest))
         self.assertEqual(out["points"], int(((x >= lo) & (x <= hi)).sum()))   # 802: a repeated time point
         self.assertEqual(len(out["size"]), 2)
         self.assertTrue(all(isinstance(v, int) and v > 0 for v in out["size"]))
@@ -1768,7 +2039,7 @@ class TestMcp(unittest.TestCase):
 
     def test_summary_defaults_to_statistics_only(self):
         out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="summary")
-        entry = out["traces"]["v_vo"][0]
+        entry = out["stats"]["v_vo"][0]
         self.assertEqual(entry["count"], 2605)
         self.assertNotIn("x", entry)
 
@@ -1798,7 +2069,7 @@ class TestMcp(unittest.TestCase):
             out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="csv", dest="rel.csv", sweeps=[0])
         finally:
             os.chdir(cwd)
-        self.assertEqual(out["path"], str((self.dir / "rel.csv").resolve()))
+        self.assertEqual(out["dest"], str((self.dir / "rel.csv").resolve()))
         self.assertEqual(out["sweep_indices"], [0])
 
     def test_sweep_out_of_range_reaches_the_client(self):
@@ -1837,7 +2108,7 @@ class TestMcp(unittest.TestCase):
 
 
     def test_error_text_reaches_the_client(self):
-        with self.assertRaisesRegex(Exception, "available traces"):
+        with self.assertRaisesRegex(Exception, "Available traces"):
             asyncio.run(self.m.server.call_tool("extract", {"path": str(HERE / "test_9601.tr0"),
                                                              "names": ["nope"], "output": "csv"}))
         with self.assertRaisesRegex(Exception, "Input should be 'text'"):    # the schema's enum
@@ -1846,7 +2117,7 @@ class TestMcp(unittest.TestCase):
 
     def test_unexpected_errors_carry_their_type(self):
         original = self.m.api.list_traces
-        def boom(path, plot=0, ac_format="magphase"):
+        def boom(*args, **kwargs):
             raise KeyError("boom")
         self.m.api.list_traces = boom
         self.addCleanup(setattr, self.m.api, "list_traces", original)

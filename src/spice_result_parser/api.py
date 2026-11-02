@@ -12,22 +12,43 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .reader import TraceSet, read_header, read_traces, validate_range
+from .reader import TraceSet, nan_min_max, read_header, read_traces, resolve_columns, scan, validate_range
 
 OUTPUTS = ("arrays", "csv", "npz", "summary", "png")
 
 
-def list_traces(path, plot: int = 0, ac_format: str = "magphase") -> dict:
-    """Trace names and file facts from the header only.
+def list_traces(path, plot: int = 0, ac_format: str = "magphase", names=None,
+                header_only: bool = False) -> dict:
+    """What a result file holds, with the extents to choose extract's parameters from.
 
-    plot selects one plot of a Nutmeg rawfile; "plots" lists every plot in it (HSPICE: []).
-    ac_format names the columns of complex (AC) variables, as in extract.
+    Keys, in order: path, format, analysis, plot, plots, x, x_range, points, sweeps,
+    sweep_params, sweep_values, truncated, traces, ranges. x_range, points and the
+    per-trace ranges ([min, max], NaN skipped; null when there is no value) cover the
+    whole plot, every sweep.
+
+    They come from one streaming pass over the data (reader.scan): it holds no trace in
+    memory but reads the whole file. header_only=True reads the header alone, which is
+    instant on any file: it leaves out x_range, points, sweep_values, truncated and
+    ranges, and sweeps is then the count the header announces.
+
+    names narrows traces and ranges, as extract's names do (names, raw names, globs).
+    plot selects one plot of a Nutmeg rawfile; plots lists every plot in it (HSPICE: []).
+    ac_format names the columns of complex (AC) variables, and is what they are ranged in.
     """
-    h = read_header(path, plot, ac_format)
+    if header_only:
+        h = read_header(path, plot, ac_format)
+        traces = [h.names[c] for c in resolve_columns(h, names) if c]
+        return {"path": h.path, "format": h.version, "analysis": h.analysis, "plot": h.plot,
+                "plots": h.plot_names, "x": h.x_name, "sweeps": max(1, h.sweep_count_hint),
+                "sweep_params": h.sweep_params, "traces": traces}
+    s = scan(path, plot, ac_format, names)
+    h = s.header
     return {
-        "path": h.path, "format": h.version, "analysis": h.analysis, "x": h.x_name,
-        "traces": h.names[1:], "sweep_params": h.sweep_params, "sweep_count_hint": h.sweep_count_hint,
-        "plot": h.plot, "plots": h.plot_names,
+        "path": h.path, "format": h.version, "analysis": h.analysis, "plot": h.plot,
+        "plots": h.plot_names, "x": h.x_name, "x_range": _json_range(s.x_range), "points": s.points,
+        "sweeps": len(s.sweep_points), "sweep_params": h.sweep_params,
+        "sweep_values": _json_sweep_values(s.sweep_values, h.dtype), "truncated": s.truncated,
+        "traces": list(s.ranges), "ranges": {name: _json_range(b) for name, b in s.ranges.items()},
     }
 
 
@@ -68,13 +89,34 @@ SUMMARY_MAX_POINTS = 20000      # cap on x/y points serialised in one summary, o
 
 
 def _json_float(v) -> Optional[float]:
-    """float, or None for NaN and infinities (strict JSON has no token for them)."""
+    """v as a JSON number, or None for NaN and infinities (strict JSON has no token for
+    them). A float32 (HSPICE 9601 data) becomes its shortest decimal, 0.1 and not
+    0.10000000149011612: that reads back as exactly the same float32."""
+    if isinstance(v, np.float32):
+        return float(str(v)) if math.isfinite(v) else None
     v = float(v)
     return v if math.isfinite(v) else None
 
 
 def _json_floats(arr) -> List[Optional[float]]:
-    return [_json_float(v) for v in np.asarray(arr, dtype=np.float64).tolist()]
+    """_json_float of every value of arr, float32 kept short as there."""
+    a = np.asarray(arr)
+    values = (float(t) for t in a.astype(str).tolist()) if a.dtype == np.float32 \
+        else a.astype(np.float64).tolist()
+    return [v if math.isfinite(v) else None for v in values]
+
+
+def _json_range(bounds) -> Optional[List[Optional[float]]]:
+    """[min, max] for JSON; None when there was no value to bound (both NaN)."""
+    lo, hi = bounds
+    if math.isnan(lo) and math.isnan(hi):
+        return None
+    return [_json_float(lo), _json_float(hi)]
+
+
+def _json_sweep_values(sweep_values, dtype) -> List[List[Optional[float]]]:
+    """Sweep parameter values were read in the file's dtype; keep a float32 one short."""
+    return [_json_floats(np.asarray(v, dtype=dtype)) for v in sweep_values]
 
 
 def nan_stats(a: np.ndarray) -> Tuple[float, float, float]:
@@ -84,33 +126,71 @@ def nan_stats(a: np.ndarray) -> Tuple[float, float, float]:
         return np.nanmin(a), np.nanmax(a), np.nanmean(a)
 
 
+def range_of(arrays) -> Tuple:
+    """(min, max) over every value of the arrays, NaN skipped, in their dtype; NaN when
+    there is no value."""
+    bounds = [nan_min_max(np.asarray(a)) for a in arrays if len(a)]
+    if not bounds:
+        return math.nan, math.nan
+    return np.fmin.reduce(np.array([b[0] for b in bounds])), np.fmax.reduce(np.array([b[1] for b in bounds]))
+
+
+def _nan_mean(a: np.ndarray) -> float:
+    """Mean of the values that are not NaN, accumulated in float64; NaN when there are none."""
+    mean = a.mean(dtype=np.float64)
+    if math.isnan(mean):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)  # mean of empty slice
+            mean = np.nanmean(a, dtype=np.float64)
+    return mean
+
+
+def overview(ts: TraceSet) -> dict:
+    """The facts every JSON result shares, for the data in ts: x, x_range, points, sweeps,
+    sweep_params, sweep_values, sweep_indices, truncated, traces and ranges (per trace,
+    [min, max] over every kept sweep, NaN skipped). Bounds are null when there is no value;
+    NaN and infinities are null."""
+    h = ts.header
+    x = ts.data[h.x_name]
+    traces = ts.selected[1:]
+    return {
+        "x": h.x_name, "x_range": _json_range(range_of(x)), "points": sum(int(a.size) for a in x),
+        "sweeps": len(ts.sweep_values), "sweep_params": h.sweep_params,
+        "sweep_values": _json_sweep_values(ts.sweep_values, h.dtype),
+        "sweep_indices": list(ts.sweep_indices), "truncated": ts.truncated,
+        "traces": traces, "ranges": {name: _json_range(range_of(ts.data[name])) for name in traces},
+    }
+
+
 def summarize(ts: TraceSet, downsample: Optional[int] = None) -> dict:
-    """JSON-serialisable statistics per trace and sweep of ts; points are decimated.
+    """JSON-serialisable description of ts: the file facts and overview(ts), then under
+    "stats" per trace and per sweep count, min, max, mean, first and last; points are
+    decimated.
 
     The statistics cover every point in ts. A TraceSet already decimated (extract with
     output="arrays" and downsample) gives statistics of the decimated points.
     min, max and mean skip NaN values; they are null only when a trace holds nothing else.
 
-    Points are emitted only when downsample is given. The SUMMARY_MAX_POINTS budget is
-    shared evenly by the (trace, sweep) series, but each series keeps at least 2 points, so
-    the cap holds only up to SUMMARY_MAX_POINTS / 2 series. The statistics always grow with
-    the number of series: select a few names or sweeps on large files. NaN and infinities
-    are emitted as null.
+    Points (x and y lists in stats) are emitted only when downsample is given. The
+    SUMMARY_MAX_POINTS budget is shared evenly by the (trace, sweep) series, but each
+    series keeps at least 2 points, so the cap holds only up to SUMMARY_MAX_POINTS / 2
+    series. The statistics always grow with the number of series: select a few names or
+    sweeps on large files. NaN and infinities are emitted as null.
     """
     h = ts.header
     x = ts.data[h.x_name]
     if downsample is not None:
         series = max(1, (len(ts.selected) - 1) * len(ts.sweep_values))
         downsample = min(downsample, max(2, SUMMARY_MAX_POINTS // series))
-    traces = {}
+    stats = {}
     for name in ts.selected[1:]:
         per_sweep = []
         for i, arr in enumerate(ts.data[name]):
-            a = np.asarray(arr, dtype=np.float64)
+            a = np.asarray(arr)
             entry = {"count": int(a.size)}
             if a.size:
-                lo, hi, mean = nan_stats(a)
-                entry.update(min=_json_float(lo), max=_json_float(hi), mean=_json_float(mean),
+                lo, hi = nan_min_max(a)
+                entry.update(min=_json_float(lo), max=_json_float(hi), mean=_json_float(_nan_mean(a)),
                              first=_json_float(a[0]), last=_json_float(a[-1]))
                 if downsample is not None:
                     idx = decimation_indices(a.size, downsample)
@@ -118,14 +198,9 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None) -> dict:
                     entry["x"] = _json_floats(xs)
                     entry["y"] = _json_floats(ys)
             per_sweep.append(entry)
-        traces[name] = per_sweep
-    return {
-        "path": h.path, "format": h.version, "plot": h.plot, "plots": h.plot_names,
-        "analysis": h.analysis, "x": h.x_name,
-        "sweep_params": h.sweep_params, "sweep_values": [_json_floats(v) for v in ts.sweep_values],
-        "sweeps": len(ts.sweep_values), "sweep_indices": list(ts.sweep_indices),
-        "truncated": ts.truncated, "traces": traces,
-    }
+        stats[name] = per_sweep
+    return {"path": h.path, "format": h.version, "analysis": h.analysis, "plot": h.plot,
+            "plots": h.plot_names, **overview(ts), "stats": stats}
 
 
 def default_dest(path, output: str) -> str:

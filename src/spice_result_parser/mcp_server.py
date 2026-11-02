@@ -64,6 +64,16 @@ def _tool(read_only: bool):
 _REPORTED = (ValueError, OSError, ImportError)   # errors whose text the client should see
 
 
+def _error_text(exc: Exception) -> str:
+    """The error as the agent should read it. A missing file named by a relative path
+    says where the server looked: its working directory need not be the agent's."""
+    text = str(exc)
+    name = getattr(exc, "filename", None)
+    if isinstance(exc, FileNotFoundError) and isinstance(name, str) and not os.path.isabs(name):
+        text += f" (relative paths resolve against the server's working directory, {os.getcwd()})"
+    return text
+
+
 def _tool_errors(fn):
     """The mcp server forwards only ToolError text to the client; anything else becomes a bare
     'Error executing tool'. Re-raise the errors we mean the agent to read."""
@@ -73,7 +83,7 @@ def _tool_errors(fn):
         except ToolError:
             raise
         except _REPORTED as exc:
-            raise ToolError(str(exc)) from exc
+            raise ToolError(_error_text(exc)) from exc
         except Exception as exc:                 # unexpected: still better than a bare "Error executing tool"
             raise ToolError(f"{type(exc).__name__}: {exc}") from exc
     wrapper.__name__ = fn.__name__
@@ -87,8 +97,11 @@ def _tool_errors(fn):
 
 TEXT_MAX_ROWS = 500     # rows one text result may hold, over all tables
 TEXT_MAX_TABLES = 20    # tables one text result may hold: the first and the last TEXT_MAX_TABLES // 2
-TEXT_MAX_STATS = 100    # min/max rows per (sweep, trace); above it, one row per trace over all sweeps
+TEXT_MAX_STATS = 100    # min/max rows per (sweep, trace); above it, one row per trace over all
+                        # sweeps, and at most this many traces
+TEXT_MAX_TRACES = 16    # trace columns in the point tables; the min/max table lists more
 MAX_RUNS = 32           # split a sweep on x restarts only up to this many runs
+MCP_MAX_RANGES = 100    # traces whose [min, max] one JSON result lists; names= narrows to others
 
 _ANALYSIS_WORDS = {"tr": "transient", "sw": "dc sweep", "ac": "ac", "op": "operating point",
                    "noise": "noise"}
@@ -129,12 +142,21 @@ def _runs(x) -> List[slice]:
 
 def _min_max(arrays) -> List[str]:
     """min and max, NaN skipped, over the points of every array; "-" when there are none."""
-    stats = [api.nan_stats(np.asarray(a, dtype=np.float64)) for a in arrays if len(a)]
-    if not stats:
+    if not any(len(a) for a in arrays):
         return ["-", "-"]
-    lo = api.nan_stats(np.array([s[0] for s in stats]))[0]
-    hi = api.nan_stats(np.array([s[1] for s in stats]))[1]
-    return [_num(lo), _num(hi)]
+    return [_num(v) for v in api.range_of(arrays)]
+
+
+def _interval(bounds) -> str:
+    """[lo, hi] as text, in the form xrange takes."""
+    return f"[{_num(bounds[0])}, {_num(bounds[1])}]"
+
+
+def _plot_extent(ts) -> str:
+    """Where the whole plot's data lies, for an agent whose x window missed or clipped it."""
+    if not ts.plot_points:
+        return "the plot holds no points"
+    return f"the whole plot has {ts.plot_points} points with {ts.header.x_name} in {_interval(ts.plot_x_range)}"
 
 
 def format_text(ts, points: int = 20) -> str:
@@ -142,18 +164,22 @@ def format_text(ts, points: int = 20) -> str:
     per sample with x once and one column per trace.
 
     Numbers are rounded to 6 significant digits; NaN and infinity print as nan/inf.
-    `points` rows are shown per table (evenly spaced, first and last kept), at most
-    TEXT_MAX_ROWS in total; the header says how many points exist and, when rows
-    were dropped, how many are shown. Each sweep gets its own table, and a sweep
-    whose x restarts (a nested .dc written flat) one table per run. Of more than
-    TEXT_MAX_TABLES tables only the first and the last TEXT_MAX_TABLES // 2 are shown, and the min/max
-    table holds one row per trace over all sweeps when per-sweep rows would exceed
-    TEXT_MAX_STATS.
+    The header gives the x range of the data and, when an x window was applied, a line
+    gives the whole plot's point count and x range. `points` rows are shown per table
+    (evenly spaced, first and last kept), at most TEXT_MAX_ROWS in total; the header
+    says how many points exist and, when rows were dropped, how many are shown. Each
+    sweep gets its own table, and a sweep whose x restarts (a nested .dc written flat)
+    one table per run. Of more than TEXT_MAX_TABLES tables only the first and the last
+    TEXT_MAX_TABLES // 2 are shown, and the min/max table holds one row per trace over
+    all sweeps when per-sweep rows would exceed TEXT_MAX_STATS. The point tables hold at
+    most TEXT_MAX_TRACES traces and the min/max table at most TEXT_MAX_STATS; a line
+    counts the traces left out.
     """
     h = ts.header
     x_name, traces = h.x_name, ts.selected[1:]
     nsweeps = len(ts.sweep_values)
     total = sum(int(ts.data[x_name][i].size) for i in range(nsweeps))
+    columns = traces[:TEXT_MAX_TRACES]
 
     # (label, slice, sweep index) per table
     tables = []
@@ -183,16 +209,19 @@ def format_text(ts, points: int = 20) -> str:
         label, sl, i = table
         x = ts.data[x_name][i][sl]
         idx = api.decimation_indices(x.size, per_table)
-        cols = [x] + [ts.data[name][i][sl] for name in traces]
+        cols = [x] + [ts.data[name][i][sl] for name in columns]
         if idx is not None:
             cols = [c[idx] for c in cols]
         shown += int(cols[0].size)
-        rows = [[x_name, *traces]] + [[_num(v) for v in row] for row in zip(*cols)]
+        rows = [[x_name, *columns]] + [[_num(v) for v in row] for row in zip(*cols)]
         if label:
             body.append(f"-- {label} --")
         body.extend(_table(rows))
 
-    head = f"{_ANALYSIS_WORDS.get(h.analysis, h.analysis)} | x: {x_name} | {total} points"
+    head = f"{_ANALYSIS_WORDS.get(h.analysis, h.analysis)} | x: {x_name}"
+    if total:
+        head += f" in {_interval(api.range_of(ts.data[x_name]))}"
+    head += f" | {total} points"
     if nsweeps > 1:
         head += f" in {nsweeps} sweeps"
     if shown < total:
@@ -204,19 +233,32 @@ def format_text(ts, points: int = 20) -> str:
     if h.analysis == "ac":
         lines.append(AC_LEGEND[h.ac_format])
     if total == 0:
-        lines.append("no sweeps in the selection" if nsweeps == 0 else "no points in the selected x window")
+        if nsweeps == 0:
+            lines.append("no sweeps in the selection")
+        elif ts.xrange is not None:
+            lines.append(f"no points in xrange {_interval(ts.xrange)}; {_plot_extent(ts)}")
+        else:
+            lines.append("no points in the selected sweeps")
         return "\n".join(lines)
+    if ts.xrange is not None:
+        lines.append(f"window: xrange {_interval(ts.xrange)}; {_plot_extent(ts)}")
     if traces:
+        listed = traces[:TEXT_MAX_STATS]
         if nsweeps <= 1 or nsweeps * len(traces) <= TEXT_MAX_STATS:
             stats = [["trace", "min", "max"]]
             for i in range(nsweeps):
                 tag = f"[{ts.sweep_indices[i]}]" if nsweeps > 1 else ""
-                for name in traces:
+                for name in listed:
                     stats.append([name + tag, *_min_max(ts.data[name][i:i + 1])])
         else:
             stats = [[f"trace (all {nsweeps} sweeps)", "min", "max"]]
-            stats += [[name, *_min_max(ts.data[name])] for name in traces]
+            stats += [[name, *_min_max(ts.data[name])] for name in listed]
         lines += ["", *_table(stats)]
+        if len(listed) < len(traces):
+            lines.append(f"-- {len(traces) - len(listed)} more traces not shown; select fewer names --")
+    if len(columns) < len(traces):
+        lines += ["", f"-- the tables below show the first {len(columns)} of {len(traces)} traces; "
+                      f"select names to see the others --"]
     lines += ["", *body]
     return "\n".join(lines)
 
@@ -252,33 +294,66 @@ def format_measures(ms, rows: int = 20) -> str:
     return "\n".join(lines)
 
 
+_NAMES_HELP = ("trace names (v_out), raw SPICE names (v(out)) or globs (v_*); case is ignored "
+               "when nothing matches exactly. For AC, v(out) selects both columns of the pair. An "
+               "unknown name fails with near names and the available traces.")
+_PATH_HELP = "Prefer an absolute path: a relative one resolves against the server's working directory."
+_AC_FORMAT_HELP = ("What each complex (AC) trace becomes: \"magphase\" (default; _Mag linear, "
+                   "_Phase degrees), \"db\" (_dB = 20*log10 magnitude, _Phase) or \"realimag\" "
+                   "(_Re, _Im). Files without complex data do not use it.")
+
+
+def _json_result(result: dict, ts=None) -> dict:
+    """A JSON result as the agent gets it: at most MCP_MAX_RANGES trace ranges, and a
+    "note" when ranges were cut or the x window of ts kept no point."""
+    notes = []
+    if ts is not None and ts.xrange is not None and ts.sweep_values and not result["points"]:
+        notes.append(f"no points in xrange {_interval(ts.xrange)}; {_plot_extent(ts)}")
+    ranges = result.get("ranges")
+    if ranges is not None and len(ranges) > MCP_MAX_RANGES:
+        result["ranges"] = dict(list(ranges.items())[:MCP_MAX_RANGES])
+        notes.append(f"ranges lists the first {MCP_MAX_RANGES} of {len(ranges)} traces; "
+                     f"pass names=[...] for the others")
+    if notes:
+        result["note"] = "; ".join(notes)
+    return result
+
+
 @_tool(read_only=True)
 @_tool_errors
 def list_traces(
     path: Annotated[str, Field(description="Result file: HSPICE .tr#/.sw#/.ac# (binary 9601/2001 "
-                                           "or ASCII) or a Nutmeg .raw (binary or ASCII). Prefer an "
-                                           "absolute path: a relative one resolves against the "
-                                           "server's working directory.")],
+                                           "or ASCII) or a Nutmeg .raw (binary or ASCII). " + _PATH_HELP)],
+    names: Annotated[Optional[Union[str, List[str]]], Field(
+        description="Traces to list, as extract selects them: " + _NAMES_HELP + " None lists every "
+                    "trace.")] = None,
     plot: Annotated[int, Field(description="Nutmeg only: which plot of the rawfile to describe, "
                                            "0-based (see \"plots\"). Must be 0 for HSPICE files.")] = 0,
+    ac_format: Annotated[Literal[tuple(AC_FORMATS)], Field(
+        description=_AC_FORMAT_HELP + " Names and ranges follow it, as extract returns them.")] = "magphase",
+    header_only: Annotated[bool, Field(
+        description="True reads only the header: instant on any file size, but without "
+                    "x_range, points, sweep_values, truncated and ranges, and sweeps is the "
+                    "count the header announces. Default False reads the data once.")] = False,
 ) -> dict:
-    """List the traces in a simulation result file. Call this first: it reads only the
-    header, so it is cheap on any file size, and gives the names to pass to extract.
+    """List what a simulation result file holds, with the extents to set extract's
+    parameters from. Call this first. It reads the whole file once and keeps none of it.
 
     Result fields:
-    - path, format ("9601", "2001", "ascii" or "nutmeg")
-    - analysis: "tr" transient, "sw" dc sweep, "ac"; Nutmeg adds "op", "noise", "other"
-    - x: the x variable (TIME, HERTZ, the swept source), always returned by extract
-    - traces: every other trace name
-    - sweep_params: names of the swept parameters (HSPICE; [] for Nutmeg)
-    - sweep_count_hint: number of sweeps the header announces; 0 means a single sweep
+    - path, format ("9601", "2001", "ascii" or "nutmeg"); analysis: "tr" transient, "sw"
+      dc sweep, "ac"; Nutmeg adds "op", "noise", "other"
     - plot, plots: the plot described and the names of all plots (Nutmeg; HSPICE: 0, [])
+    - x: the x variable (TIME, HERTZ, the swept source); x_range: its [min, max], for xrange
+    - points: total points; sweeps: their count (extract's sweeps takes 0 to sweeps-1);
+      sweep_params, sweep_values: each sweep's parameter values (HSPICE; Nutmeg: none)
+    - truncated: the simulation had not finished writing the file
+    - traces: every other trace name; ranges: each trace's [min, max], NaN skipped
+      (null: no value, or infinite). At most 100 ranges: "note" then says to narrow names.
 
-    AC traces are listed as <name>_Mag and <name>_Phase. extract's ac_format renames
-    them; select them there by raw name (v(out)), which works in every format. For a
-    measure file (.mt#, .ms#, .ma#) use read_measures instead.
+    AC traces are listed as <name>_Mag and <name>_Phase; v(out) selects the pair in
+    extract. For a measure file (.mt#, .ms#, .ma#) use read_measures instead.
     """
-    return api.list_traces(path, plot)
+    return _json_result(api.list_traces(path, plot, ac_format, names, header_only=header_only))
 
 
 MCP_OUTPUTS = ("text", "summary", "csv", "npz", "png")
@@ -289,13 +364,12 @@ MCP_OUTPUTS = ("text", "summary", "csv", "npz", "png")
 def extract(
     path: Annotated[str, Field(description="Result file, as for list_traces.")],
     names: Annotated[Optional[Union[str, List[str]]], Field(
-        description="Traces to read: names from list_traces (v_out), raw names (v(out)) or "
-                    "globs (v_*). None reads every trace. x is always included. For AC, "
-                    "v(out) selects both columns of the pair. An unknown name fails with a "
-                    "list of the available traces.")] = None,
+        description="Traces to read, as list_traces lists them: " + _NAMES_HELP + " None reads "
+                    "every trace. x is always included.")] = None,
     sweeps: Annotated[Optional[Union[int, List[int]]], Field(
-        description="0-based sweep indices to keep; None keeps all. An index the file does "
-                    "not hold is an error. On files with many sweeps, pick a few here.")] = None,
+        description="0-based sweep indices to keep (list_traces gives sweeps and each one's "
+                    "sweep_values); None keeps all. An index the file does not hold is an "
+                    "error. On files with many sweeps, pick a few here.")] = None,
     output: Annotated[Literal[MCP_OUTPUTS], Field(
         description="\"text\" (default): readable report, see the tool description. "
                     "\"summary\": JSON with exact numbers. \"csv\" / \"npz\": write every "
@@ -309,36 +383,36 @@ def extract(
                     "existing file, but never the input. Default: <input>_<ext>_traces.<output> "
                     "beside the input. An error with text or summary.")] = None,
     xrange: Annotated[Optional[List[float]], Field(
-        description="[min, max] on x: keep only rows inside the closed interval, for every "
-                    "output. Applied while reading, so a narrow window on a huge file is "
-                    "cheap: prefer it to reading everything.")] = None,
+        description="[min, max] on x (list_traces gives x_range): keep only rows inside the "
+                    "closed interval, for every output. Applied while reading, so a narrow "
+                    "window on a huge file is cheap: prefer it to reading everything.")] = None,
     yrange: Annotated[Optional[List[float]], Field(
-        description="[min, max] vertical axis limits of the png plot; other outputs do not "
-                    "use it, but a malformed value is still an error.")] = None,
+        description="[min, max] vertical axis limits of the png plot (list_traces gives each "
+                    "trace's range); other outputs do not use it, but a malformed value is "
+                    "still an error.")] = None,
     plot: Annotated[int, Field(description="Nutmeg only: which plot to read, 0-based (see "
                                            "list_traces). Must be 0 for HSPICE files.")] = 0,
-    ac_format: Annotated[Literal[tuple(AC_FORMATS)], Field(
-        description="What each complex (AC) trace becomes: \"magphase\" (default; _Mag linear, "
-                    "_Phase degrees), \"db\" (_dB = 20*log10 magnitude, _Phase) or "
-                    "\"realimag\" (_Re, _Im). Files without complex data do not use it.")] = "magphase",
+    ac_format: Annotated[Literal[tuple(AC_FORMATS)], Field(description=_AC_FORMAT_HELP)] = "magphase",
 ):
     """Read selected traces from an HSPICE result file or a Nutmeg rawfile. Call
-    list_traces first for the names. Start with output="text" to look at the data, then
-    narrow with xrange to zoom in; use csv or npz to hand every point to other tools.
+    list_traces first: its names, x_range, sweeps and ranges are what names, xrange,
+    sweeps and yrange take. Start with output="text" to look at the data, then narrow
+    with xrange to zoom in; use csv or npz to hand every point to other tools.
 
-    text: a header (analysis, x, point count, "(n shown)" when rows were dropped;
-    "TRUNCATED" first when the simulation had not finished writing), a min/max table
-    over every point, then one table per sweep with x once and one column per trace,
-    at most 500 rows. Of more than 20 tables only the first and last 10 are shown.
-    Values have 6 significant digits; nan and inf are spelled out.
+    text: "TRUNCATED" first when the simulation had not finished writing; a header
+    (analysis, x and its range, point count, "(n shown)" when rows were dropped); with
+    xrange, the whole plot's extent; a min/max table; then one table per sweep with x
+    once and a column per trace (at most 16), at most 500 rows. Of more than 20 tables
+    the first and last 10 are shown. Values have 6 significant digits.
 
-    summary: JSON with exact floats: per trace and sweep count, min, max, mean (NaN
-    skipped), first, last, plus x/y points when downsample is set; NaN and inf become
-    null. It grows with traces x sweeps: select a few.
-
-    csv, npz, png: the file is written, and the result holds output, path (absolute),
-    x, traces, sweeps (count), points (total), truncated, sweep_indices when sweeps was
-    given, and for png size [w, h]. For AC, plot the magnitude and the phase separately.
+    The JSON outputs hold list_traces' fields for the data read: x, x_range, points,
+    sweeps, truncated, traces, ranges (at most 100; then a "note").
+    summary: also sweep_values, sweep_indices and stats: per trace and sweep count,
+    min, max, mean (NaN skipped), first, last, plus x/y points when downsample is set.
+    Exact floats; NaN and inf become null. It grows with traces x sweeps: select a few.
+    csv, npz, png: the file is written; the result adds output, dest (absolute),
+    sweep_indices when sweeps was given, and for png size [w, h]. For AC, plot the
+    magnitude and the phase separately.
     """
     if output == "arrays":
         raise ValueError(f"output='arrays' is not available over MCP; use one of {MCP_OUTPUTS}")
@@ -347,41 +421,39 @@ def extract(
     downsample = api.check_downsample(downsample)
     xrange = api.validate_range("xrange", xrange)
     yrange = api.validate_range("yrange", yrange, finite=True)
-    if output == "text":
+    if output in ("text", "summary"):
         if dest is not None:
-            raise ValueError("dest applies to csv, npz and png only, not to output='text'")
+            raise ValueError(f"dest applies to csv, npz and png only, not to output={output!r}")
         ts = api.extract(path, names, sweeps, "arrays", xrange=xrange, plot=plot, ac_format=ac_format)
-        return format_text(ts, 20 if downsample is None else downsample)
-    if output == "summary":
-        return api.extract(path, names, sweeps, "summary", downsample, dest, xrange=xrange, plot=plot,
-                           ac_format=ac_format)
+        if output == "text":
+            return format_text(ts, 20 if downsample is None else downsample)
+        return _json_result(api.summarize(ts, downsample), ts)
     api.resolve_dest(path, output, dest)             # fail before the read, not after it
     if output == "png":
         api._require_matplotlib()
     ts = api.extract(path, names, sweeps, "arrays", downsample, xrange=xrange, plot=plot,
                      ac_format=ac_format)
     written = os.path.abspath(api.write_file(ts, output, dest, yrange))
-    x = ts.header.x_name
-    result = {
-        "output": output, "path": written, "x": x, "traces": ts.selected[1:],
-        "sweeps": len(ts.sweep_values), "points": sum(int(a.size) for a in ts.data[x]),
-        "truncated": ts.truncated,
-    }
-    if sweeps is not None:
-        result["sweep_indices"] = list(ts.sweep_indices)
+    facts = api.overview(ts)
+    result = {"output": output, "dest": written}
+    for key in ("x", "x_range", "points", "sweeps", "sweep_indices", "truncated", "traces", "ranges"):
+        if key != "sweep_indices" or sweeps is not None:
+            result[key] = facts[key]
     if output == "png":
         result["size"] = list(_png_size(written))
-    return result
+    return _json_result(result, ts)
 
 
 @_tool(read_only=True)
 @_tool_errors
 def read_measures(
     path: Annotated[str, Field(description="HSPICE measure file: .mt# (transient), .ms# (dc) "
-                                           "or .ma# (ac).")],
+                                           "or .ma# (ac). " + _PATH_HELP)],
     names: Annotated[Optional[Union[str, List[str]]], Field(
-        description="Measures to show, by name or glob (tp*); None shows every column. The "
-                    "index column and the swept parameters are always kept.")] = None,
+        description="Measures to show, by name or glob (tp*); case is ignored when nothing "
+                    "matches exactly. None shows every column. The index column and the swept "
+                    "parameters are always kept. An unknown name fails with near names and the "
+                    "available measures.")] = None,
     rows: Annotated[int, Field(
         description="Rows shown, evenly spaced with first and last kept; at least 2, at "
                     "most 500.")] = 20,

@@ -20,8 +20,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .reader import (Header, TraceSet, _uniquify, ac_names, ac_part, check_sweeps, parse_var_name, plot_index,
-                     resolve_columns, sweep_set)
+from .reader import (Header, Scan, TraceSet, _XSpan, _uniquify, ac_names, ac_part, check_sweeps, nan_min_max,
+                     parse_var_name, plot_index, resolve_columns, sweep_set)
 
 _BOM = b"\xef\xbb\xbf"
 
@@ -318,9 +318,11 @@ class _Writer:
         self.nsweeps = p.nsweeps
         self.counts = [0] * self.nsweeps
         self.fill = 0
+        self.span = _XSpan(np.float64)              # every point read, before the window
 
     def __call__(self, rows: np.ndarray, start: int) -> None:
         """rows are the points at plot indices start .. start + len(rows) - 1."""
+        self.span.add(rows[:, 0].real)
         kept = None                                 # None: every row is inside the window
         if self.xrange is not None:
             lo, hi = self.xrange
@@ -344,6 +346,30 @@ class _Writer:
             _grow(self.buf, self.fill, stop)
         _take(rows, self.specs, self.buf, self.fill, self.ac_format)
         self.fill = stop
+
+
+class _RangeWriter:
+    """Takes _Writer's place when nothing is kept: the (min, max) of every column, NaN
+    skipped, with each complex variable ranged as its two ac_format columns."""
+
+    def __init__(self, p: _Plot, ncols: int, ac_format: str):
+        self.p = p
+        self.ac_format = ac_format
+        self.lo = np.full(ncols, np.nan)
+        self.hi = np.full(ncols, np.nan)
+
+    def __call__(self, rows: np.ndarray, start: int) -> None:
+        if not rows.shape[0]:
+            return
+        values = rows
+        if self.p.is_complex:
+            values = np.empty((rows.shape[0], self.lo.size))
+            values[:, 0] = rows[:, 0].real
+            dep = rows[:, 1:]
+            values[:, 1::2] = ac_part(dep.real, dep.imag, self.ac_format, second=False)
+            values[:, 2::2] = ac_part(dep.real, dep.imag, self.ac_format, second=True)
+        lo, hi = nan_min_max(values, axis=0)
+        self.lo, self.hi = np.fmin(self.lo, lo), np.fmax(self.hi, hi)
 
 
 def _read_binary(f, p: _Plot, write: _Writer, limit: int) -> int:
@@ -496,26 +522,10 @@ def read_nutmeg_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None
         points = _capacity(f, target)               # points the data section can hold
         capacity = min(points, WINDOW_CAPACITY) if xrange is not None else points
         buf = {c: np.empty(capacity, np.float64) for c in cols}
-        per = max(1, (target.npoints if target.count_known else 1) // target.nsweeps)
+        per = _points_per_sweep(target)
         write = _Writer(target, specs, buf, xrange, per, ac_format)
-        f.seek(target.data_start)
-        if target.is_binary:
-            nread = _read_binary(f, target, write, points)
-        else:
-            nread = _read_ascii(f, path, target, write, points if target.count_known else None)
-    truncated = not target.count_known or nread < target.npoints
-    if not target.count_known:
-        warnings.warn(
-            f"{path}: plot {target.index}: 'No. Points' has not been written yet; the simulator "
-            f"is still running. Read {nread} complete points",
-            RuntimeWarning,
-        )
-    elif truncated:
-        warnings.warn(
-            f"{path}: plot {target.index}: file ends after {nread} of {target.npoints} points; "
-            f"keeping the complete points",
-            RuntimeWarning,
-        )
+        nread = _read_data(f, path, target, write, points)
+    truncated = _truncated(path, target, nread)
     spans, indices, reached = _kept_spans(write.counts, per, nread, wanted)
     check_sweeps(path, wanted, reached, truncated)
     # Hand out views into the buffers when nearly all of them is kept; otherwise copy the
@@ -532,5 +542,64 @@ def read_nutmeg_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None
         sweep_values=[[] for _ in spans],
         sweep_indices=indices,
         data=data,
+        truncated=truncated,
+        plot_points=write.span.points,
+        plot_x_range=write.span.range,
+        xrange=xrange,
+    )
+
+
+def _points_per_sweep(p: _Plot) -> int:
+    """Points in each of a Dimensions plot's sweeps; for a single sweep, its point count."""
+    return max(1, (p.npoints if p.count_known else 1) // p.nsweeps)
+
+
+def _read_data(f, path: str, p: _Plot, write, points: int) -> int:
+    """Hand the data section to write(rows, start); returns the points actually read."""
+    f.seek(p.data_start)
+    if p.is_binary:
+        return _read_binary(f, p, write, points)
+    return _read_ascii(f, path, p, write, points if p.count_known else None)
+
+
+def _truncated(path: str, p: _Plot, nread: int) -> bool:
+    """Whether the plot holds fewer points than it declares (or declares none yet), with a warning."""
+    truncated = not p.count_known or nread < p.npoints
+    if not p.count_known:
+        warnings.warn(
+            f"{path}: plot {p.index}: 'No. Points' has not been written yet; the simulator "
+            f"is still running. Read {nread} complete points",
+            RuntimeWarning,
+        )
+    elif truncated:
+        warnings.warn(
+            f"{path}: plot {p.index}: file ends after {nread} of {p.npoints} points; "
+            f"keeping the complete points",
+            RuntimeWarning,
+        )
+    return truncated
+
+
+def scan_nutmeg(path, plot: int = 0, ac_format: str = "magphase", names=None) -> Scan:
+    """reader.scan for one plot of a rawfile: sweeps, x range and the (min, max) of every
+    trace that names selects, from one pass that keeps none of the data."""
+    path = os.fspath(path)
+    with open(path, "rb") as f:
+        target, plot_names = _walk(f, path, plot_index(plot))
+        header = _build_header(path, target, plot_names, ac_format)
+        cols = resolve_columns(header, names)       # an unknown name fails before the data is read
+        ranger = _RangeWriter(target, header.ncols, ac_format)
+        nread = _read_data(f, path, target, ranger, _capacity(f, target))
+    truncated = _truncated(path, target, nread)
+    per = _points_per_sweep(target)
+    counts = [nread] if target.nsweeps == 1 else \
+        [max(0, min(per, nread - i * per)) for i in range(target.nsweeps)]
+    spans, _, _ = _kept_spans(counts, per, nread, None)
+    return Scan(
+        header=header,
+        sweep_values=[[] for _ in spans],
+        sweep_points=[b - a for a, b in spans],
+        x_range=(ranger.lo[0], ranger.hi[0]),
+        ranges={header.names[c]: (ranger.lo[c], ranger.hi[c]) for c in cols if c},
         truncated=truncated,
     )

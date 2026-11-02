@@ -15,6 +15,7 @@ PARAM_COUNT swept parameters.
 """
 from __future__ import annotations
 
+import difflib
 import fnmatch
 import os
 import re
@@ -55,6 +56,19 @@ def _to_float(token: str, path: str) -> float:
         raise ValueError(f"{path}: measure value {token!r} is not a number") from None
 
 
+def _matches(all_names: List[str], req: str) -> List[str]:
+    """Exact name, else glob; then both again ignoring case, as SPICE does (HSPICE writes
+    measure names in lower case, while a netlist may spell them TPD)."""
+    for fold in (str, str.lower):
+        names = [fold(n) for n in all_names]
+        key = fold(req)
+        hits = [n for n, f in zip(all_names, names) if f == key] or \
+               [n for n, f in zip(all_names, names) if fnmatch.fnmatchcase(f, key)]
+        if hits:
+            return hits
+    return []
+
+
 def _select(all_names: List[str], always: List[str], names) -> List[str]:
     """Kept columns in file order: `always` plus every exact or glob match of names."""
     if names is None:
@@ -63,9 +77,11 @@ def _select(all_names: List[str], always: List[str], names) -> List[str]:
         names = [names]
     chosen = set(always)
     for req in names:
-        hits = [n for n in all_names if n == req] or [n for n in all_names if fnmatch.fnmatchcase(n, req)]
+        hits = _matches(all_names, req)
         if not hits:
-            raise ValueError(f"unknown measure {req!r}; available measures: {', '.join(all_names)}")
+            close = difflib.get_close_matches(req.lower(), [n.lower() for n in all_names], n=5, cutoff=0.6)
+            hint = f"; did you mean {', '.join(n for n in all_names if n.lower() in close)}?" if close else "."
+            raise ValueError(f"unknown measure {req!r}{hint} Available measures: {', '.join(all_names)}")
         chosen.update(hits)
     return [n for n in all_names if n in chosen]
 
@@ -82,7 +98,8 @@ def read_measures(path, names=None) -> MeasureSet:
     with open(path, "rb") as f:
         first = f.readline(4096).decode("utf-8", errors="replace")
         if not first.startswith("$DATA1"):
-            raise ValueError(f"{path}: not an HSPICE measure file (it does not start with $DATA1)")
+            raise ValueError(f"{path}: not an HSPICE measure file (it does not start with $DATA1); "
+                             f"read a result file (.tr#, .sw#, .ac#, .raw) with list_traces and extract")
         text = f.read().decode("utf-8", errors="replace")
     match = _PARAM_COUNT.search(first)
     param_count = int(match.group(1)) if match else 0

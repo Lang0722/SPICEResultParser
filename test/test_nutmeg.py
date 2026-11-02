@@ -837,14 +837,57 @@ class TestApi(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_list_traces_shows_plots(self):
-        info = api.list_traces(BIN, plot=1)
+        info = api.list_traces(BIN, plot=1, header_only=True)
         self.assertEqual(info, {
-            "path": str(BIN), "format": "nutmeg", "analysis": "ac", "x": "frequency",
+            "path": str(BIN), "format": "nutmeg", "analysis": "ac", "plot": 1, "plots": PLOT_NAMES,
+            "x": "frequency", "sweeps": 1, "sweep_params": [],
             "traces": ["v_in_Mag", "v_in_Phase", "v_out_Mag", "v_out_Phase",
                        "i_v1_Mag", "i_v1_Phase"],
-            "sweep_params": [], "sweep_count_hint": 0, "plot": 1, "plots": PLOT_NAMES,
         })
         json.dumps(info)
+
+    def test_list_traces_ranges_every_plot(self):
+        for path in REAL_FILES:
+            for plot in range(3):
+                for ac_format in ("magphase", "db", "realimag"):
+                    info = api.list_traces(path, plot=plot, ac_format=ac_format)
+                    ts = read_traces(path, plot=plot, ac_format=ac_format)
+                    x = ts.data[ts.selected[0]][0]
+                    self.assertEqual(info["x_range"], [float(x.min()), float(x.max())])
+                    self.assertEqual(info["points"], x.size)
+                    self.assertEqual((info["sweeps"], info["sweep_values"]), (1, [[]]))
+                    self.assertFalse(info["truncated"])
+                    self.assertEqual(list(info["ranges"]), ts.selected[1:])
+                    for name in ts.selected[1:]:
+                        y = ts.data[name][0]
+                        np.testing.assert_allclose(info["ranges"][name], [y.min(), y.max()],
+                                                   rtol=1e-12, atol=0, err_msg=f"{path} {plot} {name}")
+                    json.dumps(info, allow_nan=False)
+
+    def test_list_traces_counts_the_sweeps_of_dimensions(self):
+        x = np.tile(np.linspace(0, 1, 4), 3)
+        data = np.c_[x, x * np.repeat([1.0, 2.0, 3.0], 4)]
+        path = self.dir / "dims.raw"
+        fixtures.write_nutmeg(path, [("DC transfer characteristic", ["v(v-sweep)", "i(v1)"], data, False,
+                                      [3, 4])])
+        info = api.list_traces(path)
+        self.assertEqual((info["sweeps"], info["points"], info["sweep_values"]), (3, 12, [[], [], []]))
+        self.assertEqual(info["x_range"], [0.0, 1.0])
+        self.assertEqual(info["ranges"]["i_v1"], [0.0, 3.0])
+
+    def test_list_traces_of_a_run_in_progress(self):
+        data = np.c_[np.arange(6) * 1e-9, np.arange(6.0)]
+        path = self.dir / "live.raw"
+        fixtures.write_nutmeg(path, [("Transient Analysis", ["time", "v(a)"], data, False)], unknown_points=True)
+        raw = path.read_bytes()
+        path.write_bytes(raw[:len(raw) - 5])                     # the last point is half written
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            info = api.list_traces(path)
+        self.assertTrue(info["truncated"])
+        self.assertEqual(info["points"], 5)
+        self.assertEqual(info["ranges"]["v_a"], [0.0, 4.0])
+        self.assertTrue(any("still running" in str(w.message) for w in caught))
 
     def test_hspice_files_report_no_plots(self):
         info = api.list_traces(HERE / "test_9601.tr0")
@@ -859,10 +902,14 @@ class TestApi(unittest.TestCase):
         self.assertEqual(s["plots"], PLOT_NAMES)
         self.assertEqual(s["analysis"], "sw")
         self.assertEqual(s["x"], "v_v-sweep")
+        self.assertEqual(s["x_range"], [0.0, 1.0])
+        self.assertEqual(s["points"], 5)
         self.assertEqual(s["sweeps"], 1)
-        self.assertEqual(s["traces"]["v_out"][0]["count"], 5)
-        self.assertAlmostEqual(s["traces"]["v_out"][0]["last"], 1.0)
-        self.assertEqual(s["traces"]["v_out"][0]["x"], [0.0, 0.25, 0.5, 0.75, 1.0])
+        self.assertEqual(s["traces"], ["v_out"])
+        self.assertEqual(s["ranges"], {"v_out": [0.0, 1.0]})
+        self.assertEqual(s["stats"]["v_out"][0]["count"], 5)
+        self.assertAlmostEqual(s["stats"]["v_out"][0]["last"], 1.0)
+        self.assertEqual(s["stats"]["v_out"][0]["x"], [0.0, 0.25, 0.5, 0.75, 1.0])
         json.dumps(s)
 
     def test_csv_round_trip(self):
@@ -936,7 +983,7 @@ class TestFormatText(unittest.TestCase):
     def test_dc_plot(self):
         t = self.text(BIN, ["v(out)"], plot=2)
         lines = t.splitlines()
-        self.assertEqual(lines[0], "dc sweep | x: v_v-sweep | 5 points | plot 2: DC transfer characteristic "
+        self.assertEqual(lines[0], "dc sweep | x: v_v-sweep in [0, 1] | 5 points | plot 2: DC transfer characteristic "
                                    "(file has 3 plots)")
         self.assertNotIn("shown", lines[0])
         self.assertEqual(lines[2].split(), ["trace", "min", "max"])
@@ -949,14 +996,14 @@ class TestFormatText(unittest.TestCase):
     def test_points_keeps_first_and_last(self):
         t = self.text(ASCII, ["v_out"], points=3)
         lines = t.splitlines()
-        self.assertTrue(lines[0].startswith("transient | x: time | 80 points (3 shown)"))
+        self.assertTrue(lines[0].startswith("transient | x: time in [0, 2e-08] | 80 points (3 shown)"))
         rows = [l.split() for l in lines[-3:]]
         self.assertEqual([r[0] for r in rows], ["0", "9.2e-09", "2e-08"])   # x[0], x[40], x[79]
 
     def test_ac_plot(self):
         t = self.text(BIN, ["v(out)"], plot=1, points=6)
         lines = t.splitlines()
-        self.assertTrue(lines[0].startswith("ac | x: frequency | 46 points (6 shown)"))
+        self.assertTrue(lines[0].startswith("ac | x: frequency in [1, 1e+09] | 46 points (6 shown)"))
         self.assertEqual(lines[1], self.m.AC_LEGEND["magphase"])
         self.assertEqual(lines[7].split(), ["frequency", "v_out_Mag", "v_out_Phase"])
         self.assertEqual(lines[8].split()[0], "1")
@@ -965,7 +1012,7 @@ class TestFormatText(unittest.TestCase):
     def test_one_plot_file_names_no_plot(self):
         t = self.text(HERE / "test_9601.tr0", ["v_vo"], points=2)
         self.assertNotIn("plot", t.splitlines()[0])
-        self.assertTrue(t.startswith("transient | x: TIME | "))
+        self.assertTrue(t.startswith("transient | x: TIME in [0, 0.01] | "))
 
     def test_sweeps_with_a_parameter(self):
         sweeps = []
@@ -978,7 +1025,7 @@ class TestFormatText(unittest.TestCase):
         fixtures.write_binary(path, "2001", ["TIME", "v(a", "r1"], [1, 1], sweeps)
         t = self.text(path, points=3)
         lines = t.splitlines()
-        self.assertEqual(lines[0], "transient | x: TIME | 478 points in 3 sweeps (9 shown)")
+        self.assertEqual(lines[0], "transient | x: TIME in [0, 1e-06] | 478 points in 3 sweeps (9 shown)")
         self.assertEqual(lines[3].split()[0], "v_a[0]")
         self.assertEqual(lines[5].split()[0], "v_a[2]")
         self.assertEqual([l for l in lines if l.startswith("--")],
@@ -986,9 +1033,9 @@ class TestFormatText(unittest.TestCase):
         self.assertEqual(lines[-1].split()[0], "1e-06")
         # one sweep kept: plain table, no sweep labels
         one = self.text(path, points=3, sweeps=[2])
-        self.assertTrue(one.startswith("transient | x: TIME | 231 points (3 shown)"))
+        self.assertTrue(one.startswith("transient | x: TIME in [0, 1e-06] | 231 points (3 shown)"))
         self.assertNotIn("--", one)
-        self.assertNotIn("[", one)
+        self.assertNotIn("v_a[", one)                             # no per-sweep tags
 
     def test_flat_nested_sweep_is_split_on_x_restarts(self):
         x = np.tile(np.linspace(0, 0.8, 5), 3)
@@ -998,7 +1045,7 @@ class TestFormatText(unittest.TestCase):
                                       np.c_[x, y], False)])
         t = self.text(path, points=3)
         lines = t.splitlines()
-        self.assertEqual(lines[0], "dc sweep | x: v_v-sweep | 15 points (9 shown)")
+        self.assertEqual(lines[0], "dc sweep | x: v_v-sweep in [0, 0.8] | 15 points (9 shown)")
         self.assertEqual(lines[3].split(), ["i_v1", "0", "2.4"])
         heads = [i for i, l in enumerate(lines) if l.startswith("--")]
         self.assertEqual([lines[i] for i in heads],
@@ -1039,12 +1086,12 @@ class TestFormatText(unittest.TestCase):
             t = self.text(path)
         lines = t.splitlines()
         self.assertEqual(lines[0], self.m.TRUNCATED_LINE)
-        self.assertEqual(lines[1], "transient | x: time | 8 points")
+        self.assertEqual(lines[1], "transient | x: time in [0, 14] | 8 points")
 
     def test_empty_window(self):
         t = self.text(ASCII, ["v_out"], xrange=(5, 6))
         self.assertEqual(t, "transient | x: time | 0 points | plot 0: Transient Analysis (file has 3 plots)\n"
-                            "no points in the selected x window")
+                            "no points in xrange [5, 6]; the whole plot has 80 points with time in [0, 2e-08]")
 
     def test_row_cap(self):
         t = self.text(HERE / "test_9601.tr0", ["v_vo"], points=10 ** 6)
@@ -1078,6 +1125,20 @@ class TestFormatText(unittest.TestCase):
         t = self.text(HERE / "test_9601.tr0", ["v_vo"], sweeps=[])
         self.assertEqual(t.splitlines()[-1], "no sweeps in the selection")
 
+    def test_empty_sweep_is_not_blamed_on_a_window(self):
+        d = np.c_[np.arange(3.0), np.arange(3.0)]
+        path = self.dir / "gap.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(a", "p"], [1, 1], [([1.0], d), ([2.0], np.empty((0, 2)))])
+        t = self.text(path, sweeps=[1])
+        self.assertEqual(t.splitlines()[-1], "no points in the selected sweeps")
+
+    def test_window_line_gives_the_whole_plot(self):
+        t = self.text(BIN, ["v(out)"], xrange=(5e-9, 6e-9), points=2)
+        self.assertEqual(t.splitlines()[1], "window: xrange [5e-09, 6e-09]; "
+                                            "the whole plot has 80 points with time in [0, 2e-08]")
+        ts = api.extract(BIN, ["v(out)"], xrange=(5e-9, 6e-9))
+        self.assertEqual((ts.plot_points, ts.plot_x_range), (80, (0.0, 2e-08)))
+
     def test_many_runs_of_one_sweep_are_capped(self):
         x = np.tile(np.linspace(0, 1, 10), 30)                    # 30 runs: x restarts 29 times
         path = self.dir / "runs.raw"
@@ -1090,7 +1151,7 @@ class TestFormatText(unittest.TestCase):
     def test_only_x(self):
         t = self.text(ASCII, [], points=2)
         lines = t.splitlines()
-        self.assertTrue(lines[0].startswith("transient | x: time | 80 points (2 shown) | plot 0"))
+        self.assertTrue(lines[0].startswith("transient | x: time in [0, 2e-08] | 80 points (2 shown) | plot 0"))
         self.assertEqual(lines[2].split(), ["time"])
         self.assertEqual(len(lines), 5)
 
@@ -1122,7 +1183,7 @@ class TestMcp(unittest.TestCase):
     def test_extract_tool_defaults_to_text(self):
         out = self.m.extract(str(BIN), ["v(out)"], plot=2)
         self.assertIsInstance(out, str)
-        self.assertTrue(out.startswith("dc sweep | x: v_v-sweep | 5 points"))
+        self.assertTrue(out.startswith("dc sweep | x: v_v-sweep in [0, 1] | 5 points"))
         self.assertIn("(6 shown)", self.m.extract(str(BIN), ["v(out)"], plot=1, downsample=6))
         tools = {t.name: t for t in asyncio.run(self.m.server.list_tools())}
         schema = getattr(tools["extract"], "inputSchema", None) or tools["extract"].input_schema
@@ -1135,9 +1196,10 @@ class TestMcp(unittest.TestCase):
         out = self.m.extract(str(BIN), ["v(out)"], output="summary", downsample=10, plot=1)
         self.assertEqual(out["analysis"], "ac")
         self.assertEqual(out["plot"], 1)
-        self.assertEqual(sorted(out["traces"]), ["v_out_Mag", "v_out_Phase"])
-        self.assertEqual(out["traces"]["v_out_Mag"][0]["count"], 46)
-        self.assertEqual(len(out["traces"]["v_out_Mag"][0]["x"]), 10)
+        self.assertEqual(out["traces"], ["v_out_Mag", "v_out_Phase"])
+        self.assertEqual(sorted(out["stats"]), ["v_out_Mag", "v_out_Phase"])
+        self.assertEqual(out["stats"]["v_out_Mag"][0]["count"], 46)
+        self.assertEqual(len(out["stats"]["v_out_Mag"][0]["x"]), 10)
         json.dumps(out)
 
     def test_extract_tool_writes_a_csv_of_one_plot(self):

@@ -1,6 +1,7 @@
 """Streaming, column-selecting reader for HSPICE binary and ASCII result files."""
 from __future__ import annotations
 
+import difflib
 import fnmatch
 import math
 import operator
@@ -389,6 +390,11 @@ def _reject_plot(path: str, plot: int) -> None:
         raise ValueError(f"{path}: plot={plot} applies to Nutmeg rawfiles only; an HSPICE file holds one plot")
 
 
+def _read_hspice_header(f, path: str, ac_format: str) -> Header:
+    read = _read_binary_header if _is_binary(path) else _read_ascii_header
+    return read(f, path, ac_format)
+
+
 def read_header(path, plot: int = 0, ac_format: str = "magphase") -> Header:
     """Parse only the header. Never touches data.
 
@@ -403,9 +409,8 @@ def read_header(path, plot: int = 0, ac_format: str = "magphase") -> Header:
     if nutmeg.is_nutmeg(path):
         return nutmeg.read_nutmeg_header(path, plot, ac_format)
     _reject_plot(path, plot)
-    read = _read_binary_header if _is_binary(path) else _read_ascii_header
     with open(path, "rb") as f:
-        return read(f, path, ac_format)
+        return _read_hspice_header(f, path, ac_format)
 
 
 @dataclass
@@ -416,6 +421,89 @@ class TraceSet:
     sweep_indices: List[int]            # original sweep index of each kept sweep
     data: dict                          # name -> list of arrays, one per kept sweep
     truncated: bool                     # file ended without a final sentinel
+    plot_points: int = 0                # points in the whole plot, before sweeps and xrange
+    plot_x_range: Tuple = (math.nan, math.nan)      # (min, max) of x over those points, NaN skipped
+    xrange: Optional[Tuple[float, float]] = None    # the x window applied, if any
+
+
+@dataclass
+class Scan:
+    """What one pass over a plot's data shows, keeping none of the data (see scan)."""
+    header: Header
+    sweep_values: List[List[float]]     # per sweep: nsweepparam values (Nutmeg: [])
+    sweep_points: List[int]             # points per sweep
+    x_range: Tuple                      # (min, max) of x, NaN skipped; NaN when there are no points
+    ranges: Dict[str, Tuple]            # per selected trace (x excluded): (min, max), NaN skipped
+    truncated: bool                     # the file ends before its last point
+
+    @property
+    def points(self) -> int:
+        return sum(self.sweep_points)
+
+
+def nan_min_max(values: np.ndarray, axis=None):
+    """(min, max) along axis with NaN skipped (NaN only where nothing else is), in the
+    values' dtype. Plain min/max first, as they are about twice as fast as fmin/fmax and
+    a NaN is rare; then fmin/fmax only if a NaN came through."""
+    lo, hi = values.min(axis=axis), values.max(axis=axis)
+    if np.isnan(lo).any() or np.isnan(hi).any():
+        lo, hi = np.fmin.reduce(values, axis=axis), np.fmax.reduce(values, axis=axis)
+    return lo, hi
+
+
+class _XSpan:
+    """Point count and (min, max) of x, NaN skipped, over every point a reader meets before
+    any sweep or x-window selection: what the whole plot spans. Bounds keep the data's dtype."""
+
+    def __init__(self, dtype):
+        self.points = 0
+        self.lo = self.hi = np.dtype(dtype).type(np.nan)
+
+    def add(self, x: np.ndarray) -> None:
+        if x.size:
+            self.points += int(x.size)
+            lo, hi = nan_min_max(x)
+            self.lo, self.hi = np.fmin(self.lo, lo), np.fmax(self.hi, hi)
+
+    @property
+    def range(self) -> Tuple:
+        return self.lo, self.hi
+
+
+def _lookup_ignoring_case(req: str, names: Sequence[str], raw_names: Sequence[str]) -> List[int]:
+    """Columns that request req selects when case is ignored: an exact name, a raw name
+    with or without its closing paren, then a glob on names."""
+    req, names, raw_names = req.lower(), [n.lower() for n in names], [r.lower() for r in raw_names]
+    hits = [i for i, n in enumerate(names) if n == req] or [i for i, r in enumerate(raw_names) if r == req]
+    if not hits and req.endswith(")"):
+        hits = [i for i, r in enumerate(raw_names) if r == req[:-1]]
+    if not hits:
+        hits = [i for i, n in enumerate(names) if fnmatch.fnmatchcase(n, req)]
+    return hits
+
+
+def _unknown_trace(req: str, header: Header) -> str:
+    """The error for a trace request that matches nothing: what was probably meant, then
+    the traces there are."""
+    names = header.names
+    lower = {n.lower(): n for n in reversed(names)}
+    key = parse_var_name(req.replace(")", "")).lower()
+    message = f"unknown trace {req!r}."
+    first, second = (f"{key}_{s}".lower() for s in AC_FORMATS[header.ac_format])
+    if first in lower and second in lower:
+        raw = header.col_raw_names[names.index(lower[first])]
+        raw += ")" if raw.count("(") > raw.count(")") else ""
+        message = (f"unknown trace {req!r}: complex traces are split in two, {lower[first]} and "
+                   f"{lower[second]}; {raw!r} or {key + '*'!r} selects both.")
+    else:
+        close = set(difflib.get_close_matches(key, list(lower), n=5, cutoff=0.6))
+        if close:
+            near = ", ".join(n for n in names if n.lower() in close)       # in file order
+            message = f"unknown trace {req!r}; did you mean {near}?"
+    shown = ", ".join(names[:20])
+    if len(names) > 20:
+        shown += f", ... and {len(names) - 20} more"
+    return f"{message} Available traces: {shown}"
 
 
 def resolve_columns(header: Header, names) -> List[int]:
@@ -424,7 +512,9 @@ def resolve_columns(header: Header, names) -> List[int]:
     Each entry of names matches, in order of preference: an exact sanitized name
     (v_vo), a raw name with optional closing paren (v(vo) or v(vo, which for AC
     selects both _Mag and _Phase; HSPICE raw names have no closing paren, Nutmeg's
-    do), or an fnmatch glob on sanitized names (v_*).
+    do), or an fnmatch glob on sanitized names (v_*). An entry that matches nothing
+    is tried again ignoring case, as SPICE itself does (V(OUT) finds v(out)); one that
+    still matches nothing raises a ValueError that suggests near names.
     """
     if names is None:
         return list(range(header.ncols))
@@ -444,10 +534,9 @@ def resolve_columns(header: Header, names) -> List[int]:
         if not hits:
             hits = [i for i, n in enumerate(header.names) if fnmatch.fnmatchcase(n, req)]
         if not hits:
-            shown = ", ".join(header.names[:20])
-            if len(header.names) > 20:
-                shown += f", ... and {len(header.names) - 20} more"
-            raise ValueError(f"unknown trace {req!r}; available traces: {shown}")
+            hits = _lookup_ignoring_case(req, header.names, header.col_raw_names)
+        if not hits:
+            raise ValueError(_unknown_trace(req, header))
         chosen.update(hits)
     return sorted(chosen)
 
@@ -511,6 +600,7 @@ class _Collector:
         self.sweep_indices: List[int] = []
         self.spans: List[Tuple[int, int]] = []  # (start, stop) in the buffers, one per kept sweep
         self.data = {c: [] for c in self.cols}
+        self.span = _XSpan(header.dtype)        # every point of every sweep, before any selection
 
     def _keep(self) -> bool:
         return self.sweeps is None or self.sweep_idx in self.sweeps
@@ -551,6 +641,7 @@ class _Collector:
         self.carry = seg[npts * ncols:].copy()      # copy: do not pin the source block
 
     def _write_rows(self, rows: np.ndarray) -> None:
+        self.span.add(rows[:, 0])
         if not self._keep():
             return
         if self.xrange is not None:
@@ -605,6 +696,37 @@ class _Collector:
             buf = self.buf.pop(c) if compact else self.buf[c]
             self.data[c] = [buf[a:b].copy() if compact else buf[a:b] for a, b in self.spans]
         return truncated
+
+
+def _ac_values(header: Header, rows: np.ndarray) -> np.ndarray:
+    """rows of an HSPICE AC file with each variable's stored (real, imaginary) columns
+    turned into its two ac_format columns, as _convert_ac does; other rows unchanged."""
+    if header.analysis != "ac" or header.ac_format == "realimag" or rows.shape[1] < 3:
+        return rows
+    re = np.ascontiguousarray(rows[:, 1::2])        # contiguous, as _convert_ac's columns are
+    im = np.ascontiguousarray(rows[:, 2::2])
+    out = np.empty_like(rows)
+    out[:, 0] = rows[:, 0]
+    out[:, 1::2] = ac_part(re, im, header.ac_format, second=False)
+    out[:, 2::2] = ac_part(re, im, header.ac_format, second=True)
+    return out
+
+
+class _RangeCollector(_Collector):
+    """Walks the value stream as _Collector does but stores no rows: it counts each sweep's
+    points (as spans) and keeps the (min, max) of every column, NaN skipped. AC columns are
+    ranged in the header's ac_format, as read_traces returns them."""
+
+    def __init__(self, header: Header):
+        super().__init__(header, [], None, 1)
+        self.lo = np.full(header.ncols, np.nan, header.dtype)
+        self.hi = np.full(header.ncols, np.nan, header.dtype)
+
+    def _write_rows(self, rows: np.ndarray) -> None:
+        self.span.add(rows[:, 0])
+        lo, hi = nan_min_max(_ac_values(self.h, rows), axis=0)
+        self.lo, self.hi = np.fmin(self.lo, lo), np.fmax(self.hi, hi)
+        self.fill += rows.shape[0]              # nothing is stored; the spans count the points
 
 
 def _iter_binary_blocks(f, header: Header, index: int = 1) -> Iterator[np.ndarray]:
@@ -703,37 +825,15 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
     if nutmeg.is_nutmeg(path):
         return nutmeg.read_nutmeg_traces(path, names, sweeps, plot, xrange, ac_format)
     _reject_plot(path, plot)
-    if _is_binary(path):
-        with open(path, "rb") as f:
-            header = _read_binary_header(f, path, ac_format)
-            cols = resolve_columns(header, names)
-            stored = _stored_columns(header, cols)
-            data_start = f.tell()
-            file_size = os.fstat(f.fileno()).st_size
-            block_payload = _peek_block_payload(f)
-            capacity = _binary_capacity(file_size, data_start, block_payload,
-                                        header.ncols, header.dtype.itemsize)
-            if xrange is not None:
-                capacity = min(capacity, WINDOW_CAPACITY)
-            collector = _Collector(header, stored, sweeps, capacity, xrange)
-            index = 1
-            frame = block_payload + _FRAME_OVERHEAD
-            if block_payload > 0 and block_payload % header.dtype.itemsize == 0 and frame <= _MAX_CHUNK_BYTES:
-                index = _feed_bulk_frames(f, header, collector, block_payload, index)
-            for block in _iter_binary_blocks(f, header, index):
-                collector.feed(block)
-    else:
-        with open(path, "rb") as f:
-            header = _read_ascii_header(f, path, ac_format)
-            cols = resolve_columns(header, names)
-            stored = _stored_columns(header, cols)
-            file_size = os.fstat(f.fileno()).st_size
-            capacity = _ascii_capacity(file_size, header.ncols)
-            if xrange is not None:
-                capacity = min(capacity, WINDOW_CAPACITY)
-            collector = _Collector(header, stored, sweeps, capacity, xrange)
-            for values in _iter_ascii_values(f, path):
-                collector.feed(values)
+    with open(path, "rb") as f:
+        header = _read_hspice_header(f, path, ac_format)
+        cols = resolve_columns(header, names)
+        stored = _stored_columns(header, cols)
+        capacity = _data_capacity(f, header)
+        if xrange is not None:
+            capacity = min(capacity, WINDOW_CAPACITY)
+        collector = _Collector(header, stored, sweeps, capacity, xrange)
+        _feed_data(f, path, header, collector)
     truncated = collector.finish()
     check_sweeps(path, collector.sweeps, collector.sweep_idx, truncated)
     data = _convert_ac(header, cols, collector.data)
@@ -743,5 +843,65 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
         sweep_values=collector.sweep_values,
         sweep_indices=collector.sweep_indices,
         data={header.names[c]: data[c] for c in cols},
+        truncated=truncated,
+        plot_points=collector.span.points,
+        plot_x_range=collector.span.range,
+        xrange=xrange,
+    )
+
+
+def _data_capacity(f, header: Header) -> int:
+    """Estimated points in the data section at f's position (f is left there)."""
+    file_size = os.fstat(f.fileno()).st_size
+    if not header.is_binary:
+        return _ascii_capacity(file_size, header.ncols)
+    return _binary_capacity(file_size, f.tell(), _peek_block_payload(f), header.ncols, header.dtype.itemsize)
+
+
+def _feed_data(f, path: str, header: Header, collector: _Collector) -> None:
+    """Stream the data section at f's position into the collector: uniform binary blocks
+    in bulk slabs, the rest block by block; ASCII in chunks."""
+    if not header.is_binary:
+        for values in _iter_ascii_values(f, path):
+            collector.feed(values)
+        return
+    index = 1
+    block_payload = _peek_block_payload(f)
+    frame = block_payload + _FRAME_OVERHEAD
+    if block_payload > 0 and block_payload % header.dtype.itemsize == 0 and frame <= _MAX_CHUNK_BYTES:
+        index = _feed_bulk_frames(f, header, collector, block_payload, index)
+    for block in _iter_binary_blocks(f, header, index):
+        collector.feed(block)
+
+
+def scan(path, plot: int = 0, ac_format: str = "magphase", names=None) -> Scan:
+    """Read a plot's whole data section once and keep none of it: the sweeps with their
+    parameter values and point counts, the range of x and the (min, max) of every trace.
+
+    It reads as much as read_traces with every trace, but holds only one read buffer,
+    whatever the file size. A file the simulator is still writing is scanned up to its
+    last complete point, with `truncated` set. AC traces are ranged in ac_format.
+    names limits `ranges` to the traces it selects (see resolve_columns); an unknown
+    name fails before any data is read.
+    """
+    from . import nutmeg          # imported here: nutmeg.py builds on this module
+
+    path = os.fspath(path)
+    check_ac_format(ac_format)
+    if nutmeg.is_nutmeg(path):
+        return nutmeg.scan_nutmeg(path, plot, ac_format, names)
+    _reject_plot(path, plot)
+    with open(path, "rb") as f:
+        header = _read_hspice_header(f, path, ac_format)
+        cols = resolve_columns(header, names)
+        collector = _RangeCollector(header)
+        _feed_data(f, path, header, collector)
+    truncated = collector.finish()
+    return Scan(
+        header=header,
+        sweep_values=collector.sweep_values,
+        sweep_points=[b - a for a, b in collector.spans],
+        x_range=collector.span.range,
+        ranges={header.names[c]: (collector.lo[c], collector.hi[c]) for c in cols if c},
         truncated=truncated,
     )
