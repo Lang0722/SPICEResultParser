@@ -405,7 +405,9 @@ def _scan_ascii(f, path: str, p: _Plot, limit: Optional[int], collect=None) -> i
     limit is the declared point count, or None to stream to the end of the file. When limit
     is reached f is left just after the last consumed token, so the next plot's header
     follows. A file ending without a newline has its last line dropped as a half-written
-    value, unless the count is known and those tokens complete the declared last point.
+    value, unless the count is known, those tokens complete the declared last point, and
+    the last of them is written like the value before it: a writer such as ngspice writes
+    every value alike (%.15e), so a value cut short (4.93, 4.930230187317426e-0) shows.
     """
     stride = p.nvars * (2 if p.is_complex else 1)   # float64 values per point
     per_point = 1 + stride                          # the point index leads every point
@@ -413,6 +415,7 @@ def _scan_ascii(f, path: str, p: _Plot, limit: Optional[int], collect=None) -> i
     prefix = b""
     carry = np.empty(0, np.float64)                 # values of a partial point (collect)
     held = 0                                        # tokens of a partial point (count only)
+    last_value = None                               # the last token read: a value, as lines end in one
     while limit is None or done < limit:
         data = f.read(ASCII_CHUNK_BYTES)
         chunk = prefix + data
@@ -428,10 +431,15 @@ def _scan_ascii(f, path: str, p: _Plot, limit: Optional[int], collect=None) -> i
                 continue
             tokens = chunk[:end + 1].split()
             prefix = chunk[end + 1:]
+            last_value = tokens[-1] if tokens else last_value
         else:
             tokens = chunk.split()                  # end of file: a line with no newline
             if not (limit is not None and done == limit - 1 and pending + len(tokens) == per_point):
                 break
+            # the token before the last is a value unless it is the point index (one value per point)
+            reference = tokens[-2] if len(tokens) >= 2 and per_point >= 3 else last_value
+            if reference is not None and _written_form(tokens[-1]) != _written_form(reference):
+                break                               # the last value is cut short
         if limit is not None:
             needed = (limit - done) * per_point - pending
             if needed < len(tokens):
@@ -456,6 +464,13 @@ def _scan_ascii(f, path: str, p: _Plot, limit: Optional[int], collect=None) -> i
         if not data:
             break
     return done
+
+
+def _written_form(token: bytes) -> Tuple[int, bool, int]:
+    """How a number token is written: digits after the point, whether it has an exponent,
+    and how many exponent digits."""
+    mantissa, exponent_mark, exponent = token.lstrip(b"+-").lower().partition(b"e")
+    return len(mantissa.partition(b".")[2]), bool(exponent_mark), len(exponent.lstrip(b"+-"))
 
 
 def _to_float(tokens, path: str, p: _Plot) -> np.ndarray:

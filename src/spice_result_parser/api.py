@@ -197,7 +197,7 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None, tolerance: Optiona
         if downsample is not None:
             cap = min(cap, downsample)
         tolerance = reduce.DEFAULT_TOLERANCE if tolerance is None else tolerance
-        floor = 4 * float(np.finfo(h.dtype).eps)
+        eps = float(np.finfo(h.dtype).eps)
         log = reduce.log_frequency(h)
         x_criteria = [reduce.x_criterion(a, log) for a in x]
     stats = {}
@@ -215,15 +215,14 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None, tolerance: Optiona
                 entry.update(min=_json_float(lo), max=_json_float(hi), mean=_json_float(_nan_mean(a)),
                              first=_json_float(a[0]), last=_json_float(a[-1]))
                 if with_points:
-                    idx, error = reduce.breakpoints(x_criteria[i], [criteria[i]], [span], tolerance, cap, floor)
-                    if error <= max(tolerance, floor):
+                    idx, error = reduce.breakpoints(x_criteria[i], [criteria[i]], [span], tolerance, cap, eps)
+                    if error <= tolerance:
                         entry["x"] = _json_floats(x[i][idx])
                         entry["y"] = _json_floats(a[idx])
                         entry["max_error"] = float(f"{error:.3g}")
                     else:                           # too dense to follow: a peak-detect envelope instead
-                        start, stop, mins, maxs = reduce.peak_detect(x[i], [a], max(2, cap // 2), log)
-                        entry["envelope"] = {"from": [float(f"{v:.6g}") for v in start.tolist()],
-                                             "to": [float(f"{v:.6g}") for v in stop.tolist()],
+                        start, stop, mins, maxs = reduce.peak_detect(x[i], [a], max(1, cap // 2), log)
+                        entry["envelope"] = {"from": _json_floats(start), "to": _json_floats(stop),
                                              "min": _json_floats(mins[0]), "max": _json_floats(maxs[0])}
             per_sweep.append(entry)
         stats[name] = per_sweep
@@ -239,15 +238,18 @@ def default_dest(path, output: str) -> str:
 
 def resolve_dest(source, output: str, dest=None) -> str:
     """The path a csv/npz/png of `source` goes to; raises when it cannot be written safely:
-    a directory, a missing parent directory, or the input file itself."""
+    an empty path, a directory (or a path that ends like one), a parent that is not an
+    existing directory, or the input file itself."""
     if not os.path.exists(source):                  # name the missing input, not its default dest
         raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), os.fspath(source))
     dest = os.fspath(dest) if dest is not None else default_dest(source, output)
-    if os.path.isdir(dest):
+    if not dest:
+        raise ValueError("dest is empty; give a file path")
+    if os.path.isdir(dest) or dest.endswith(("/", os.sep)) or os.path.basename(dest) in (".", ".."):
         raise ValueError(f"dest {dest!r} is a directory; give a file path")
-    parent = os.path.dirname(os.path.abspath(dest))
+    parent = os.path.dirname(dest) or os.curdir     # as written: abspath would drop a trailing "/."
     if not os.path.isdir(parent):
-        raise ValueError(f"dest {dest!r}: directory {parent!r} does not exist")
+        raise ValueError(f"dest {dest!r}: directory {os.path.abspath(parent)!r} does not exist")
     if os.path.exists(dest) and os.path.samefile(dest, source):
         raise ValueError(f"dest {dest!r} is the input file; writing it would destroy the simulation result")
     return dest
@@ -412,7 +414,7 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
     ts = read_traces(path, names, sweeps, plot, xrange, ac_format)
     if output == "summary":
         return summarize(ts, downsample, tolerance)
-    if downsample is not None:
+    if downsample is not None and output != "png":  # png draws every point's envelope instead
         _decimate(ts, downsample)
     if output == "arrays":
         return ts

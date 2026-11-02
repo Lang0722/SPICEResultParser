@@ -348,6 +348,28 @@ class TestTruncation(unittest.TestCase):
                               binary=binary)
         return path
 
+    def test_a_last_value_cut_short_is_not_data(self):
+        # a known point count, the file cut inside its very last value: never return the stub
+        data = np.array([[0.0, 0.0], [1e-9, 0.25], [2e-9, 0.4930230187317426]])
+        path = self.dir / "cut.raw"
+        fixtures.write_nutmeg(path, [("Transient Analysis", ["time", "v(a)"], data, False)], binary=False)
+        raw = path.read_bytes()
+        end = raw.rindex(b"4.930230187317426e-01")
+        for stub in (b"4", b"4.93", b"4.930230187317426e-0", b"4.930230187317426e"):
+            path.write_bytes(raw[:end] + stub)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                ts = read_traces(path)
+                info = api.list_traces(path)
+            self.assertTrue(ts.truncated, stub)
+            np.testing.assert_array_equal(ts.data["v_a"][0], [0.0, 0.25])
+            self.assertEqual(info["ranges"]["v_a"], [0.0, 0.25])
+        # a complete file whose writer left out the last newline keeps its last point
+        path.write_bytes(raw.rstrip(b"\n"))
+        ts = read_traces(path)
+        self.assertFalse(ts.truncated)
+        np.testing.assert_array_equal(ts.data["v_a"][0], data[:, 1])
+
     def test_truncated_binary(self):
         path = self.write(True)
         raw = path.read_bytes()

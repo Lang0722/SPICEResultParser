@@ -110,3 +110,24 @@ values and audio peak files all do for the same reason:
   min, max}` with half as many slices as it had points, instead of `x`, `y`, `max_error`.
 
 The values stay real samples, so the fallback is still extraction, not post-processing.
+
+## Revisions after a bug hunt
+
+- Segment lines: the repeated-x rule ("a sample between the ends of a vertical jump is no
+  error") applied whenever the two kept samples shared an x, even with other x values
+  between them. In a nested sweep written flat, that hid whole inner curves behind two
+  samples at the same x while the bound was reported met. A segment's line now runs
+  along x only where x is monotonic between its ends, is a vertical jump only where x
+  stays put, and runs along the sample order otherwise.
+- Rounding: `floor` (4 epsilons of the range) is replaced by `eps`: a deviation within 4
+  epsilons of the values' own size is no error. With a DC offset, rounding scales with
+  the value, not the range, so tolerance 0 kept rounding noise as corners.
+- Text precision: 6 significant digits printed distinct x values alike (samples 25 ns
+  apart at 100 us in the repo's own sample file) and a small ripple on a large level as a
+  constant. x columns now get the digits that tell their values apart, y columns the
+  digits that show 3 digits of the trace's range.
+- Restarts: `_runs` took any decrease of x for a restart, so a sweep run downwards became
+  one table per point. A restart is now a step against the direction most steps take.
+- Envelope budget and bounds: summary envelopes use `cap // 2` slices (at least 1), and
+  their bounds are exact floats (6 digits collapsed slices in narrow windows).
+- png ignores `downsample`, as its description said: thinning before drawing lost spikes.

@@ -116,15 +116,20 @@ sweep count.
 `downsample=N` keeps `N` evenly spaced points per sweep. `N` is an integer, at least 2.
 `downsample` always keeps the first and last points. For `summary`, `downsample` is
 the most points that it lists per trace and sweep. The reduction chooses them (see
-[Shape-preserving reduction](#shape-preserving-reduction)).
+[Shape-preserving reduction](#shape-preserving-reduction)). `png` does not use
+`downsample`: it always draws the envelope of every point.
 
-If you read the file while the simulator still writes it, the reader returns the partial
-last sweep. In that case, `ts.truncated` is `True`.
+If you read the file while the simulator still writes it, the reader returns the
+complete points. The file can end at any byte: inside a block, a block head, a value or
+the parameters of a sweep. `ts.truncated` is then `True`, and a `RuntimeWarning` says
+where the file ends. `ts.truncated` is also `True` when the file holds fewer sweeps than
+its header announces. A file that ends inside its header raises a `ValueError` that says
+the header is incomplete.
 
 `dest` names the csv/npz/png file. `extract` checks `dest` before it reads the input file. It
 raises `ValueError` in these cases:
 
-- `dest` is a directory.
+- `dest` is empty, is a directory, or ends like one (`/` or `/.`).
 - The parent directory of `dest` is missing.
 - `dest` is the input file itself.
 - You give `dest` with `output="arrays"` or `"summary"`.
@@ -166,7 +171,12 @@ vertical error bound:
 2. It keeps the lowest and highest sample of each trace, so a peak shows with its
    exact value and position.
 3. It draws straight lines between the kept samples. It finds the sample that is
-   farthest from its line, as a fraction of the range of its trace, and keeps it.
+   farthest from its line, as a fraction of the range of its trace, and keeps it. A
+   line runs along x where x is monotonic between its two samples. Where x stays put (a
+   vertical jump), a sample between the two ends of the jump is no error. Where x goes
+   back and forth (a nested sweep written flat), the line runs along the sample order.
+   Thus no inner curve can hide between two samples at the same x. A deviation within
+   the rounding of the values themselves is no error.
 4. It repeats step 3 until every sample is within `tolerance` of the lines.
 
 If the rows available cannot follow a signal within `tolerance`, the signal is too
@@ -309,7 +319,7 @@ plot until the end of the file. The results are:
 
 - The reader keeps whole points only and discards a half-written final value. If a file
   simply ends without a newline but holds all its declared points, the reader keeps all
-  of them.
+  of them, provided that the last value has the same written form as the value before it.
 - `ts.truncated` is `True`.
 - A `RuntimeWarning` names the number of complete points.
 
@@ -392,7 +402,13 @@ says so, and `names` gets the others. When an `xrange` keeps no point, a `note` 
 point count and the x range of the whole plot.
 
 The schema lists the valid `output` and `ac_format` values. `names` takes one string or
-a list.
+a list. The numeric parameters take numbers only: `true`, `false` and strings such as
+`"0.5"` are errors, as they are for Python callers.
+
+Over MCP, a `summary` describes at most 200 (trace, sweep) series. A larger request is
+an error that says how to narrow it with `names` or `sweeps`. `text` stays within its own
+budget at any size. `list_traces` lists the values of at most 100 sweeps, and a `note`
+says how many the file holds.
 
 If the server cannot find a file with a relative path, the error names the working
 directory of the server. The server can run in a different directory from the agent.
@@ -431,7 +447,15 @@ a nested `.dc` sweep flat, `text` splits it into one table per run of the inner 
 The point tables show at most 16 traces, and the min/max table at most 100. A line
 counts the traces that the text omits. Select fewer `names` to see them.
 
-`text` rounds values to 6 significant digits. NaN and infinity print as `nan`/`inf`.
+`text` prints values with 6 significant digits, or more where 6 would mislead:
+
+- x values get as many digits as it takes to tell them apart. For example, samples 25 ns
+  apart at t = 100 µs, or a 100 ns window at t = 1 ms.
+- A trace whose range is small next to its size gets enough digits to show 3 digits of
+  its range. For example, a 1 µV ripple on a 1.2 V supply prints as `1.20000012`, not
+  `1.2`.
+
+NaN and infinity print as `nan`/`inf`.
 
 `spice_result_parser.mcp_server.format_text(ts, points=None, tolerance=0.01)` renders any
 `TraceSet` as the same text. `points` is the most rows per table. The module imports without the `mcp` package. Only `srp-mcp` itself

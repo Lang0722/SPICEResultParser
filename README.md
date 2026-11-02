@@ -111,6 +111,7 @@ The `extract` parameters work as follows:
 - `yrange` sets the vertical limits of the plot.
 - `sweeps=[...]` selects sweeps. An index that the file does not hold is an error.
 - `downsample=N` keeps N evenly spaced points. For `summary`, it caps the listed points.
+  `png` does not use it: the plot always draws the envelope of every point.
 - `tolerance` (for `summary`) sets how closely the listed points follow each trace. See
   [Shape-preserving reduction](#shape-preserving-reduction).
 - `dest` names the csv, npz or png file. `extract` checks `dest` before it reads the
@@ -156,7 +157,7 @@ Over MCP, the `output` parameter of `extract` takes one of these values:
 
 | `output` | Result |
 |---|---|
-| `text` (default) | A readable report: the x range and point count, per-trace min/max, then a table with x once and one column per trace. The table shows the samples that the shape-preserving reduction keeps. The server rounds values to 6 significant digits. The report holds at most 500 rows, 20 tables and 16 trace columns. |
+| `text` (default) | A readable report: the x range and point count, per-trace min/max, then a table with x once and one column per trace. The table shows the samples that the shape-preserving reduction keeps. The server prints 6 significant digits, or more where 6 would print different values alike. The report holds at most 500 rows, 20 tables and 16 trace columns. |
 | `summary` | JSON with exact floats: the fields of `list_traces` for the selected data and per-trace and per-sweep statistics. With `tolerance` or `downsample`, it also lists the points that the reduction keeps. |
 | `csv`, `npz`, `png` | The server writes the file. It returns the absolute path as `dest`, with the x range, point count and trace ranges of the written data. |
 

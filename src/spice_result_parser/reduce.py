@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import re
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -44,8 +45,10 @@ def log_frequency(header) -> bool:
 
 def in_db(header, name: str) -> bool:
     """Whether trace name is a linear AC magnitude, which the reduction compares in dB, as on
-    a Bode plot (else a roll-off to 1% of the peak would look flat)."""
-    return header.ac_format == "magphase" and log_frequency(header) and name.endswith("_Mag")
+    a Bode plot (else a roll-off to 1% of the peak would look flat). A '#<column>' suffix
+    (a sanitized name that repeats) does not change what the trace is."""
+    base = re.sub(r"#\d+$", "", name)
+    return header.ac_format == "magphase" and log_frequency(header) and base.endswith("_Mag")
 
 
 def x_criterion(x: np.ndarray, log: bool) -> np.ndarray:
@@ -113,7 +116,7 @@ def _extremes(channels) -> set:
 
 
 def breakpoints(x: np.ndarray, ys: Sequence[np.ndarray], spans: Sequence[float], tolerance: float,
-                max_points: Optional[int] = None, floor: float = 0.0) -> Tuple[np.ndarray, float]:
+                max_points: Optional[int] = None, eps: float = 0.0) -> Tuple[np.ndarray, float]:
     """The samples to keep of one sweep, and the error that keeping them leaves.
 
     x and ys are the criterion values (x_criterion, y_criterion) of traces that share x;
@@ -125,10 +128,17 @@ def breakpoints(x: np.ndarray, ys: Sequence[np.ndarray], spans: Sequence[float],
     max_points leaves room, each trace's lowest and highest sample, so a peak shows with
     its exact value and position.
 
+    The line between two kept samples runs along x where x is monotonic between them. Where
+    x stays put (a vertical jump: PWL corners, HSPICE breakpoints), a sample between the
+    jump's ends is no error. Where x goes back and forth between them (a nested sweep
+    written flat, x restarting), the line runs along the sample order instead, so no inner
+    curve can hide behind two kept samples at the same x.
+
     The segment with the largest relative error is split first, at its worst sample, so
     when max_points stops the split early the samples already kept are the ones that
-    mattered most. floor raises a tolerance below the data's rounding (tolerance 0 then
-    drops only the samples that lie on a straight line).
+    mattered most. eps is the data's machine epsilon: a deviation within the rounding of
+    the values themselves (4 eps of their size) is no error, so tolerance 0 drops exactly
+    the samples that lie on a straight line, whatever their offset.
 
     Returns (sorted indices, error reached as a fraction of the span). The error is at most
     the tolerance unless max_points stopped the split; it is inf when the boundaries alone
@@ -137,7 +147,7 @@ def breakpoints(x: np.ndarray, ys: Sequence[np.ndarray], spans: Sequence[float],
     n = len(x)
     if n <= 2:
         return np.arange(n, dtype=np.intp), 0.0
-    tol = max(tolerance, floor)
+    tol = tolerance
     x = np.asarray(x, dtype=np.float64)
     channels = [(np.asarray(y), float(s)) for y, s in zip(ys, spans) if s > 0]
     keep = {0, n - 1} | _boundaries([x] + [np.asarray(y) for y in ys])
@@ -149,20 +159,31 @@ def breakpoints(x: np.ndarray, ys: Sequence[np.ndarray], spans: Sequence[float],
     if max_points is None or len(with_extremes) <= max_points:
         keep = with_extremes
 
+    rounding = 4 * eps
+
     def worst(a: int, b: int) -> Tuple[float, int]:
         """Largest relative vertical error inside (a, b) over every trace, and where it is."""
         if b - a < 2 or not channels:
             return 0.0, -1
         seg = slice(a + 1, b)
         dx = x[b] - x[a]
-        slope = (x[seg] - x[a]) / dx if dx != 0 and math.isfinite(dx) else None
+        steps = np.diff(x[a:b + 1])
+        if dx != 0 and math.isfinite(dx) and bool(np.all(steps >= 0) if dx > 0 else np.all(steps <= 0)):
+            slope = (x[seg] - x[a]) / dx            # x monotonic: the line runs along x
+        elif not steps.any():
+            slope = None                            # x stays put: a vertical jump
+        else:                                       # x goes back and forth: along the sample order
+            slope = np.arange(1, b - a, dtype=np.float64) / (b - a)
         best, at = 0.0, -1
         for y, span in channels:
             ya, yb, inside = float(y[a]), float(y[b]), y[seg]
             with np.errstate(invalid="ignore", over="ignore"):
                 if slope is not None:
-                    err = np.abs(inside - (ya + (yb - ya) * slope))
-                else:                               # a repeated x: the line is a vertical jump
+                    line = ya + (yb - ya) * slope
+                    err = np.abs(inside - line)
+                    if rounding:
+                        err = err - rounding * np.maximum(np.abs(inside), np.abs(line))
+                else:
                     err = np.maximum(min(ya, yb) - inside, inside - max(ya, yb))
                 err = np.fmax(err / span, 0.0)      # NaN (a run of one non-finite kind) is no error
             k = int(np.argmax(err))

@@ -32,10 +32,26 @@ except ImportError:
         ToolError = ValueError
 
 try:
-    from pydantic import Field
+    from pydantic import BeforeValidator, Field
 except ImportError:                          # no mcp, so no schema to describe
     def Field(description=None):
         return description
+
+    def BeforeValidator(fn):
+        return fn
+
+
+def _numbers_only(value):
+    """Refuse true/false and strings where numbers are due. The schema's lax parsing would
+    turn them into 1, 0 or a parsed number before the tool's own checks, which refuse them
+    for Python callers too."""
+    for item in value if isinstance(value, (list, tuple)) else [value]:
+        if isinstance(item, (bool, str)):
+            raise ValueError(f"expected a number, not {item!r}")
+    return value
+
+
+Number = BeforeValidator(_numbers_only)       # Annotated metadata for every numeric parameter
 
 try:
     from mcp.types import ToolAnnotations
@@ -105,6 +121,8 @@ TEXT_ENVELOPE_SLICES = 100  # slices of an envelope table, when downsample does 
 TEXT_MAX_CONSTANTS = 20 # traces named on the "constant:" line
 MAX_RUNS = 32           # split a sweep on x restarts only up to this many runs
 MCP_MAX_RANGES = 100    # traces whose [min, max] one JSON result lists; names= narrows to others
+MCP_MAX_SWEEP_VALUES = 100  # sweeps whose parameter values list_traces lists
+MCP_MAX_SERIES = 200    # (trace, sweep) series one summary may describe: about 30k characters
 
 _ANALYSIS_WORDS = {"tr": "transient", "sw": "dc sweep", "ac": "ac", "op": "operating point",
                    "noise": "noise"}
@@ -117,14 +135,40 @@ AC_LEGEND = {   # per ac_format
 }
 
 
-def _num(v) -> str:
-    """6 significant digits; nan/inf spelled out; no negative zero."""
+def _num(v, digits: int = 6) -> str:
+    """digits significant digits (6 by default); nan/inf spelled out; no negative zero."""
     v = float(v)
     if math.isnan(v):
         return "nan"
     if math.isinf(v):
         return "inf" if v > 0 else "-inf"
-    return f"{v + 0.0:.6g}"
+    return f"{v + 0.0:.{digits}g}"
+
+
+MAX_DIGITS = 15     # significant digits a float64 always holds
+
+
+def _distinct_digits(values) -> int:
+    """Significant digits (6 or more) that print every distinct finite value differently:
+    x values close together far from zero (a 100 ns window at t = 1 ms, a narrow pulse)
+    would print alike with 6."""
+    v = np.asarray(values, dtype=np.float64)
+    distinct = np.unique(v[np.isfinite(v)])
+    for digits in range(6, MAX_DIGITS):
+        if len({f"{u:.{digits}g}" for u in distinct.tolist()}) == distinct.size:
+            return digits
+    return MAX_DIGITS
+
+
+def _range_digits(arrays) -> int:
+    """Significant digits (6 or more) that show 3 digits of the arrays' range: a microvolt
+    ripple on a 1.2 V supply would print as 1.2 throughout with 6."""
+    span = reduce.finite_span(arrays)
+    size = max((float(np.max(np.abs(a[np.isfinite(a)]))) for a in map(np.asarray, arrays)
+                if a.size and np.isfinite(a).any()), default=0.0)
+    if not span > 0 or not size > 0:
+        return 6
+    return int(min(MAX_DIGITS, max(6, 3 + math.ceil(math.log10(size / span)))))
 
 
 def _table(rows: List[List[str]]) -> List[str]:
@@ -134,25 +178,32 @@ def _table(rows: List[List[str]]) -> List[str]:
 
 
 def _runs(x) -> List[slice]:
-    """Slices of x between restarts (x decreasing), as a nested .dc sweep that ngspice
-    writes flat produces; one slice when x never restarts or restarts implausibly often."""
-    starts = np.flatnonzero(np.diff(x) < 0) + 1
+    """Slices of x between restarts, as a nested .dc sweep that ngspice writes flat
+    produces; one slice when x never restarts or restarts implausibly often.
+
+    A restart is a step against the sweep's own direction, the direction most steps take:
+    a sweep run downwards (.dc vin 1.8 0 -0.1) has no restart, and the inner sweep of a
+    nested one may run either way."""
+    steps = np.sign(np.diff(np.asarray(x, dtype=np.float64)))
+    forward = 1.0 if (steps > 0).sum() >= (steps < 0).sum() else -1.0
+    starts = np.flatnonzero(steps == -forward) + 1
     if starts.size == 0 or starts.size + 1 > MAX_RUNS:
         return [slice(0, x.size)]
     bounds = [0, *starts.tolist(), x.size]
     return [slice(a, b) for a, b in zip(bounds, bounds[1:])]
 
 
-def _min_max(arrays) -> List[str]:
+def _min_max(arrays, digits: int = 6) -> List[str]:
     """min and max, NaN skipped, over the points of every array; "-" when there are none."""
     if not any(len(a) for a in arrays):
         return ["-", "-"]
-    return [_num(v) for v in api.range_of(arrays)]
+    return [_num(v, digits) for v in api.range_of(arrays)]
 
 
 def _interval(bounds) -> str:
-    """[lo, hi] as text, in the form xrange takes."""
-    return f"[{_num(bounds[0])}, {_num(bounds[1])}]"
+    """[lo, hi] as text, in the form xrange takes, with the digits that tell lo from hi."""
+    digits = _distinct_digits(bounds)
+    return f"[{_num(bounds[0], digits)}, {_num(bounds[1], digits)}]"
 
 
 def _plot_extent(ts) -> str:
@@ -250,7 +301,8 @@ def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFA
     db = {name: reduce.in_db(h, name) for name in columns}
     spans = {name: reduce.finite_span(reduce.y_criterion(a, db[name]) for a in ts.data[name])
              for name in columns}
-    floor = 4 * float(np.finfo(h.dtype).eps)
+    eps = float(np.finfo(h.dtype).eps)
+    y_digits = {name: _range_digits(ts.data[name]) for name in varying}
     body: List[str] = []
     shown, followed, enveloped = 0, 0, 0
     for table in tables if columns else []:
@@ -263,18 +315,21 @@ def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFA
         values = [ts.data[name][i][sl] for name in columns]
         idx, error = reduce.breakpoints(
             reduce.x_criterion(x, log), [reduce.y_criterion(v, db[name]) for v, name in zip(values, columns)],
-            [spans[name] for name in columns], tolerance, per_table, floor)
-        if error <= max(tolerance, floor):
+            [spans[name] for name in columns], tolerance, per_table, eps)
+        if error <= tolerance:
             followed += 1
             cols = [x[idx]] + [v[idx] for v in values]
-            rows = [[x_name, *columns]] + [[_num(v) for v in row] for row in zip(*cols)]
+            digits = [_distinct_digits(cols[0])] + [y_digits[name] for name in columns]
+            rows = [[x_name, *columns]] + [[_num(v, d) for v, d in zip(row, digits)] for row in zip(*cols)]
         else:                                       # too dense to follow: show it as a peak-detect envelope
             enveloped += 1
             start, stop, mins, maxs = reduce.peak_detect(x, values, slices, log)
             cols = [start, stop] + [c for pair in zip(mins, maxs) for c in pair]
             heading = [f"{x_name}_from", f"{x_name}_to"] + [f"{k}({name})" for name in columns
                                                             for k in ("min", "max")]
-            rows = [heading] + [[_num(v) for v in row] for row in zip(*cols)]
+            xd = _distinct_digits(np.concatenate([start, stop]))
+            digits = [xd, xd] + [y_digits[name] for name in columns for _ in range(2)]
+            rows = [heading] + [[_num(v, d) for v, d in zip(row, digits)] for row in zip(*cols)]
             label = (f"{label}; " if label else "") + "envelope: each row is a slice with every trace's min and max"
             if np.any(start[1:] != stop[:-1]):     # the simulator stepped over some slices
                 label += "; slices without a sample are left out"
@@ -307,7 +362,10 @@ def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFA
     if h.analysis == "ac":
         lines.append(AC_LEGEND[h.ac_format])
     if total == 0:
-        if nsweeps == 0:
+        if not ts.plot_points:
+            lines.append("the file holds no data point" + (" yet: the simulation is still writing it"
+                                                           if ts.truncated else ""))
+        elif nsweeps == 0:
             lines.append("no sweeps in the selection")
         elif ts.xrange is not None:
             lines.append(f"no points in xrange {_interval(ts.xrange)}; {_plot_extent(ts)}")
@@ -327,10 +385,10 @@ def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFA
             for i in range(nsweeps):
                 tag = f"[{ts.sweep_indices[i]}]" if nsweeps > 1 else ""
                 for name in listed:
-                    stats.append([name + tag, *_min_max(ts.data[name][i:i + 1])])
+                    stats.append([name + tag, *_min_max(ts.data[name][i:i + 1], y_digits[name])])
         else:
             stats = [[f"trace (all {nsweeps} sweeps)", "min", "max"]]
-            stats += [[name, *_min_max(ts.data[name])] for name in listed]
+            stats += [[name, *_min_max(ts.data[name], y_digits[name])] for name in listed]
         lines += ["", *_table(stats)]
         if len(listed) < len(varying):
             lines.append(f"-- {len(varying) - len(listed)} more traces not shown; select fewer names --")
@@ -406,7 +464,7 @@ def list_traces(
     names: Annotated[Optional[Union[str, List[str]]], Field(
         description="Traces to list, as extract selects them: " + _NAMES_HELP + " None lists every "
                     "trace.")] = None,
-    plot: Annotated[int, Field(description="Nutmeg only: which plot of the rawfile to describe, "
+    plot: Annotated[int, Number, Field(description="Nutmeg only: which plot of the rawfile to describe, "
                                            "0-based (see \"plots\"). Must be 0 for HSPICE files.")] = 0,
     ac_format: Annotated[Literal[tuple(AC_FORMATS)], Field(
         description=_AC_FORMAT_HELP + " Names and ranges follow it, as extract returns them.")] = "magphase",
@@ -427,12 +485,20 @@ def list_traces(
       sweep_params, sweep_values: each sweep's parameter values (HSPICE; Nutmeg: none)
     - truncated: the simulation had not finished writing the file
     - traces: every other trace name; ranges: each trace's [min, max], NaN skipped
-      (null: no value, or infinite). At most 100 ranges: "note" then says to narrow names.
+      (null: no value, or infinite). At most 100 ranges and 100 sweep_values: a "note"
+      then says so.
 
     AC traces are listed as <name>_Mag and <name>_Phase; v(out) selects the pair in
     extract. For a measure file (.mt#, .ms#, .ma#) use read_measures instead.
     """
-    return _json_result(api.list_traces(path, plot, ac_format, names, header_only=header_only))
+    info = _json_result(api.list_traces(path, plot, ac_format, names, header_only=header_only))
+    values = info.get("sweep_values")
+    if values is not None and len(values) > MCP_MAX_SWEEP_VALUES:
+        info["sweep_values"] = values[:MCP_MAX_SWEEP_VALUES]
+        note = (f"sweep_values lists the first {MCP_MAX_SWEEP_VALUES} of {len(values)} sweeps; extract with "
+                f"sweeps=[...] shows the values of others")
+        info["note"] = f"{info['note']}; {note}" if "note" in info else note
+    return info
 
 
 MCP_OUTPUTS = ("text", "summary", "csv", "npz", "png")
@@ -445,21 +511,21 @@ def extract(
     names: Annotated[Optional[Union[str, List[str]]], Field(
         description="Traces to read, as list_traces lists them: " + _NAMES_HELP + " None reads "
                     "every trace. x is always included.")] = None,
-    sweeps: Annotated[Optional[Union[int, List[int]]], Field(
+    sweeps: Annotated[Optional[Union[int, List[int]]], Number, Field(
         description="0-based sweep indices to keep (list_traces gives sweeps and each one's "
                     "sweep_values); None keeps all. An index the file does not hold is an "
                     "error. On files with many sweeps, pick a few here.")] = None,
     output: Annotated[Literal[MCP_OUTPUTS], Field(
         description="\"text\" (default): readable report, see the tool description. "
-                    "\"summary\": JSON with exact numbers. \"csv\" / \"npz\": write every "
+                    "\"summary\": JSON with exact numbers, for at most 200 trace x sweep series. \"csv\" / \"npz\": write every "
                     "point to a file. \"png\": write a plot image.")] = "text",
-    downsample: Annotated[Optional[int], Field(
+    downsample: Annotated[Optional[int], Number, Field(
         description="csv/npz: keep this many evenly spaced points per sweep, first and last "
                     "included (default: every point). text: at most this many rows per table. "
                     "summary: list at most this many x/y points per trace and sweep (default: "
                     "none, statistics only). At least 2. png always draws every point's "
                     "envelope.")] = None,
-    tolerance: Annotated[Optional[float], Field(
+    tolerance: Annotated[Optional[float], Number, Field(
         description="text and summary: how far straight lines between the rows shown may "
                     "stray from any point, as a fraction of each trace's range in the "
                     "selection (default 0.01 = 1%; 0 drops only points on a straight line). "
@@ -473,15 +539,15 @@ def extract(
         description="Output path for csv/npz/png (an absolute path is best); replaces an "
                     "existing file, but never the input. Default: <input>_<ext>_traces.<output> "
                     "beside the input. An error with text or summary.")] = None,
-    xrange: Annotated[Optional[List[float]], Field(
+    xrange: Annotated[Optional[List[float]], Number, Field(
         description="[min, max] on x (list_traces gives x_range): keep only rows inside the "
                     "closed interval, for every output. Applied while reading, so a narrow "
                     "window on a huge file is cheap: prefer it to reading everything.")] = None,
-    yrange: Annotated[Optional[List[float]], Field(
+    yrange: Annotated[Optional[List[float]], Number, Field(
         description="[min, max] vertical axis limits of the png plot (list_traces gives each "
                     "trace's range); other outputs do not use it, but a malformed value is "
                     "still an error.")] = None,
-    plot: Annotated[int, Field(description="Nutmeg only: which plot to read, 0-based (see "
+    plot: Annotated[int, Number, Field(description="Nutmeg only: which plot to read, 0-based (see "
                                            "list_traces). Must be 0 for HSPICE files.")] = 0,
     ac_format: Annotated[Literal[tuple(AC_FORMATS)], Field(description=_AC_FORMAT_HELP)] = "magphase",
 ):
@@ -522,12 +588,17 @@ def extract(
         ts = api.extract(path, names, sweeps, "arrays", xrange=xrange, plot=plot, ac_format=ac_format)
         if output == "text":
             return format_text(ts, downsample, reduce.DEFAULT_TOLERANCE if tolerance is None else tolerance)
+        traces, nsweeps = len(ts.selected) - 1, len(ts.sweep_values)
+        if traces * nsweeps > MCP_MAX_SERIES:
+            raise ValueError(f"a summary of {traces} traces x {nsweeps} sweeps = {traces * nsweeps} series is too "
+                             f"large for one reply (at most {MCP_MAX_SERIES}): select fewer with names=[...] or "
+                             f"sweeps=[...], or use output='text' (always bounded) or 'csv'")
         return _json_result(api.summarize(ts, downsample, tolerance), ts)
     api.resolve_dest(path, output, dest)             # fail before the read, not after it
     if output == "png":
         api._require_matplotlib()
-    ts = api.extract(path, names, sweeps, "arrays", downsample, xrange=xrange, plot=plot,
-                     ac_format=ac_format)
+    ts = api.extract(path, names, sweeps, "arrays", None if output == "png" else downsample, xrange=xrange,
+                     plot=plot, ac_format=ac_format)    # png draws every point's envelope
     written = os.path.abspath(api.write_file(ts, output, dest, yrange))
     facts = api.overview(ts)
     result = {"output": output, "dest": written}
@@ -549,7 +620,7 @@ def read_measures(
                     "matches exactly. None shows every column. The index column and the swept "
                     "parameters are always kept. An unknown name fails with near names and the "
                     "available measures.")] = None,
-    rows: Annotated[int, Field(
+    rows: Annotated[int, Number, Field(
         description="Rows shown, evenly spaced with first and last kept; at least 2, at "
                     "most 500.")] = 20,
 ):

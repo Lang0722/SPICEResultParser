@@ -18,7 +18,8 @@ _DTYPE = {"9601": np.dtype("<f4"), "2001": np.dtype("<f8"), "ascii": np.dtype("<
 _ANALYSIS_BY_TYPE_CODE = {1: "tr", 2: "ac", 3: "sw"}
 _TERMINATOR = "$&%#"
 _FRAME_OVERHEAD = 20            # 16-byte block head + 4-byte block tail
-_ASCII_BYTES_PER_VALUE = 13     # one HSPICE ASCII field; used only to bound the preallocation
+_ASCII_BYTES_PER_VALUE = 13     # one HSPICE ASCII field when the first line cannot tell (9601-style
+                                # files write 11): used only to bound the preallocation
 
 FRAMES_PER_CHUNK = 256          # frames per bulk read: 256 * (8192 + 20) bytes ≈ 2.1 MB for HSPICE's 8 KB blocks
 _MAX_CHUNK_BYTES = 4 << 20      # cap on one bulk read buffer; blocks whose frame exceeds it take the per-block path
@@ -96,7 +97,7 @@ def ac_part(re: np.ndarray, im: np.ndarray, ac_format: str, second: bool) -> np.
     if ac_format == "realimag":
         return im if second else re
     if second:
-        return np.degrees(np.arctan2(im, re))
+        return np.degrees(np.arctan2(im + 0.0, re))    # + 0.0 turns -0.0 into 0.0: -180 would leave (-180, 180]
     mag = np.hypot(re, im)
     if ac_format == "db":
         with np.errstate(divide="ignore"):         # |H| = 0 is -inf dB
@@ -156,14 +157,19 @@ def _analysis_from_extension(path: str) -> Optional[str]:
 
 
 def _uniquify(path: str, names: List[str]) -> List[str]:
-    """Make sanitized names 1:1 with columns: repeats get a '#<column_index>' suffix."""
+    """Make sanitized names 1:1 with columns: repeats get a '#<column_index>' suffix (and
+    '_2', '_3' ... after it, should a variable already carry that name)."""
+    taken = set(names)
     seen = set()
     out: List[str] = []
     duplicates: List[str] = []
     for i, name in enumerate(names):
         if name in seen:
             duplicates.append(name)
-            name = f"{name}#{i}"
+            candidate, k = f"{name}#{i}", 2
+            while candidate in taken or candidate in seen:
+                candidate, k = f"{name}#{i}_{k}", k + 1
+            name = candidate
         seen.add(name)
         out.append(name)
     if duplicates:
@@ -222,27 +228,37 @@ def _short_block(index: int, payload: bytes, itemsize: int) -> bytes:
     return payload[:kept]
 
 
-def _read_block(f, index: int, itemsize: int = 1) -> Optional[bytes]:
+def _read_block(f, index: int, itemsize: int = 1, cut: Optional[list] = None) -> Optional[bytes]:
     """Read one framed block (16-byte head, payload, 4-byte tail). None at EOF.
 
-    A block the file ends inside of (short payload, or a tail of fewer than 4
-    bytes) is returned truncated to a whole number of values, with a warning:
-    that is what a file still being written by the simulator looks like. A tail
-    that is present but disagrees with the head is corruption and raises.
+    A file that ends inside a block is what a file still being written by the simulator
+    looks like, not corruption: a block cut in its payload or tail is returned truncated
+    to a whole number of values, and one cut in its head ends the data (None). Either way
+    a warning says so and `cut`, when given, records where: ("head" | "payload" |
+    "tail", index). A tail that is present but disagrees with the head is corruption and
+    raises.
     """
     head = f.read(16)
     if not head:
         return None
     if len(head) < 16:
-        raise ValueError(f"block {index}: truncated block head")
+        warnings.warn(f"block {index}: file ends inside the block head; keeping the blocks before it",
+                      RuntimeWarning)
+        if cut is not None:
+            cut.append(("head", index))
+        return None
     size = struct.unpack("<i", head[12:16])[0]
     if size < 0:
         raise ValueError(f"block {index}: negative block size {size}")
     payload = f.read(size)
     if len(payload) < size:
+        if cut is not None:
+            cut.append(("payload", index))
         return _short_block(index, payload, itemsize)
     tail = f.read(4)
     if len(tail) < 4:
+        if cut is not None:
+            cut.append(("tail", index))
         return _short_block(index, payload, itemsize)
     if struct.unpack("<i", tail)[0] != size:
         raise ValueError(f"block {index}: tail length does not match head length {size}")
@@ -250,21 +266,35 @@ def _read_block(f, index: int, itemsize: int = 1) -> Optional[bytes]:
 
 
 def _read_binary_header(f, path: str, ac_format: str = "magphase") -> Header:
-    payload = _read_block(f, 0, 1)
+    cut: list = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)     # an incomplete header raises below
+        payload = _read_block(f, 0, 1, cut)
+    incomplete = ValueError(f"{path}: the header is incomplete (the file ends inside it); the simulator "
+                            f"may still be writing it")
     if payload is None:
-        raise ValueError(f"{path}: empty file")
+        raise incomplete if cut else ValueError(f"{path}: empty file")
     text = payload.decode("utf-8", errors="replace")
     try:
         nauto, nprobe, nsweepparam = int(text[0:4]), int(text[4:8]), int(text[8:12])
     except ValueError:
         raise _not_a_result_file(path) from None
+    if cut and cut[0][0] != "tail":
+        raise incomplete
     version = text[20:24].strip() or text[16:20].strip()
     if version not in ("9601", "2001"):
         raise ValueError(f"{path}: unsupported post_version {version!r}; only 9601 and 2001 are supported")
-    marker = text.find("Reserved.")
-    if marker < 0:
-        raise ValueError(f"{path}: header has no copyright marker")
-    tokens = text[marker + len("Reserved."):].split()
+    # The copyright notice ends with "Reserved." and the sweep count follows it. The title
+    # before it is free text that may say "Reserved." too: take the first one followed by
+    # an integer.
+    marker, tokens = -1, []
+    while True:
+        marker = text.find("Reserved.", marker + 1)
+        if marker < 0:
+            raise ValueError(f"{path}: header has no copyright marker")
+        tokens = text[marker + len("Reserved."):].split()
+        if tokens and tokens[0].lstrip("+-").isdigit():
+            break
     if tokens and tokens[-1] == _TERMINATOR:
         tokens = tokens[:-1]
     if not tokens:
@@ -321,6 +351,8 @@ def _ascii_field_width(data: bytes, path: str, final: bool) -> Optional[int]:
         if line:
             exponent = line.find(b"E")
             if exponent < 0:
+                if end < 0:
+                    return None                   # the file ends inside its first field
                 raise ValueError(f"{path}: cannot determine ASCII field width from first data line")
             return exponent + 4
         if end < 0:
@@ -339,14 +371,15 @@ def _ascii_fields(flat: bytes, n: int, width: int, path: str) -> Iterator[np.nda
         yield values[start:start + ASCII_BATCH_VALUES]
 
 
-def _iter_ascii_values(f, path: str) -> Iterator[np.ndarray]:
+def _iter_ascii_values(f, path: str, cut: Optional[list] = None) -> Iterator[np.ndarray]:
     """float64 arrays of at most ASCII_BATCH_VALUES values each (line boundaries are not
     significant to the stream).
 
     The data section is read in ASCII_CHUNK_BYTES chunks, stripped of every whitespace byte
     in one C call (which also absorbs CRLF endings), and converted as fixed-width fields by
     numpy: nothing is parsed a value at a time. A field split across two chunks is carried
-    over; a partial field at the end of the file is dropped, as a half-written value.
+    over; a partial field at the end of the file is dropped, as a half-written value, and
+    `cut` (when given) records it.
     """
     width = None
     carry = b""                                   # bytes of a field split across chunks
@@ -368,11 +401,16 @@ def _iter_ascii_values(f, path: str) -> Iterator[np.ndarray]:
             yield from _ascii_fields(flat, n, width, path)
     if width is None and head:                    # the whole section arrived in one short read
         width = _ascii_field_width(head, path, final=True)
-        if width is not None:
-            flat = head.translate(None, _BLANKS)
+        flat = head.translate(None, _BLANKS)
+        if width is None:
+            carry = flat                          # not even one whole field yet
+        else:
             n = len(flat) // width
+            carry = flat[n * width:]
             if n:
                 yield from _ascii_fields(flat, n, width, path)
+    if carry and cut is not None:
+        cut.append(("field", None))
 
 
 def plot_index(plot) -> int:
@@ -470,6 +508,21 @@ class _XSpan:
         return self.lo, self.hi
 
 
+def name_list(names, kind: str) -> List[str]:
+    """names as a list of strings: one name, or an iterable of them; anything else raises
+    a ValueError that says what was given."""
+    if isinstance(names, str):
+        return [names]
+    try:
+        items = list(names)
+    except TypeError:
+        raise ValueError(f"names must be a {kind} name or a list of them, not {names!r}") from None
+    for item in items:
+        if not isinstance(item, str):
+            raise ValueError(f"names must be {kind} names (strings), not {item!r}")
+    return items
+
+
 def _lookup_ignoring_case(req: str, names: Sequence[str], raw_names: Sequence[str]) -> List[int]:
     """Columns that request req selects when case is ignored: an exact name, a raw name
     with or without its closing paren, then a glob on names."""
@@ -518,8 +571,7 @@ def resolve_columns(header: Header, names) -> List[int]:
     """
     if names is None:
         return list(range(header.ncols))
-    if isinstance(names, str):
-        names = [names]
+    names = name_list(names, "trace")
     by_name: Dict[str, List[int]] = {}
     for i, n in enumerate(header.names):
         by_name.setdefault(n, []).append(i)
@@ -553,9 +605,9 @@ def _binary_capacity(file_size: int, data_start: int, block_payload: int, ncols:
     return payload // itemsize // ncols + 1
 
 
-def _ascii_capacity(file_size: int, ncols: int) -> int:
+def _ascii_capacity(file_size: int, ncols: int, width: Optional[int] = None) -> int:
     """Upper bound on data points in an ASCII file (13 bytes per value; newlines only inflate it)."""
-    return file_size // _ASCII_BYTES_PER_VALUE // ncols + 1
+    return file_size // (width or _ASCII_BYTES_PER_VALUE) // ncols + 1
 
 
 def _peek_block_payload(f) -> int:
@@ -601,6 +653,7 @@ class _Collector:
         self.spans: List[Tuple[int, int]] = []  # (start, stop) in the buffers, one per kept sweep
         self.data = {c: [] for c in self.cols}
         self.span = _XSpan(header.dtype)        # every point of every sweep, before any selection
+        self.cut = False                        # the file ended inside a block or a field
 
     def _keep(self) -> bool:
         return self.sweeps is None or self.sweep_idx in self.sweeps
@@ -680,13 +733,22 @@ class _Collector:
         self.sweep_idx += 1
 
     def finish(self) -> bool:
-        truncated = self.pos > 0 or bool(self.params)
-        if truncated:
+        """Close the stream; True when the file is truncated: it ends inside a sweep, a block
+        or a field, or holds fewer sweeps than its header announces (the simulator is still
+        writing it, or was stopped)."""
+        partial = self.pos > 0 or bool(self.params)
+        if partial:
             warnings.warn(
                 f"{self.h.path}: file ended before the sweep terminator; the last sweep is partial",
                 RuntimeWarning,
             )
             self._end_sweep()
+        announced = self.h.sweep_count_hint
+        missing = announced > 0 and self.sweep_idx < announced
+        if missing:
+            warnings.warn(f"{self.h.path}: the header announces {announced} sweeps, the file holds "
+                          f"{self.sweep_idx}", RuntimeWarning)
+        truncated = partial or self.cut or missing
         # Materialise the kept sweeps. When a noticeable share of the capacity went unused
         # (a selective sweeps=, a grown buffer, an over-estimate) copy the spans out so the
         # TraceSet does not pin the buffer; otherwise hand out views into it.
@@ -729,9 +791,9 @@ class _RangeCollector(_Collector):
         self.fill += rows.shape[0]              # nothing is stored; the spans count the points
 
 
-def _iter_binary_blocks(f, header: Header, index: int = 1) -> Iterator[np.ndarray]:
+def _iter_binary_blocks(f, header: Header, index: int = 1, cut: Optional[list] = None) -> Iterator[np.ndarray]:
     while True:
-        payload = _read_block(f, index, header.dtype.itemsize)
+        payload = _read_block(f, index, header.dtype.itemsize, cut)
         if payload is None:
             return
         if len(payload) % header.dtype.itemsize:
@@ -854,24 +916,33 @@ def _data_capacity(f, header: Header) -> int:
     """Estimated points in the data section at f's position (f is left there)."""
     file_size = os.fstat(f.fileno()).st_size
     if not header.is_binary:
-        return _ascii_capacity(file_size, header.ncols)
+        start = f.tell()
+        first = f.read(4096)                        # the first data line gives the field width
+        f.seek(start)
+        try:
+            width = _ascii_field_width(first, header.path, final=False)
+        except ValueError:                          # reading the data will say what is wrong
+            width = None
+        return _ascii_capacity(file_size, header.ncols, width)
     return _binary_capacity(file_size, f.tell(), _peek_block_payload(f), header.ncols, header.dtype.itemsize)
 
 
 def _feed_data(f, path: str, header: Header, collector: _Collector) -> None:
     """Stream the data section at f's position into the collector: uniform binary blocks
     in bulk slabs, the rest block by block; ASCII in chunks."""
+    cut: list = []                                # where the file ended inside a block or a field
     if not header.is_binary:
-        for values in _iter_ascii_values(f, path):
+        for values in _iter_ascii_values(f, path, cut):
             collector.feed(values)
-        return
-    index = 1
-    block_payload = _peek_block_payload(f)
-    frame = block_payload + _FRAME_OVERHEAD
-    if block_payload > 0 and block_payload % header.dtype.itemsize == 0 and frame <= _MAX_CHUNK_BYTES:
-        index = _feed_bulk_frames(f, header, collector, block_payload, index)
-    for block in _iter_binary_blocks(f, header, index):
-        collector.feed(block)
+    else:
+        index = 1
+        block_payload = _peek_block_payload(f)
+        frame = block_payload + _FRAME_OVERHEAD
+        if block_payload > 0 and block_payload % header.dtype.itemsize == 0 and frame <= _MAX_CHUNK_BYTES:
+            index = _feed_bulk_frames(f, header, collector, block_payload, index)
+        for block in _iter_binary_blocks(f, header, index, cut):
+            collector.feed(block)
+    collector.cut = bool(cut)
 
 
 def scan(path, plot: int = 0, ac_format: str = "magphase", names=None) -> Scan:

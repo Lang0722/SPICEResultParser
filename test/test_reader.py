@@ -1,5 +1,6 @@
 """Tests for the streaming reader, API and MCP server. Fixtures are generated in temp dirs."""
 import asyncio
+import dataclasses
 import json
 import pickle
 import re
@@ -503,7 +504,7 @@ class TestBinaryRead(unittest.TestCase):
     def test_incomplete_point_is_dropped_at_a_sweep_boundary(self):
         # Sweep 0 ends with 3 stray values before its sentinel; sweep 1 must start clean.
         path, _ = make_multi(self.dir, "2001")
-        header = read_header(path)
+        header = dataclasses.replace(read_header(path), sweep_count_hint=2)    # the 2 sweeps fed below
         c = reader._Collector(header, list(range(7)), None, capacity=8)
         sweep0 = [1000.0] + list(range(14)) + [90.0, 91.0, 92.0] + [1e30]
         sweep1 = [2000.0] + [float(v) for v in range(100, 107)] + [1e30]
@@ -1686,6 +1687,146 @@ class TestScan(unittest.TestCase):
         self.assertEqual(api._json_floats(np.array([np.nan, np.inf, 1.5], np.float32)), [None, None, 1.5])
 
 
+class TestFilesCutAnywhere(unittest.TestCase):
+    """A file the simulator is still writing can end at any byte: the complete points are
+    kept and `truncated` is set; nothing half-written becomes data."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def read(self, path, **kw):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            return read_traces(path, **kw), api.list_traces(path)
+
+    def test_cut_inside_a_block_head(self):
+        path = self.dir / "run.tr0"
+        data = np.random.default_rng(0).random((2000, 2))
+        fixtures.write_binary(path, "2001", ["TIME", "v(out"], [1, 1], [([], data)])
+        raw = path.read_bytes()
+        first = 20 + struct.unpack("<i", raw[12:16])[0]
+        boundary = first + 2 * (16 + 8192 + 4)                    # after two whole data blocks
+        for extra in range(1, 16):                                 # every byte of the third block's head
+            path.write_bytes(raw[:boundary + extra])
+            ts, info = self.read(path)
+            self.assertTrue(ts.truncated, extra)
+            self.assertEqual(ts.data["v_out"][0].size, 1024)
+            self.assertTrue(info["truncated"])
+            np.testing.assert_array_equal(ts.data["v_out"][0], data[:1024, 1])
+
+    def test_cut_just_after_a_sweep_terminator(self):
+        rng = np.random.default_rng(3)
+        sweeps = [([1000.0], rng.random((100, 3))), ([2000.0], rng.random((100, 3))), ([3000.0], rng.random((100, 3)))]
+        path = self.dir / "sweep.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(a", "v(b", "r1"], [1, 1, 1], sweeps)
+        raw = path.read_bytes()
+        start = 20 + struct.unpack("<i", raw[12:16])[0] + 16
+        terminator = start + 302 * 8                                # sweep 0: 1 parameter, 300 values, 1e30
+        for cut in (terminator + 3, terminator):                    # mid-value, and exactly at the terminator
+            path.write_bytes(raw[:cut])
+            ts, info = self.read(path)
+            self.assertEqual(len(ts.sweep_indices), 1)
+            self.assertTrue(ts.truncated, cut - terminator)        # 1 of the 3 announced sweeps
+            self.assertEqual((info["sweeps"], info["truncated"]), (1, True))
+        apath = self.dir / "sweep_a.tr0"
+        fixtures.write_ascii(apath, ["TIME", "v(a", "r1"], [1, 1], [([1.0], rng.random((3, 2)) + .1),
+                                                                     ([2.0], rng.random((3, 2)) + .1)])
+        text = apath.read_bytes()
+        end = text.index(b"0.1000000E+31") + 13
+        apath.write_bytes(text[:end + 1 + 6])                       # half of sweep 1's parameter
+        ts, _ = self.read(apath)
+        self.assertEqual((len(ts.sweep_indices), ts.truncated), (1, True))
+
+    def test_a_complete_file_is_not_truncated(self):
+        path, _ = make_multi(self.dir, "2001")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            self.assertFalse(read_traces(path).truncated)
+
+    def test_cut_inside_the_first_ascii_field(self):
+        path = self.dir / "live.tr0"
+        fixtures.write_ascii(path, ["TIME", "v(a"], [1, 1], [([], np.array([[1e-9, 0.5], [2e-9, 0.7]]))])
+        raw = path.read_bytes()
+        start = raw.index(b"$&%#\n") + 5
+        for n in range(1, 13):                                      # inside the first 13-character field
+            path.write_bytes(raw[:start + n])
+            ts, info = self.read(path)
+            self.assertTrue(ts.truncated, n)
+            self.assertEqual(info["points"], 0)
+
+    def test_a_cut_header_says_so(self):
+        path = self.dir / "hdr.tr0"
+        fixtures.write_binary(path, "9601", ["TIME", "v(in", "i(vdd"], [1, 1, 8], [([], np.ones((5, 3)))])
+        raw = path.read_bytes()
+        path.write_bytes(raw[:raw.index(b"i(vdd") + 3])             # inside the last name
+        with self.assertRaisesRegex(ValueError, "the header is incomplete"):
+            read_header(path)
+
+    def test_a_title_saying_reserved(self):
+        path = self.dir / "corp.tr0"
+        data = np.random.default_rng(0).random((5, 2))
+        fixtures.write_binary(path, "9601", ["TIME", "v(out"], [1, 1], [([], data)])
+        raw = path.read_bytes()
+        n0 = struct.unpack("<i", raw[12:16])[0]
+        text = raw[16:16 + n0].decode().replace(" fixture.sp ", " * (c) ACME. All Rights Reserved. ", 1).encode()
+        path.write_bytes(raw[:12] + struct.pack("<i", len(text)) + text + struct.pack("<i", len(text)) + raw[20 + n0:])
+        ts = read_traces(path)
+        self.assertEqual(ts.selected, ["TIME", "v_out"])
+        np.testing.assert_allclose(ts.data["v_out"][0], data[:, 1], rtol=1e-7)
+
+    def test_ascii_capacity_follows_the_field_width(self):
+        # 9601-style ASCII writes 11-character fields; the estimate must still bound the points
+        def field11(v):
+            if v == 0.0:
+                return "0.00000E+00"
+            e = int(np.floor(np.log10(abs(v)))) + 1
+            m = f"{abs(v) / 10.0 ** e:.5f}"
+            if m.startswith("1"):
+                m, e = "0.10000", e + 1
+            return ("-" if v < 0 else "0") + m[1:] + f"E{e:+03d}"
+        data = np.column_stack([np.linspace(1e-12, 1e-6, 5000), np.linspace(0.1, 0.9, 5000)])
+        path = self.dir / "a9601.tr0"
+        fields = [field11(v) for v in data.ravel().tolist() + [1e30]]
+        with open(path, "w") as f:
+            f.write("   2   0   0    9601 * x.sp\n01/01/2026 00:00:00 Copyright (c) 2026 X. All Rights Reserved."
+                    "\n  0\n1 1 TIME v(a $&%#\n")
+            f.writelines("".join(fields[i:i + 5]) + "\n" for i in range(0, len(fields), 5))
+        with open(path, "rb") as f:
+            header = reader._read_ascii_header(f, str(path))
+            self.assertGreaterEqual(reader._data_capacity(f, header), 5000)
+        np.testing.assert_allclose(read_traces(path).data["v_a"][0], data[:, 1], rtol=1e-4)
+
+
+class TestNamesAndValues(unittest.TestCase):
+    def test_phase_stays_in_its_documented_interval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "inv.ac0"
+            fixtures.write_binary(path, "2001", ["HERTZ", "v(out"], [2, 1],
+                                  [([], np.array([[1e3, -5.0, 0.0], [1e4, -5.0, -0.0]]))])
+            phase = read_traces(path, ["v(out"]).data["v_out_Phase"][0]
+            np.testing.assert_array_equal(phase, [180.0, 180.0])           # (-180, 180]: never -180
+            self.assertEqual(reader.scan(path).ranges["v_out_Phase"], (180.0, 180.0))
+
+    def test_a_repeat_suffix_never_takes_an_existing_name(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            names = reader._uniquify("f", ["time", "x#3", "x", "x"])
+        self.assertEqual(names, ["time", "x#3", "x", "x#3_2"])
+        self.assertEqual(len(set(names)), len(names))
+
+    def test_names_must_be_strings(self):
+        for names in ([1], [None], [b"TIME"], 5):
+            with self.assertRaisesRegex(ValueError, "names must be"):
+                read_traces(HERE / "test_9601.tr0", names)
+        from spice_result_parser import read_measures
+        with self.assertRaisesRegex(ValueError, "names must be measure names"):
+            read_measures(HERE / "test.mt0", [1])
+
+
 class TestArgumentChecks(unittest.TestCase):
     """Arguments the reader and the API reject, with an error that names the problem."""
 
@@ -1973,6 +2114,35 @@ class TestMcp(unittest.TestCase):
         self.assertIn(f"window: xrange [0.001, 0.002]; {hint}", inside)
         self.assertNotIn("note", self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="summary",
                                                 xrange=[0.001, 0.002]))
+
+    def test_true_false_and_strings_are_not_numbers(self):
+        # the schema's lax parsing would make true 1 and "0.5" 0.5 before the tool's own checks
+        path = str(HERE / "test_9601.tr0")
+        for args in ({"tolerance": True}, {"sweeps": True}, {"plot": True}, {"xrange": [False, True]},
+                     {"tolerance": "0.5"}, {"downsample": "20"}, {"yrange": [0, True]}):
+            with self.assertRaisesRegex(Exception, "expected a number", msg=str(args)):
+                asyncio.run(self.m.server.call_tool("extract", {"path": path, **args}))
+        with self.assertRaisesRegex(Exception, "expected a number"):
+            asyncio.run(self.m.server.call_tool("read_measures", {"path": str(HERE / "test.mt0"), "rows": True}))
+        result = asyncio.run(self.m.server.call_tool("extract", {"path": path, "names": "v(vo", "tolerance": 0,
+                                                                  "sweeps": [0], "xrange": [0, 0.001]}))
+        content = getattr(result, "content", None) or (result[0] if isinstance(result, tuple) else result)
+        self.assertIn("265 points", content[0].text)                # real numbers still pass
+
+    def test_many_sweeps_stay_within_one_reply(self):
+        t = np.linspace(0, 1e-8, 50)
+        sweeps = [([float(k)], np.c_[t, np.tanh(t / 1e-9) * (1 + k / 1000)]) for k in range(300)]
+        path = self.dir / "mc.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(o", "mc"], [1, 1], sweeps)
+        info = self.m.list_traces(str(path))
+        self.assertEqual(info["sweeps"], 300)
+        self.assertEqual(len(info["sweep_values"]), self.m.MCP_MAX_SWEEP_VALUES)
+        self.assertIn(f"sweep_values lists the first {self.m.MCP_MAX_SWEEP_VALUES} of 300 sweeps", info["note"])
+        with self.assertRaisesRegex(self.m.ToolError, "300 series is too large .* sweeps=\\[...\\]"):
+            self.m.extract(str(path), output="summary")
+        summary = self.m.extract(str(path), output="summary", sweeps=list(range(150)))
+        self.assertEqual(len(summary["stats"]["v_o"]), 150)
+        self.assertLess(len(self.m.extract(str(path))), 30_000)       # text is bounded by itself
 
     def test_relative_path_errors_name_the_server_directory(self):
         import os

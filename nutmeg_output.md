@@ -102,7 +102,9 @@ For such a plot, the reader reads all the complete points that the file contains
 - The reader streams the ASCII section to the end of the file.
 - The reader discards a final line with no newline as half-written. Exception: the
   reader keeps the last point of a complete file whose writer merely omitted the last
-  newline.
+  newline. The last value must then have the same written form as the value before it
+  (ngspice writes every value as `%.15e`). Thus a value that the file cuts short, such as
+  `4.93` or `4.930230187317426e-0`, is discarded.
 - `truncated` is `True`.
 - A `RuntimeWarning` says how many complete points the reader read.
 

@@ -25,6 +25,8 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+from .reader import name_list
+
 _PARAM_COUNT = re.compile(r"PARAM_COUNT\s*=\s*(\d+)")
 _LAST_NAME = "alter#"
 
@@ -73,8 +75,7 @@ def _select(all_names: List[str], always: List[str], names) -> List[str]:
     """Kept columns in file order: `always` plus every exact or glob match of names."""
     if names is None:
         return list(all_names)
-    if isinstance(names, str):
-        names = [names]
+    names = name_list(names, "measure")
     chosen = set(always)
     for req in names:
         hits = _matches(all_names, req)

@@ -78,14 +78,14 @@ class TestBreakpoints(unittest.TestCase):
 
     def test_straight_lines_need_two_samples(self):
         t, sig = signals()
-        keep, reached = reduce.breakpoints(t, [sig["ramp"]], [3.0], 0.0, floor=4 * np.finfo(float).eps)
+        keep, reached = reduce.breakpoints(t, [sig["ramp"]], [3.0], 0.0, eps=np.finfo(float).eps)
         self.assertEqual(keep.tolist(), [0, t.size - 1])
         self.assertLess(reached, 1e-12)                          # rounding only
 
     def test_tolerance_zero_keeps_every_corner(self):
         t = np.arange(7.0)
         y = np.array([0.0, 1, 2, 2, 2, 5, 8])                   # corners at 2, 4; 1, 3, 6 lie on lines
-        keep, _ = reduce.breakpoints(t, [y], [8.0], 0.0, floor=4 * np.finfo(float).eps)
+        keep, _ = reduce.breakpoints(t, [y], [8.0], 0.0, eps=np.finfo(float).eps)
         self.assertEqual(keep.tolist(), [0, 2, 4, 6])
 
     def test_budget_keeps_the_worst_first_and_reports_the_error_left(self):
@@ -447,6 +447,130 @@ class TestEnvelopeFallback(unittest.TestCase):
         self.assertEqual((env["from"][0], env["to"][-1]), (0.0, 1e-6))
         self.assertEqual((min(env["min"]), max(env["max"])), (entry["min"], entry["max"]))
         json.dumps(s, allow_nan=False)
+
+
+class TestBugHuntRegressions(unittest.TestCase):
+    """Edge cases found by a bug hunt over the reduction and the outputs built on it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        from spice_result_parser import mcp_server
+        self.m = mcp_server
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_flat_nested_sweep_keeps_every_inner_curve(self):
+        # x restarts 8 times; two kept samples at the same x must not hide the curves between them
+        inner, outer = np.linspace(0, 1.8, 16), np.linspace(0.5, 3, 8)
+        x = np.tile(inner, outer.size)
+        y = np.concatenate([np.sin(inner * o * 3) for o in outer])
+        keep, reached = reduce.breakpoints(x, [y], [reduce.finite_span([y])], 0.01)
+        self.assertLessEqual(reached, 0.01)
+        self.assertEqual(sorted(set((keep // inner.size).tolist())), list(range(outer.size)))
+        for a, b in zip(keep[:-1], keep[1:]):                      # every gap: one run, or a straight index line
+            inside = np.arange(a + 1, b)
+            if inside.size and x[a] == x[b] and np.ptp(x[a:b + 1]) > 0:
+                line = y[a] + (y[b] - y[a]) * (inside - a) / (b - a)
+                self.assertLessEqual(np.abs(y[inside] - line).max(), 0.01 * np.ptp(y) + 1e-12)
+
+    def test_tolerance_zero_ignores_rounding_whatever_the_offset(self):
+        t = np.linspace(0, 1e-6, 401)
+        for offset in (0.0, 1.0, 1e6):
+            v = offset + 1e-3 * t / 1e-6
+            keep, _ = reduce.breakpoints(t, [v], [reduce.finite_span([v])], 0.0, eps=np.finfo(np.float64).eps)
+            self.assertEqual(keep.tolist(), [0, 400], offset)
+        v32 = (1.0 + 1e-3 * t / 1e-6).astype(np.float32)
+        keep, _ = reduce.breakpoints(t, [v32], [reduce.finite_span([v32])], 0.0, eps=np.finfo(np.float32).eps)
+        self.assertLess(keep.size, 10)                              # float32 steps are not corners
+
+    def test_a_repeated_name_is_still_a_magnitude(self):
+        h = read_traces(HERE / "test_9601.ac0", ["v(vo)"]).header
+        self.assertTrue(reduce.in_db(h, "v_a_b_Mag#3"))
+        self.assertFalse(reduce.in_db(h, "v_a_b_Phase#4"))
+
+    def test_summary_envelope_bounds_are_exact_and_within_budget(self):
+        t = 1e-3 + np.arange(20_001) * 5e-12                     # a 5 GHz clock, 1 ms into the run
+        v = 0.6 + 0.6 * np.sign(np.sin(2 * np.pi * 5e9 * t + 0.1))
+        path = self.dir / "clk.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(clk"], [1, 1], [([], np.c_[t, v])])
+        env = api.extract(path, output="summary", tolerance=0.01)["stats"]["v_clk"][0]["envelope"]
+        self.assertEqual(len(set(env["from"])), len(env["from"]))  # no two slices print alike
+        self.assertTrue(all(a < b for a, b in zip(env["from"], env["to"])))
+        one = api.extract(path, output="summary", downsample=2)["stats"]["v_clk"][0]["envelope"]
+        self.assertEqual(len(one["from"]), 1)                       # 2 points' worth: 1 slice
+
+    def test_a_downward_sweep_is_one_run(self):
+        x = np.linspace(1.8, 0.0, 25)
+        path = self.dir / "desc.sw0"
+        fixtures.write_binary(path, "2001", ["vin", "v(out"], [3, 1], [([], np.c_[x, 1.8 - x])])
+        text = self.m.format_text(read_traces(path))
+        self.assertNotIn("run ", text)
+        self.assertNotIn("not shown", text)
+        self.assertIn("25 points (2 shown", text.splitlines()[0])
+        # a nested sweep whose inner variable runs downwards: three runs, not thirteen
+        inner = np.array([1.0, 0.75, 0.5, 0.25, 0.0])
+        x = np.tile(inner, 3)
+        raw = self.dir / "nested_desc.raw"
+        fixtures.write_nutmeg(raw, [("DC transfer characteristic", ["v-sweep", "v(out)"],
+                                     np.c_[x, np.concatenate([inner * (1 + o) for o in (0, .5, 1)])], False)])
+        heads = [l for l in self.m.format_text(read_traces(raw)).splitlines() if l.startswith("-- run")]
+        self.assertEqual(heads, [f"-- run {k} of 3 (x restarts) --" for k in (1, 2, 3)])
+
+    def test_close_x_values_print_apart(self):
+        # the repo's 2001 sample has samples 25 ns apart at t = 100 us: 6 digits printed them alike
+        text = self.m.format_text(read_traces(HERE / "test_2001.tr0", ["v(vs"]), tolerance=0)
+        lines = text.splitlines()
+        start = next(i for i, l in enumerate(lines) if l.split()[:1] in (["TIME"], ["TIME_from"]))
+        xs = [l.split()[0] for l in lines[start + 1:]]
+        self.assertEqual(len(xs), len(set(xs)), "two rows print the same x")
+        t = 1e-3 + np.arange(2001) * 5e-11                         # a 100 ns window at 1 ms
+        path = self.dir / "late.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(a"], [1, 1], [([], np.c_[t, np.sin(t * 1e8)])])
+        head = self.m.format_text(read_traces(path)).splitlines()[0]
+        self.assertIn("x: TIME in [0.001, 0.0010001]", head)
+
+    def test_a_small_ripple_on_a_large_value_shows(self):
+        t = np.linspace(0, 1e-6, 2001)
+        v = 1.2 + 1e-6 * np.sin(2 * np.pi * 3e6 * t)               # 1 uV ripple on a 1.2 V rail
+        path = self.dir / "rail.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(vdd"], [1, 1], [([], np.c_[t, v])])
+        text = self.m.format_text(read_traces(path))
+        lines = text.splitlines()
+        start = next(i for i, l in enumerate(lines) if l.split()[:1] == ["TIME"])
+        ys = {l.split()[1] for l in lines[start + 1:]}
+        self.assertGreater(len(ys), 5)                              # not "1.2" on every row
+        stats = next(l.split() for l in lines if l.split()[:1] == ["v_vdd"])
+        self.assertNotEqual(stats[1], stats[2])                     # min and max print apart
+
+    def test_png_draws_every_point_whatever_downsample_says(self):
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest("matplotlib not installed")
+        t = np.linspace(0, 1e-6, 100_001)
+        v = np.zeros_like(t)
+        v[33_350] = 1.0
+        path = self.dir / "glitch.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(out"], [1, 1], [([], np.c_[t, v])])
+        out = self.m.extract(str(path), ["v(out"], output="png", downsample=1000, dest=str(self.dir / "g.png"))
+        self.assertEqual((out["points"], out["ranges"]["v_out"]), (100_001, [0.0, 1.0]))
+        self.assertTrue(api.extract(path, ["v(out"], output="png", downsample=1000, dest=str(self.dir / "h.png")))
+
+    def test_dest_is_checked_before_the_read(self):
+        from unittest import mock
+        src = str(HERE / "test_9601.tr0")
+        with mock.patch.object(api, "read_traces", side_effect=AssertionError("read first")):
+            for dest, why in (("", "dest is empty"), (str(self.dir / "nodir") + "/", "is a directory"),
+                              (src + "/.", "is a directory"), (str(self.dir / "no" / "o.csv"), "does not exist")):
+                with self.assertRaisesRegex(ValueError, why):
+                    api.extract(src, output="csv", dest=dest)
+
+    def test_a_file_without_data_says_so(self):
+        path = self.dir / "started.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(a"], [1, 1], [([], np.empty((0, 2)))], final_sentinel=False)
+        self.assertEqual(self.m.format_text(read_traces(path)).splitlines()[-1], "the file holds no data point")
 
 
 class TestMcpTolerance(unittest.TestCase):
