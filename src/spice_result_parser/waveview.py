@@ -75,6 +75,17 @@ class WaveViewError(RuntimeError):
     """WaveView could not be run, or a script did not finish; the text quotes WaveView's console."""
 
 
+class ValueLimitError(ValueError):
+    """extract.tcl stopped at the limit of values that the caller set (max_values of read_traces).
+    values: the values of the rows that fit. trace: the WaveView trace where it stopped. x: the
+    x of the last row that fits in that trace (None: no row fits). x_name: the name of x."""
+
+    def __init__(self, path: str, limit: int, values: int, trace: int, x: Optional[float], x_name: str):
+        self.limit, self.values, self.trace, self.x, self.x_name = limit, values, trace, x, x_name
+        where = "before its first point" if x is None else f"at {x_name} = {x:.6g}"
+        super().__init__(f"{path}: WaveView stopped at the limit of {limit:,} values, in sweep {trace} {where}")
+
+
 def resolve_engine(engine: Optional[str] = None) -> str:
     """The engine to use: `engine` if given, else the SRP_ENGINE environment variable, else "python"."""
     if engine is None:
@@ -198,13 +209,14 @@ atexit.register(stop_all)
 
 
 def _run(name: str, path: str, signals: Optional[List[str]] = None, xcheck: bool = False,
-         npoints_all: bool = False) -> Tuple[str, int, str]:
+         npoints_all: bool = False, max_values: Optional[int] = None) -> Tuple[str, int, str]:
     """Run a script on `path`; return its output, the offset of the final srp_done, where
     the records end, and the console. The text is not sliced: an extract output can be large.
 
     signals: exact WaveView names written to SRP_SIGNALS, one per line; None leaves it unset.
     xcheck: set SRP_XCHECK (extract.tcl checks that all signals have the same x points).
     npoints_all: set SRP_NPOINTS=all (extract.tcl writes the point count of every signal).
+    max_values: set SRP_MAX_VALUES (extract.tcl stops before a row would go past it).
     Raises WaveViewError when the output has no srp_done or holds an error record.
     """
     # A WaveView that outlives a timeout can hold files in tmp (Windows): the clean-up must
@@ -223,6 +235,8 @@ def _run(name: str, path: str, signals: Optional[List[str]] = None, xcheck: bool
             env["SRP_XCHECK"] = "1"
         if npoints_all:
             env["SRP_NPOINTS"] = "all"
+        if max_values is not None:
+            env["SRP_MAX_VALUES"] = str(int(max_values))
         if signals is not None:
             env["SRP_SIGNALS"] = os.path.join(tmp, "signals.txt")
             with open(env["SRP_SIGNALS"], "w", encoding="utf-8", newline="\n") as f:
@@ -585,16 +599,19 @@ def _parse_points(text: str, end: int, path: str) -> List[Tuple[np.ndarray, Dict
 class _ExportInfo:
     """The records of extract.tcl that hold no values."""
     npoints: Dict[str, int] = field(default_factory=dict)  # WaveView name -> -npoints (one more per sweep)
+    limit: Optional[Tuple[int, int, Optional[float]]] = None  # SRP_MAX_VALUES: (values, trace, last x)
 
 
 def _export_info(text: str, end: int) -> _ExportInfo:
     """The records of extract.tcl output up to `end` that hold no values (_INFO_RECORDS)."""
     info = _ExportInfo()
     for mark in _RECORD.finditer(text, 0, end):
-        if mark.group(1) == "npoints":
-            name, _, count = mark.group(2).rpartition("\t")
-            if count.isdigit():
-                info.npoints[name] = int(count)
+        kind, fields = mark.group(1), mark.group(2).split("\t")
+        if kind == "npoints" and len(fields) == 2 and fields[1].isdigit():
+            info.npoints[fields[0]] = int(fields[1])
+        elif kind == "limit" and len(fields) == 3:
+            x = float(_WINDOWS_SPECIAL.sub(_special, fields[2])) if fields[2] else None
+            info.limit = (int(fields[0]), int(fields[1]), x)
     return info
 
 
@@ -648,12 +665,16 @@ def _condition_values(values: List[str], params: List[str], path: str) -> List[f
 
 
 def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
-                ac_format: str = "magphase") -> TraceSet:
+                ac_format: str = "magphase", max_values: Optional[int] = None) -> TraceSet:
     """Read selected traces through WaveView (see reader.read_traces for the arguments).
 
     Two WaveView runs: list_traces.tcl for the names, then extract.tcl for every point of
     the selected signals. The sweeps filter and the closed xrange window are applied
     afterwards, so memory follows the selected signals times all their points.
+
+    max_values: the most values that extract.tcl writes. A point of x counts its whole
+    row: x, 1 per real and 2 per complex signal. When the next row would go past it,
+    this raises ValueLimitError (a ValueError). None: no limit.
     """
     path = os.fspath(path)
     check_ac_format(ac_format)
@@ -681,8 +702,12 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
         wv_name = listing.columns[c][0]
         if wv_name not in signals:
             signals.append(wv_name)
-    text, end, _ = _run("extract.tcl", path, signals, xcheck=not listing.shared_x, npoints_all=listing.incomplete)
+    text, end, _ = _run("extract.tcl", path, signals, xcheck=not listing.shared_x, npoints_all=listing.incomplete,
+                        max_values=max_values)
     info = _export_info(text, end)
+    if info.limit is not None:
+        del text
+        raise ValueLimitError(path, int(max_values), *info.limit, header.x_name)
     traces = _parse_points(text, end, path)
     del text
     if len(traces) > listing.ntraces:   # the simulator ended a sweep between the two WaveView runs
@@ -774,13 +799,13 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
     )
 
 
-def scan(path, plot: int = 0, ac_format: str = "magphase", names=None) -> Scan:
+def scan(path, plot: int = 0, ac_format: str = "magphase", names=None, max_values: Optional[int] = None) -> Scan:
     """What list_traces reports, from every point of the selected traces (see reader.scan:
     sweeps, points per sweep, the x range and each trace's [min, max], NaN skipped).
 
     WaveView has no pass that keeps nothing, so this reads the selected traces into
-    memory, as read_traces does, and ranges them."""
-    ts = read_traces(path, names, None, plot, None, ac_format)
+    memory, as read_traces does, and ranges them. max_values: see read_traces."""
+    ts = read_traces(path, names, None, plot, None, ac_format, max_values)
     x = ts.data[ts.header.x_name]
     ranges = {name: _bounds(ts.data[name]) for name in ts.selected[1:]}
     return Scan(header=ts.header, sweep_values=ts.sweep_values, sweep_points=[int(a.size) for a in x],

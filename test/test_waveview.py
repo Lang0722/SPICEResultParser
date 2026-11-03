@@ -616,6 +616,34 @@ class TestReadTraces(FakeWaveView):
                     waveview.read_traces(path, ["v(vo"])
                 self.assertEqual(run.call_args_list[-1].args[1].get("SRP_NPOINTS"), want, path)
 
+    def test_value_limit(self):
+        # A point of the x column counts its whole row: x and v(vo), 2 values. 50 rows fit in 101.
+        x = read_traces(TR).data["TIME"][0]
+        with self.assertRaises(waveview.ValueLimitError) as caught:
+            waveview.read_traces(TR, ["v(vo"], max_values=101)
+        err = caught.exception
+        self.assertIsInstance(err, ValueError)
+        self.assertEqual((err.limit, err.values, err.trace, err.x, err.x_name), (101, 100, 0, float(x[49]), "TIME"))
+        self.assertRegex(str(err), r"WaveView stopped at the limit of 101 values, in sweep 0 at TIME = ")
+        with self.assertRaisesRegex(waveview.ValueLimitError, r"in sweep 0 before its first point$"):
+            waveview.read_traces(TR, ["v(vo"], max_values=1)
+        # 2 x 2605 = 5210 values
+        self.assert_same_traces(waveview.read_traces(TR, ["v(vo"], max_values=5210), read_traces(TR, ["v(vo"]))
+        with self.assertRaises(waveview.ValueLimitError):
+            waveview.read_traces(TR, ["v(vo"], max_values=5209)
+
+    def test_value_limit_counts_a_complex_value_twice(self):
+        ts = read_traces(WV / "rc.ac0", ["v(out"])
+        n = sum(a.size for a in ts.data[ts.header.x_name])      # x, then a real and an imaginary part
+        waveview.read_traces(WV / "rc.ac0", ["v(out"], max_values=3 * n)
+        with self.assertRaises(waveview.ValueLimitError):
+            waveview.read_traces(WV / "rc.ac0", ["v(out"], max_values=3 * n - 1)
+
+    def test_api_extract_passes_the_limit_to_waveview_only(self):
+        with self.assertRaises(waveview.ValueLimitError):
+            api.extract(TR, "v(vo", engine="waveview", max_values=101)
+        api.extract(TR, "v(vo", engine="python", max_values=101)
+
     def test_truncated_sweep(self):
         # rc9.tr0 cut inside sweep 1: WaveView reads sweep 0 only, the header declares 3.
         with tempfile.TemporaryDirectory() as tmp:

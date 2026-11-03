@@ -14,7 +14,8 @@ the error record of the scripts.
 
 For extract.tcl the fake also writes what the script writes and the canned output has
 not: the npoints records (see with_counts). They come from the canned listing of the
-same file, which holds WaveView's real -npoints values.
+same file, which holds WaveView's real -npoints values. It also applies SRP_MAX_VALUES
+as the script does (see limited).
 
 SRP_FAKE_WV selects a failure: "no_done" (the script stops on a Tcl error; exit code 1),
 "silent" (no output file at all), "sleep" (never finishes), "launcher" (never finishes,
@@ -86,6 +87,35 @@ def with_counts(lines, source, signals):
     return lines[:end] + records + lines[end:]
 
 
+def limited(lines, limit):
+    """Stop before a row would go past the limit, as extract.tcl does: a point of the x
+    column counts its whole row (x, 1 per real and 2 per complex signal of the trace)."""
+    widths = {}
+    trace = None
+    for line in lines:
+        kind, _, value = line.rstrip(b"\r\n").partition(b"\t")
+        if kind == b"trace":
+            trace = value
+            widths[trace] = 1
+        elif kind in (b"real", b"complex") and trace is not None:
+            widths[trace] += 1 if kind == b"real" else 2
+    kept, count, trace, in_x, last = [], 0, None, False, b""
+    for line in lines:
+        text = line.rstrip(b"\r\n")
+        if b"\t" in text:
+            kind, _, value = text.partition(b"\t")
+            if kind == b"trace":
+                trace, last = value, b""
+            in_x = kind == b"x"
+        elif in_x and text != b"srp_done":
+            if count + widths[trace] > limit:
+                return kept + [b"limit\t%d\t%s\t%s\r\n" % (count, trace, last), b"srp_done\r\n"]
+            count += widths[trace]
+            last = text
+        kept.append(line)
+    return kept
+
+
 def main(argv) -> int:
     script = os.path.splitext(os.path.basename(argv[-1]))[0]
     open(os.path.join(os.path.dirname(os.path.abspath(argv[-1])), "ace_tcl.log"), "wb").close()  # as WaveView
@@ -116,6 +146,8 @@ def main(argv) -> int:
         lines = sliced(lines, signals)
     if script == "extract":
         lines = with_counts(lines, source, signals)
+        if "SRP_MAX_VALUES" in os.environ:
+            lines = limited(lines, int(os.environ["SRP_MAX_VALUES"]))
     if mode == "no_done":
         lines = lines[:len(lines) // 2]
         console += TCL_ERROR

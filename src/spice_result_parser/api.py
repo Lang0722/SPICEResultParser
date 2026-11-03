@@ -681,7 +681,7 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
             downsample: Optional[int] = None, dest=None,
             xrange: Optional[Sequence[float]] = None, yrange: Optional[Sequence[float]] = None,
             plot: int = 0, ac_format: str = "magphase", tolerance: Optional[float] = None,
-            engine: Optional[str] = None):
+            engine: Optional[str] = None, max_values: Optional[int] = None):
     """Read selected traces and return them as arrays, a summary dict, or a written file path.
 
     xrange=(lo, hi) keeps only the rows whose x value (TIME, FREQ or the sweep
@@ -703,6 +703,9 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
     WaveView in batch mode, see waveview.py: it reads every point of the selected
     traces, then applies xrange). None uses the SRP_ENGINE environment variable, else
     "python".
+    max_values (WaveView only, see waveview.read_traces): the most values that WaveView
+    writes. At the limit, extract raises waveview.ValueLimitError (a ValueError). The
+    Python engine ignores it.
     """
     if output not in OUTPUTS:
         raise ValueError(f"output must be one of {OUTPUTS}, not {output!r}")
@@ -718,7 +721,10 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
         raise ValueError(f"dest applies to csv, npz and png only, not to output={output!r}")
     if output == "png":
         _require_matplotlib()
-    ts = read(path, names, sweeps, plot, xrange, ac_format)
+    if read is waveview.read_traces:
+        ts = read(path, names, sweeps, plot, xrange, ac_format, max_values=max_values)
+    else:
+        ts = read(path, names, sweeps, plot, xrange, ac_format)
     if output == "summary":
         return summarize(ts, downsample, tolerance)
     if downsample is not None and output != "png":  # png draws every point's envelope instead

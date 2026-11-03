@@ -18,6 +18,9 @@
 #                     the same x points (see write_points).
 #         SRP_NPOINTS optional: "all" writes the npoints record of every signal,
 #                     not only of the x signal and the written signals.
+#         SRP_MAX_VALUES optional: the most values that the script writes. An x
+#                     or real value is 1, a complex value 2. The x scan counts each
+#                     point as its whole row: x and the value of each written signal.
 # Output: SRP_OUT     a text file. Records have a tab; value lines do not:
 #   srp_extract 1
 #   trace   <i>           0-based; one per sweep trace, one when not swept
@@ -25,6 +28,10 @@
 #   real    <signal>      then the y value of each point, one per line
 #   complex <signal>      then "<real part> <imaginary part>" per point
 #   ...                   (the signals in the order of the file)
+#   limit   <values> <trace> <x>
+#                         in place of the rest, when the next row would go past
+#                         SRP_MAX_VALUES: the values of the rows that fit, the trace,
+#                         and the x of the last row that fits in it (empty: none)
 #   npoints <signal> <n>  after the last trace: WaveView's point count of the x
 #                         signal and of each written signal, in the order of the
 #                         file, each once (in a swept file one more per sweep)
@@ -61,10 +68,11 @@ proc clean {name} {
 # SRP_XCHECK, the x scan keeps its values in xs, and a y scan compares its x
 # values with them: all the signals of the trace must have the same x points.
 # The check costs time, so waveview.py sets SRP_XCHECK only for a file whose
-# format does not give one x to all signals. The loops are in a proc so that
-# Tcl compiles them.
+# format does not give one x to all signals. With SRP_MAX_VALUES, the x scan
+# counts the values of each row (see stop_at_limit). The loops are in a proc so
+# that Tcl compiles them.
 proc write_points {sig trace swept kind} {
-    global out xs xname xcheck
+    global out xs xname xcheck limit count width
     set scan [sx_scan_data_points $sig POINT]
     if {$swept} {
         set more [sx_jump_to_x $scan FIRST -trace $trace]
@@ -73,17 +81,20 @@ proc write_points {sig trace swept kind} {
     }
     set k 0
     set n [llength $xs]
-    if {$kind == "x" && $xcheck} {
+    if {$kind == "x"} {
         set xs {}
+        set last ""
         while {$more == 1} {
             set x [sx_x_value $scan]
-            lappend xs $x
+            if {$limit >= 0 && $count + $width > $limit} {
+                stop_at_limit $trace $last
+            }
+            incr count $width
+            if {$xcheck} {
+                lappend xs $x
+            }
             puts $out $x
-            set more [sx_jump_to_x $scan NEXT]
-        }
-    } elseif {$kind == "x"} {
-        while {$more == 1} {
-            puts $out [sx_x_value $scan]
+            set last $x
             set more [sx_jump_to_x $scan NEXT]
         }
     } elseif {$kind == "complex"} {
@@ -110,6 +121,15 @@ proc write_points {sig trace swept kind} {
         finish "the signals have their own x points (an HSPICE post=3 file, for example):\
             [clean [sx_get_name $sig]] has other x points than $xname; extract one signal at a time"
     }
+}
+
+# Before a row would go past SRP_MAX_VALUES: write the values of the rows that fit,
+# the trace and the x of its last row that fits (empty when none), and end. The
+# signals have the rows of the x scan, so their scans do not count.
+proc stop_at_limit {trace last} {
+    global out count
+    puts $out "limit\t$count\t$trace\t$last"
+    finish
 }
 
 # sx_open_sim_file_read splits its argument as a Tcl list: pass one element, in
@@ -188,6 +208,19 @@ if {[llength $sigs] > 0} {
 set xname $nameof($xsig)
 set xs {}
 set xcheck [info exists env(SRP_XCHECK)]
+set limit -1
+if {[info exists env(SRP_MAX_VALUES)]} {
+    set limit $env(SRP_MAX_VALUES)
+}
+set count 0
+set width 1
+foreach s $sigs {
+    if {[sx_signal_attribute $s -datatype] == "complex"} {
+        incr width 2
+    } else {
+        incr width
+    }
+}
 puts $out "srp_extract\t1"
 for {set i 0} {$i < $ntrace} {incr i} {
     puts $out "trace\t$i"
