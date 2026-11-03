@@ -1,0 +1,12 @@
+srp_extract	1
+trace	0
+x	v(0)
+0.0
+4.0000000000000002e-009
+real	v(0)
+0.0
+0.0
+real	v(a)
+0.0
+error	the signals have their own x points (an HSPICE post=3 file, for example): v(a) has other x points than v(0); extract one signal at a time
+srp_done

@@ -1,0 +1,5 @@
+$DATA1 SOURCE='HSPICE' VERSION='P-2019.06-SP1-1 win64' PARAM_COUNT=1
+.TITLE '* rc sweep test'
+ cval             f3db             temper           alter#          
+  1.000e-09        1.588e+05         25.0000        1               
+  2.000e-09        7.939e+04         25.0000        1               

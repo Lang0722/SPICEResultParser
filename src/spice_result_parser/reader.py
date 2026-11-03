@@ -14,7 +14,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 import numpy as np
 
 _DTYPE = {"9601": np.dtype("<f4"), "2001": np.dtype("<f8"), "ascii": np.dtype("<f8"),
-          "nutmeg": np.dtype("<f8")}
+          "nutmeg": np.dtype("<f8"), "waveview": np.dtype("<f8")}
 _ANALYSIS_BY_TYPE_CODE = {1: "tr", 2: "ac", 3: "sw"}
 _TERMINATOR = "$&%#"
 _FRAME_OVERHEAD = 20            # 16-byte block head + 4-byte block tail
@@ -35,7 +35,7 @@ AC_FORMATS = {"magphase": ("Mag", "Phase"), "db": ("dB", "Phase"), "realimag": (
 class Header:
     path: str
     is_binary: bool
-    version: str            # "9601" | "2001" | "ascii" | "nutmeg"
+    version: str            # "9601" | "2001" | "ascii" | "nutmeg" | "waveview" (read by waveview.py)
     analysis: str           # "tr" | "sw" | "ac" (Nutmeg adds "op", "noise", "other")
     ncols: int              # values per point in the data stream
     nsweepparam: int
@@ -224,32 +224,33 @@ def _build_header(path: str, is_bin: bool, version: str, nauto: int, nprobe: int
     )
 
 
-def _short_block(index: int, payload: bytes, itemsize: int) -> bytes:
+def _short_block(index: int, payload: bytes, itemsize: int, warn: bool = True) -> bytes:
     """A block cut short by EOF: warn and keep whole values only."""
     kept = len(payload) - len(payload) % itemsize
-    warnings.warn(
-        f"block {index}: file ends mid-block; keeping {kept} of {len(payload)} payload bytes",
-        RuntimeWarning,
-    )
+    if warn:
+        warnings.warn(f"block {index}: file ends mid-block; keeping {kept} of {len(payload)} payload bytes",
+                      RuntimeWarning)
     return payload[:kept]
 
 
-def _read_block(f, index: int, itemsize: int = 1, cut: Optional[list] = None) -> Optional[bytes]:
+def _read_block(f, index: int, itemsize: int = 1, cut: Optional[list] = None,
+                warn: bool = True) -> Optional[bytes]:
     """Read one framed block (16-byte head, payload, 4-byte tail). None at EOF.
 
     A file that ends inside a block is what a file still being written by the simulator
     looks like, not corruption: a block cut in its payload or tail is returned truncated
     to a whole number of values, and one cut in its head ends the data (None). Either way
-    a warning says so and `cut`, when given, records where: ("head" | "payload" |
-    "tail", index). A tail that is present but disagrees with the head is corruption and
-    raises.
+    a warning says so (unless warn is False: a header read raises instead) and `cut`,
+    when given, records where: ("head" | "payload" | "tail", index). A tail that is
+    present but disagrees with the head is corruption and raises.
     """
     head = f.read(16)
     if not head:
         return None
     if len(head) < 16:
-        warnings.warn(f"block {index}: file ends inside the block head; keeping the blocks before it",
-                      RuntimeWarning)
+        if warn:
+            warnings.warn(f"block {index}: file ends inside the block head; keeping the blocks before it",
+                          RuntimeWarning)
         if cut is not None:
             cut.append(("head", index))
         return None
@@ -260,12 +261,12 @@ def _read_block(f, index: int, itemsize: int = 1, cut: Optional[list] = None) ->
     if len(payload) < size:
         if cut is not None:
             cut.append(("payload", index))
-        return _short_block(index, payload, itemsize)
+        return _short_block(index, payload, itemsize, warn)
     tail = f.read(4)
     if len(tail) < 4:
         if cut is not None:
             cut.append(("tail", index))
-        return _short_block(index, payload, itemsize)
+        return _short_block(index, payload, itemsize, warn)
     if struct.unpack("<i", tail)[0] != size:
         raise ValueError(f"block {index}: tail length does not match head length {size}")
     return payload
@@ -273,9 +274,7 @@ def _read_block(f, index: int, itemsize: int = 1, cut: Optional[list] = None) ->
 
 def _read_binary_header(f, path: str, ac_format: str = "magphase") -> Header:
     cut: list = []
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)     # an incomplete header raises below
-        payload = _read_block(f, 0, 1, cut)
+    payload = _read_block(f, 0, 1, cut, warn=False)        # an incomplete header raises below
     incomplete = ValueError(f"{path}: the header is incomplete (the file ends inside it); the simulator "
                             f"may still be writing it")
     if payload is None:
@@ -290,19 +289,47 @@ def _read_binary_header(f, path: str, ac_format: str = "magphase") -> Header:
     version = text[20:24].strip() or text[16:20].strip()
     if version not in ("9601", "2001"):
         raise ValueError(f"{path}: unsupported post_version {version!r}; only 9601 and 2001 are supported")
-    tokens = _sweep_count_and_variables(path, payload, text)
-    if tokens and tokens[-1] == _TERMINATOR:
-        tokens = tokens[:-1]
+    payload = _header_continuation(f, path, payload)
+    tokens = _sweep_count_and_variables(path, payload, payload.decode("utf-8", errors="replace"))
+    if _TERMINATOR in tokens:
+        tokens = tokens[:tokens.index(_TERMINATOR)]
     if not tokens:
         raise ValueError(f"{path}: header has no variable list")
     return _build_header(path, True, version, nauto, nprobe, nsweepparam, int(tokens[0]), tokens[1:],
                          ac_format)
 
 
+def _header_continuation(f, path: str, first: bytes) -> bytes:
+    """The header text of every header block, from `first` (block 0's payload) on.
+
+    A header longer than one block (about 8 KB of text) goes on in the next blocks, each
+    cut at a name field, until the block that holds the terminator. A block with a NUL
+    byte is a data block: the header then has no terminator and is read as it is, with
+    f left at that block. A file that ends before the terminator is a header still being
+    written.
+    """
+    end = _TERMINATOR.encode()
+    blocks, recent, index = [first], first, 1
+    while end not in recent:
+        start = f.tell()
+        cut: list = []
+        more = _read_block(f, index, 1, cut, warn=False)    # a cut header block raises below
+        if more is not None and b"\0" in more:
+            f.seek(start)
+            break
+        if more is None or (cut and cut[0][0] != "tail"):
+            raise ValueError(f"{path}: the header is incomplete (the file ends before its terminator "
+                             f"{_TERMINATOR}); the simulator may still be writing it")
+        recent = blocks[-1][-len(end) + 1:] + more       # the terminator can be split over two blocks
+        blocks.append(more)
+        index += 1
+    return b"".join(blocks)
+
+
 # HSPICE writes its header in fixed columns: the counts and the version in 0-23, the title
 # in 24-87, date and time in 88-111, the copyright notice in 112-176, and the sweep count
 # right-aligned in 177-187. The variable list (type codes, names, sweep parameters) starts
-# after column 255. Every release seen (2011, 2013, 2020 and 2021, in 9601 and 2001) keeps
+# after column 255. Every release seen (2011, 2013, 2019, 2020, 2021; 9601 and 2001) keeps
 # these columns. Only the notice changes: H-2013.03 blanks all of it but "erved.", so
 # searching it for "Reserved." fails.
 _SWEEP_COUNT_END = 188

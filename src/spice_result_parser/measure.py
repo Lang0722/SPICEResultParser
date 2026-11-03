@@ -2,7 +2,7 @@
 
 A measure file is text:
 
-    $DATA1 SOURCE='HSPICE' VERSION='...' PARAM_COUNT=1
+    $DATA1 SOURCE='HSPICE' VERSION='...' PARAM_COUNT=2
     .TITLE '* inverter delay'
      index    vdd      tpd        temper   alter#
      1.0000   0.9000   2.345e-11  25.0000  1.0000
@@ -10,8 +10,8 @@ A measure file is text:
 
 The names run until `alter#`; then every row holds one value per name, wrapped over
 as many lines as the simulator likes. A measure that could not be evaluated is written
-as `failed`. When the run was swept the first column is `index`, followed by the
-PARAM_COUNT swept parameters.
+as `failed`. PARAM_COUNT counts the leading columns that identify a row: `index` (a
+`.data` sweep or Monte Carlo writes it) and the swept parameters.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import os
 import re
 import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -58,6 +58,33 @@ def _to_float(token: str, path: str) -> float:
         raise ValueError(f"{path}: measure value {token!r} is not a number") from None
 
 
+def _leading_columns(all_names: List[str], param_count: int) -> Tuple[List[str], List[str]]:
+    """(the index column if the file has one, the swept parameters). PARAM_COUNT counts
+    index too: `index rval cval tdel` with PARAM_COUNT=3 sweeps rval and cval, and
+    `rval tdel` with PARAM_COUNT=1 sweeps rval."""
+    index = all_names[:1] if all_names[:1] == ["index"] else []
+    return index, all_names[len(index):param_count]
+
+
+def _unique(path: str, names: List[str]) -> List[str]:
+    """Make the names 1:1 with columns: a repeat (a measure named as a .data parameter,
+    index or temper) gets a '#<column_index>' suffix, as reader._uniquify does for traces."""
+    seen, taken, out, repeated = set(), set(names), [], []
+    for i, name in enumerate(names):
+        if name in seen:
+            repeated.append(name)
+            name = f"{name}#{i}"
+            while name in taken:            # another column has that name (HSPICE allows '#')
+                name += f"#{i}"
+            taken.add(name)
+        seen.add(name)
+        out.append(name)
+    if repeated:
+        warnings.warn(f"{path}: repeated measure names disambiguated with '#<column>': "
+                      f"{', '.join(sorted(set(repeated)))}", RuntimeWarning)
+    return out
+
+
 def _matches(all_names: List[str], req: str) -> List[str]:
     """Exact name, else glob; then both again ignoring case, as SPICE does (HSPICE writes
     measure names in lower case, while a netlist may spell them TPD)."""
@@ -87,14 +114,21 @@ def _select(all_names: List[str], always: List[str], names) -> List[str]:
     return [n for n in all_names if n in chosen]
 
 
-def read_measures(path, names=None) -> MeasureSet:
+def read_measures(path, names=None, engine: Optional[str] = None) -> MeasureSet:
     """Read an HSPICE measure file.
 
     names: None for every column, else measure names or fnmatch globs (tp*). The `index`
     column and the swept parameters are always kept, so each row stays identifiable.
     A value written as `failed` becomes NaN and is counted in `failed`. A file that ends
     part-way through a row keeps its complete rows, with a RuntimeWarning and `truncated` True.
+    A repeated name (a measure named as a .data parameter, index or temper) gets a
+    '#<column>' suffix from its second column on (vmax#3), with a RuntimeWarning.
+    engine: "python" or "waveview" (waveview.read_measures); None uses SRP_ENGINE, else "python".
     """
+    from . import waveview          # imported here: waveview.py builds on this module
+
+    if waveview.resolve_engine(engine) == "waveview":
+        return waveview.read_measures(path, names)
     path = os.fspath(path)
     with open(path, "rb") as f:
         first = f.readline(4096).decode("utf-8", errors="replace")
@@ -114,15 +148,14 @@ def read_measures(path, names=None) -> MeasureSet:
     if _LAST_NAME not in tokens:
         raise ValueError(f"{path}: measure names do not end with {_LAST_NAME!r}")
     end = tokens.index(_LAST_NAME) + 1
-    all_names, value_tokens = tokens[:end], tokens[end:]
+    all_names, value_tokens = _unique(path, tokens[:end]), tokens[end:]
     ncols = len(all_names)
     nrows = len(value_tokens) // ncols
     if len(value_tokens) % ncols:
         warnings.warn(f"{path}: file ends with an incomplete row; keeping {nrows} complete rows",
                       RuntimeWarning)
-    first_param = 1 if all_names[0] == "index" else 0
-    params = all_names[first_param:first_param + param_count]
-    kept = _select(all_names, all_names[:first_param] + params, names)
+    index, params = _leading_columns(all_names, param_count)
+    kept = _select(all_names, index + params, names)
     table = np.array([_to_float(t, path) for t in value_tokens[:nrows * ncols]],
                      dtype=np.float64).reshape(nrows, ncols)
     failed_mask = np.array([t == "failed" for t in value_tokens[:nrows * ncols]],

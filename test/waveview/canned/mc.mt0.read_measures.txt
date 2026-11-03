@@ -1,0 +1,19 @@
+srp_measures	1
+title	* monte carlo
+column	index
+1.0
+2.0
+3.0
+column	vmax
+0.99685900000000005
+0.99733629999999995
+0.99735209999999996
+column	tr
+2.3757839999999999e-009
+2.329494e-009
+2.3278590000000004e-009
+column	temper
+25.0
+25.0
+25.0
+srp_done

@@ -119,6 +119,28 @@ class TestReleaseHeaders(unittest.TestCase):
             self.assertEqual((tokens[0], tokens[1], tokens[-1]), ("0", "2" if "ac" in name else
                                                                   "3" if "sw" in name else "1", "$&%#"))
 
+    def test_a_header_over_several_blocks_keeps_its_columns(self):
+        # HSPICE ends a header block at a name field, at about 8 KB; the columns hold in the joined text
+        names = ["TIME"] + [f"v(n{i}" for i in range(600)]
+        data = np.arange(3 * 601, dtype=np.float64).reshape(3, 601)
+        path = self.dir / "wide.tr0"
+        fixtures.write_binary(path, "2001", names, [1] * 601, [([], data)], layout="hspice",
+                              header_bytes=8176, notice=fixtures.NOTICE_2013)
+        self.assertEqual(read_header(path).raw_names, names)
+        np.testing.assert_array_equal(read_traces(path, ["v(n599"]).data["v_n599"][0], data[:, 600])
+        real = read_header(HERE / "waveview" / "l340_9.tr0")       # HSPICE P-2019.06: 8184 + 344 bytes of header
+        self.assertEqual((len(real.names), real.names[-1]), (344, "i_vin"))
+
+    def test_a_file_cut_inside_a_header_block(self):
+        path = self.dir / "cut.tr0"
+        fixtures.write_binary(path, "2001", ["TIME"] + [f"v(n{i}" for i in range(600)], [1] * 601,
+                              [([], np.ones((2, 601)))], layout="hspice", header_bytes=8176)
+        raw = path.read_bytes()
+        for end in (8176 + 20 + 10, 8176 + 20 + 16 + 100):         # in the second block's head, in its payload
+            path.write_bytes(raw[:end])
+            with self.assertRaisesRegex(ValueError, "the header is incomplete .*terminator"):
+                read_header(path)
+
     def test_other_writers_still_read_by_the_notice(self):
         # the free layout of fixtures.header_text keeps no columns, as another writer might not
         path = self.dir / "free.tr0"

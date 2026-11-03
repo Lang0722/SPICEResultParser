@@ -1,0 +1,13 @@
+srp_listing	1
+title	* noise
+xname	HERTZ
+signal	v(0)	complex	13
+signal	v(in)	complex	13
+signal	v(out)	complex	13
+signal	i(vin)	complex	13
+signal	nr(r1)	real	13
+signal	nf(r1)	real	13
+signal	nt(r1)	real	13
+signal	noise(outnoise)	real	13
+signal	noise(innoise)	real	13
+srp_done

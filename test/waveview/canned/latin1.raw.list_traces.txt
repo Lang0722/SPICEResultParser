@@ -1,0 +1,6 @@
+srp_listing	1
+title	Transient Analysis
+xname	time
+signal	v(é)	real	3
+signal	v(x)	real	3
+srp_done

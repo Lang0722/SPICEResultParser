@@ -68,12 +68,14 @@ The data section of the header block is a single long string (no newlines in the
 The variable list holds three blanks, the type codes, five blanks, then the names and the end marker:
 
 - **Type codes**: one number per variable, each in a field of 8 columns. The first code gives the analysis: 1 is transient, 2 is AC and 3 is DC sweep. The other codes give the kind of each variable, for example 1 for a node voltage and 8 for a branch current.
-- **Variable names**: one name per variable, each in a field of 16 columns. HSPICE does not write the closing parenthesis, so `v(out` is `v(out)`.
+- **Variable names**: one name per variable, each in a field of 16 columns (32 columns for a name of 16 characters or more). HSPICE does not write the closing parenthesis, so `v(out` is `v(out)`.
   - The first name is the x variable, for example `TIME`, `HERTZ` or the swept source of a `.dc` (`gg` for `.dc gg 0 1 0.1`).
   - The probe outputs come last.
 - **Sweep parameter names**: one name per sweep parameter, in a field of 16 columns.
   - **Note:** Some analyses have 2D sweeps (such as `.dc` analysis that sweeps two sources). For 2D sweeps, the second source is the sweep parameter. For example, suppose that a `.dc` analysis sweeps `gg` and `dd` and monitors `v(A)`, `v(B)`, and `v(C)`. Then the names would be: `gg v(A v(B v(C dd`.
 - **End marker**: the string `$&%#` and four blanks. The block tail follows.
+
+A long header does not fit in one block. Then HSPICE continues the header text in the next blocks, until the block that holds the terminator `$&%#`. Each of these blocks has its own block head and block tail. HSPICE ends each block at the end of a name field, at about 8 KB of text: a first block of 8168, 8176 or 8184 bytes, for example. That is about 330 short names, or fewer when the names have 16 characters or more (HSPICE gives such a name a 32-character field). The data blocks start after the block that holds the terminator. Join the text of all these blocks before you read the fields.
 
 **Example breakdown:**
 
@@ -103,7 +105,7 @@ $&%#
 
 ### The copyright notice changes with the release
 
-The columns are the same in every release that we examined: HSPICE 2011, 2013, 2020 and 2021, in the 9601 and 2001 formats. The copyright notice is different:
+The columns are the same in every release that we examined: HSPICE 2011, 2013, P-2019.06, 2020 and 2021, in the 9601 and 2001 formats. The copyright notice is different:
 
 - A 2011 file writes `Copyright (C) 2011 Synopsys, Inc. All Rights Reserved.`
 - A 2020 file writes `Copyright (c) 1986 - 2020 by Synopsys, Inc. All Rights Reserved.` This notice fills all of its columns.

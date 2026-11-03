@@ -6,13 +6,12 @@ import errno
 import math
 import operator
 import os
-import warnings
 import zipfile
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from . import reduce
+from . import reduce, waveview
 from .reader import TraceSet, nan_min_max, read_header, read_traces, resolve_columns, scan, validate_range
 from .reduce import check_tolerance
 
@@ -20,8 +19,16 @@ OUTPUTS = ("arrays", "csv", "npz", "summary", "png")
 TOLERANCE_OUTPUTS = ("text", "summary")         # the outputs whose points the reduction chooses
 
 
+def readers(engine: Optional[str] = None):
+    """(read_header, read_traces, scan) of an engine: "python" (reader.py, nutmeg.py) or
+    "waveview" (waveview.py). None uses the SRP_ENGINE environment variable, else "python"."""
+    if waveview.resolve_engine(engine) == "waveview":
+        return waveview.read_header, waveview.read_traces, waveview.scan
+    return read_header, read_traces, scan
+
+
 def list_traces(path, plot: int = 0, ac_format: str = "magphase", names=None,
-                header_only: bool = False) -> dict:
+                header_only: bool = False, engine: Optional[str] = None) -> dict:
     """What a result file holds, with the extents to choose extract's parameters from.
 
     Keys, in order: path, format, analysis, plot, plots, x, x_range, points, sweeps,
@@ -37,14 +44,18 @@ def list_traces(path, plot: int = 0, ac_format: str = "magphase", names=None,
     names narrows traces and ranges, as extract's names do (names, raw names, globs).
     plot selects one plot of a Nutmeg rawfile; plots lists every plot in it (HSPICE: []).
     ac_format names the columns of complex (AC) variables, and is what they are ranged in.
+    engine selects the reader, as in extract. The WaveView engine reports format
+    "waveview"; it has no streaming pass, so it reads every point of the selected traces
+    into memory to range them (header_only=True runs only WaveView's listing).
     """
+    read_head, _, scan_plot = readers(engine)
     if header_only:
-        h = read_header(path, plot, ac_format)
+        h = read_head(path, plot, ac_format)
         traces = [h.names[c] for c in resolve_columns(h, names) if c]
         return {"path": h.path, "format": h.version, "analysis": h.analysis, "plot": h.plot,
                 "plots": h.plot_names, "x": h.x_name, "sweeps": max(1, h.sweep_count_hint),
                 "sweep_params": h.sweep_params, "traces": traces}
-    s = scan(path, plot, ac_format, names)
+    s = scan_plot(path, plot, ac_format, names)
     h = s.header
     return {
         "path": h.path, "format": h.version, "analysis": h.analysis, "plot": h.plot,
@@ -53,6 +64,15 @@ def list_traces(path, plot: int = 0, ac_format: str = "magphase", names=None,
         "sweep_values": _json_sweep_values(s.sweep_values, h.dtype), "truncated": s.truncated,
         "traces": list(s.ranges), "ranges": {name: _json_range(b) for name, b in s.ranges.items()},
     }
+
+
+def value_eps(ts: TraceSet) -> float:
+    """The relative rounding step of the values read: float32's for data stored in float32
+    (HSPICE 9601), else float64's. Taken from the arrays, not the header, so that every
+    engine gets the precision of its data; the reduction allows this much rounding."""
+    steps = [float(np.finfo(a.dtype).eps) for name in ts.selected for a in ts.data[name]
+             if np.issubdtype(a.dtype, np.floating)]
+    return max(steps) if steps else float(np.finfo(ts.header.dtype).eps)
 
 
 def decimation_indices(n: int, downsample: Optional[int]):
@@ -124,10 +144,12 @@ def _json_sweep_values(sweep_values, dtype) -> List[List[Optional[float]]]:
 
 
 def nan_stats(a: np.ndarray) -> Tuple[float, float, float]:
-    """(min, max, mean) over the values that are not NaN; NaN for each when there are none."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)     # all-NaN slice / mean of empty slice
-        return np.nanmin(a), np.nanmax(a), np.nanmean(a)
+    """(min, max, mean) over the values that are not NaN; NaN for each when there are none.
+    No warnings filter (it is not safe in threads): the NaN are dropped first."""
+    kept = a[~np.isnan(a)]
+    if not kept.size:
+        return math.nan, math.nan, math.nan
+    return kept.min(), kept.max(), kept.mean()
 
 
 def range_of(arrays) -> Tuple:
@@ -143,9 +165,8 @@ def _nan_mean(a: np.ndarray) -> float:
     """Mean of the values that are not NaN, accumulated in float64; NaN when there are none."""
     mean = a.mean(dtype=np.float64)
     if math.isnan(mean):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)  # mean of empty slice
-            mean = np.nanmean(a, dtype=np.float64)
+        kept = a[~np.isnan(a)]                  # not np.nanmean: it warns on an empty slice
+        mean = kept.mean(dtype=np.float64) if kept.size else math.nan
     return mean
 
 
@@ -197,7 +218,7 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None, tolerance: Optiona
         if downsample is not None:
             cap = min(cap, downsample)
         tolerance = reduce.DEFAULT_TOLERANCE if tolerance is None else tolerance
-        eps = float(np.finfo(h.dtype).eps)
+        eps = value_eps(ts)
         log = reduce.log_frequency(h)
         x_criteria = [reduce.x_criterion(a, log) for a in x]
     stats = {}
@@ -379,7 +400,8 @@ def reject_tolerance(output: str, tolerance) -> None:
 def extract(path, names=None, sweeps=None, output: str = "arrays",
             downsample: Optional[int] = None, dest=None,
             xrange: Optional[Sequence[float]] = None, yrange: Optional[Sequence[float]] = None,
-            plot: int = 0, ac_format: str = "magphase", tolerance: Optional[float] = None):
+            plot: int = 0, ac_format: str = "magphase", tolerance: Optional[float] = None,
+            engine: Optional[str] = None):
     """Read selected traces and return them as arrays, a summary dict, or a written file path.
 
     xrange=(lo, hi) keeps only the rows whose x value (TIME, FREQ or the sweep
@@ -397,9 +419,14 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
     plot selects one plot of a Nutmeg rawfile (0-based); see list_traces for the list.
     ac_format is what each complex (AC) variable becomes: "magphase" (_Mag, _Phase in
     degrees), "db" (_dB = 20 log10 |z|, _Phase) or "realimag" (_Re, _Im).
+    engine is the reader: "python" (this package's parser) or "waveview" (Synopsys
+    WaveView in batch mode, see waveview.py: it reads every point of the selected
+    traces, then applies xrange). None uses the SRP_ENGINE environment variable, else
+    "python".
     """
     if output not in OUTPUTS:
         raise ValueError(f"output must be one of {OUTPUTS}, not {output!r}")
+    read = readers(engine)[1]
     downsample = check_downsample(downsample)
     tolerance = check_tolerance(tolerance)
     reject_tolerance(output, tolerance)
@@ -411,7 +438,7 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
         raise ValueError(f"dest applies to csv, npz and png only, not to output={output!r}")
     if output == "png":
         _require_matplotlib()
-    ts = read_traces(path, names, sweeps, plot, xrange, ac_format)
+    ts = read(path, names, sweeps, plot, xrange, ac_format)
     if output == "summary":
         return summarize(ts, downsample, tolerance)
     if downsample is not None and output != "png":  # png draws every point's envelope instead

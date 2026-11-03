@@ -1,0 +1,8 @@
+$DATA1 SOURCE='HSPICE' VERSION='P-2019.06-SP1-1 win64' PARAM_COUNT=2
+.TITLE '* data sweep one param'
+ index            rval             vmax             temper          
+                  alter#          
+ 1                 1.000e+03          0.9934          25.0000       
+                 1               
+ 2                 2.000e+03          0.9182          25.0000       
+                 1               

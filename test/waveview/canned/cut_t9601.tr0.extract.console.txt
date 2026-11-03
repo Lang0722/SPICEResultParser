@@ -1,0 +1,10 @@
+   *** running Tcl script ... ***
+   *** loading waveform file \\Mac\Home\.cache\srp_fix3\rec\in\cut_t9601.tr0 ... ***
+   *** error reading waveform file ***
+   *** waveform file '\\Mac\Home\.cache\srp_fix3\rec\in\cut_t9601.tr0' not complete ! ***
+   *** error reading waveform file ***
+   *** waveform file '\\Mac\Home\.cache\srp_fix3\rec\in\cut_t9601.tr0' not complete ! ***
+   *** error reading waveform file ***
+   *** waveform file '\\Mac\Home\.cache\srp_fix3\rec\in\cut_t9601.tr0' not complete ! ***
+   *** error reading waveform file ***
+   *** waveform file '\\Mac\Home\.cache\srp_fix3\rec\in\cut_t9601.tr0' not complete ! ***

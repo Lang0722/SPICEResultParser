@@ -5,9 +5,13 @@ HSPICE layout follows hSpice_output.md and the sample files in test/: each block
 nutmeg_output.md.
 """
 import math
+import os
 import struct
 
 import numpy as np
+
+# test_reader.py and test_nutmeg.py test the Python engine, also when SRP_ENGINE is set.
+os.environ.pop("SRP_ENGINE", None)
 
 _ENDIAN_HEAD = b"\x04\x00\x00\x00\x31\x00\x00\x00\x04\x00\x00\x00"
 _COPYRIGHT = " fixture.sp   01/01/2026   00:00:00 Copyright (c) 2026 Fixture. All Rights Reserved. "
@@ -60,7 +64,8 @@ def _block(payload: bytes) -> bytes:
 
 
 def write_binary(path, version, raw_names, type_codes, sweeps, block_bytes=8192,
-                 final_sentinel=True, drop_tail=0, nprobe=0, layout="free", announce=None, **header):
+                 final_sentinel=True, drop_tail=0, nprobe=0, layout="free", announce=None,
+                 header_bytes=None, **header):
     """Write a binary result file.
 
     sweeps: list of (param_values, data); data has shape (npoints, ncols) where
@@ -73,6 +78,8 @@ def write_binary(path, version, raw_names, type_codes, sweeps, block_bytes=8192,
     layout: "free" (header_text) or "hspice" (hspice_header_text, which takes the
     title, date, time and notice in `header`).
     announce: the sweep count the header gives, when it is not the number of sweeps written.
+    header_bytes: split the header text into blocks of this size, as HSPICE does with a
+    long variable list (its first block holds about 8 KB, cut at the end of a name field).
     Returns the flat value stream that was written.
     """
     dtype = np.dtype("<f4") if version == "9601" else np.dtype("<f8")
@@ -97,8 +104,10 @@ def write_binary(path, version, raw_names, type_codes, sweeps, block_bytes=8192,
     sizes = list(block_bytes) if isinstance(block_bytes, (list, tuple)) else [int(block_bytes)]
     if any(s <= 0 for s in sizes):
         raise ValueError("block_bytes entries must be positive")
+    step = header_bytes or len(text)
     with open(path, "wb") as f:
-        f.write(_block(text))
+        for start in range(0, len(text), step):
+            f.write(_block(text[start:start + step]))
         offset = 0
         k = 0
         while offset < len(raw):

@@ -8,6 +8,7 @@ import shutil
 import struct
 import sys
 import tempfile
+import time
 import tracemalloc
 import unittest
 import warnings
@@ -319,6 +320,49 @@ class TestBinaryRead(unittest.TestCase):
         self.assertEqual(ts.sweep_indices, [])
         self.assertEqual(ts.data["v_a"], [])
         self.assertFalse(ts.truncated)
+
+    def test_header_over_several_blocks(self):
+        # A header longer than one block (about 8 KB of text: about 330 short names) goes on
+        # in the next blocks; only the last one holds the terminator.
+        names = ["TIME"] + [f"v(n{i}" for i in range(400)]
+        data = np.arange(3 * 401, dtype=np.float64).reshape(3, 401)
+        for version in ("9601", "2001"):
+            path = self.dir / f"wide{version}.tr0"
+            fixtures.write_binary(path, version, names, [1] * 401, [([], data)], header_bytes=1000)
+            self.assertGreater(path.stat().st_size // 1000, 6)
+            h = read_header(path)
+            self.assertEqual(h.raw_names, names)
+            ts = read_traces(path, ["v(n0", "v(n399"])
+            np.testing.assert_array_equal(ts.data["v_n399"][0], data[:, 400])
+            np.testing.assert_array_equal(ts.data["TIME"][0], data[:, 0])
+        path = self.dir / "cut.tr0"
+        path.write_bytes(fixtures._block(fixtures.header_text("9601", names, [1] * 401, 0, 0).encode()[:1000]))
+        with self.assertRaisesRegex(ValueError, "terminator"):
+            read_header(path)
+        # The terminator split over two blocks.
+        text = fixtures.header_text("9601", ["TIME", "v(a"], [1, 1], 0, 0)
+        path = self.dir / "split.tr0"
+        fixtures.write_binary(path, "9601", ["TIME", "v(a"], [1, 1], [([], np.ones((2, 2)))],
+                              header_bytes=text.index("$&%#") + 2)
+        self.assertEqual(read_header(path).raw_names, ["TIME", "v(a"])
+        np.testing.assert_array_equal(read_traces(path).data["v_a"][0], [1.0, 1.0])
+
+    def test_header_without_terminator(self):
+        # A header block without $&%#, then data blocks: read as it is, as before the header could
+        # span blocks, and fast: the data blocks are not read as text.
+        path = self.dir / "noterm.tr0"
+        text = fixtures.header_text("9601", ["TIME", "v(a"], [1, 1], 0, 0).replace("$&%#", "    ")
+        values = np.arange(1, 2049, dtype="<f4")
+        with open(path, "wb") as f:
+            f.write(fixtures._block(text.encode()))
+            for _ in range(1200):                   # about 10 MB of data blocks
+                f.write(fixtures._block(values.tobytes()))
+        start = time.perf_counter()
+        self.assertEqual(read_header(path).raw_names, ["TIME", "v(a"])
+        self.assertLess(time.perf_counter() - start, 2.0)
+        with self.assertWarnsRegex(RuntimeWarning, "file ended before the sweep terminator"):
+            ts = read_traces(path)
+        np.testing.assert_array_equal(ts.data["TIME"][0][:3], [1.0, 3.0, 5.0])
 
     def test_capacity_estimates(self):
         # 16424 bytes of frames after a header: two 8192-byte-payload frames would be 16424 bytes
@@ -2026,9 +2070,9 @@ class TestMcp(unittest.TestCase):
             params = {t.name: list(self.schema(t)["properties"])
                       for t in asyncio.run(self.m.server.list_tools())}
             # list_traces takes the parameters extract has for naming and ranging traces, in the same order
-            self.assertEqual(params["list_traces"], ["path", "names", "plot", "ac_format", "header_only"])
+            self.assertEqual(params["list_traces"], ["path", "names", "plot", "ac_format", "header_only", "engine"])
             self.assertEqual([p for p in params["extract"] if p in params["list_traces"]],
-                             ["path", "names", "plot", "ac_format"])
+                             ["path", "names", "plot", "ac_format", "engine"])
             db = self.m.list_traces(str(path), ac_format="db")
             self.assertEqual(db["traces"][:2], ["v_a_dB", "v_a_Phase"])
             ts = read_traces(path, ["v(a"], ac_format="db")
@@ -2190,7 +2234,7 @@ class TestMcp(unittest.TestCase):
         dest = self.dir / "o.csv"
         out = self.m.extract(str(HERE / "test_9601.tr0"), ["v(vo"], output="csv", dest=str(dest))
         self.assertEqual(list(out), ["output", "dest", "x", "x_range", "points", "sweeps", "truncated",
-                                     "traces", "ranges"])
+                                     "traces", "ranges", "engine"])
         self.assertEqual(out["dest"], str(dest))          # the parameter's name: path is always the input
         self.assertEqual(out["x"], "TIME")
         self.assertEqual(out["x_range"], [0.0, 0.01])

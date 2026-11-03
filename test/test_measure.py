@@ -1,4 +1,5 @@
 """Tests for the HSPICE measure-file reader (.mt#, .ms#, .ma#)."""
+import os
 import sys
 import tempfile
 import unittest
@@ -9,14 +10,15 @@ import numpy as np
 
 HERE = Path(__file__).parent.resolve()
 sys.path.insert(0, str(HERE))
+os.environ.pop("SRP_ENGINE", None)      # these tests are of the Python engine, also when SRP_ENGINE is set
 
 from spice_result_parser import measure  # noqa: E402
 from spice_result_parser.measure import read_measures  # noqa: E402
 from spice_result_parser.reader import read_header, read_traces  # noqa: E402
 
-# A swept measure file: an index column, one swept parameter, rows wrapped over two
-# lines each, and a measure that failed in one row.
-SWEPT = """$DATA1 SOURCE='HSPICE' VERSION='P-2019.06 linux64' PARAM_COUNT=1
+# A swept measure file: an index column, one swept parameter (PARAM_COUNT counts index
+# too), rows wrapped over two lines each, and a measure that failed in one row.
+SWEPT = """$DATA1 SOURCE='HSPICE' VERSION='P-2019.06 linux64' PARAM_COUNT=2
 .TITLE '* inverter delay'
  index            vdd              tpd              tpw
                   temper           alter#
@@ -41,6 +43,25 @@ class TestSampleFile(unittest.TestCase):
         np.testing.assert_array_equal(ms.values["alter#"], [1.0])
 
 
+class TestParamCount(unittest.TestCase):
+    def test_param_count_includes_index(self):
+        # HSPICE output: PARAM_COUNT counts the leading columns, index included.
+        cases = {"rc.mt0": ["rval"],            # PARAM_COUNT=1: rval tdel ...
+                 "two.mt0": ["rval", "cval"],   # PARAM_COUNT=3: index rval cval tdel ...
+                 "d1.mt0": ["rval"]}            # PARAM_COUNT=2: index rval vmax ...
+        for name, params in cases.items():
+            ms = read_measures(HERE / "waveview" / name)
+            self.assertEqual(ms.params, params, name)
+        self.assertEqual(read_measures(HERE / "waveview" / "two.mt0", ["never"]).names,
+                         ["index", "rval", "cval", "never"])
+
+    def test_leading_columns(self):
+        self.assertEqual(measure._leading_columns(["index", "a", "m", "alter#"], 2), (["index"], ["a"]))
+        self.assertEqual(measure._leading_columns(["index", "m", "alter#"], 1), (["index"], []))
+        self.assertEqual(measure._leading_columns(["a", "m", "alter#"], 1), ([], ["a"]))
+        self.assertEqual(measure._leading_columns(["m", "alter#"], 0), ([], []))
+
+
 class TestSweptFile(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -57,6 +78,15 @@ class TestSweptFile(unittest.TestCase):
         self.assertEqual(ms.rows, 3)
         np.testing.assert_array_equal(ms.values["vdd"], [0.9, 1.0, 1.1])
         np.testing.assert_array_equal(ms.values["tpw"], [1.0e-10, 1.1e-10, 1.2e-10])
+
+    def test_repeated_names(self):
+        # A repeat gets '#<column>'; a name that another column has gets one more suffix.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            names = measure._unique("f.mt0", ["vmax", "vmax#2", "vmax", "vmax", "alter#"])
+        self.assertEqual(names, ["vmax", "vmax#2", "vmax#2#2", "vmax#3", "alter#"])
+        self.assertEqual([str(w.message) for w in caught],
+                         ["f.mt0: repeated measure names disambiguated with '#<column>': vmax"])
 
     def test_failed_measure_is_nan(self):
         ms = read_measures(self.path)
