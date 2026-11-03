@@ -7,7 +7,7 @@ import math
 import operator
 import os
 import zipfile
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -187,6 +187,54 @@ def overview(ts: TraceSet) -> dict:
     }
 
 
+DENSE_NAMES_MAX = 5             # traces a "too dense" note names; it counts the others
+
+
+def _and(items: List[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _percent(fraction: float) -> str:
+    return f"{100 * fraction:.3g}%"
+
+
+def dense_reason(swung: List[int], errors: List[float], tolerance: float, unit: str, where: str = "") -> str:
+    """Why a trace cannot be followed, for dense_phrase: it swings more often than its
+    `unit` ("rows", "points") allow (swung: reduce.swings counts), else the best of them
+    miss by errors (the fractions of its range that breakpoints reach). Each list holds one
+    value per table or sweep where the trace is too dense; where says which ones."""
+    if swung:       # a lower bound (reduce.swings): the smallest count holds in each table or sweep
+        return f"it swings at least {min(swung)} times by more than {_percent(2 * tolerance)} of its range{where}"
+    up_to = "up to " if len(errors) > 1 else ""
+    finite = [e for e in errors if math.isfinite(e)]
+    if finite:
+        return f"its best {unit} miss by {up_to}{_percent(max(finite))} of its range{where}"
+    return f"its changes between numbers, NaN and infinities alone need more {unit}{where}"
+
+
+def dense_phrase(reasons: Dict[str, str], tolerance: float, budget: str, envelope: str) -> str:
+    """What every output says of the traces that it cannot follow within the tolerance:
+
+        v_osc is too dense to follow within 1% in 500 rows (it swings at least 1992 times by more
+        than 2% of its range), so it is an envelope of 100 x slices; narrow xrange to see
+        its waveform
+
+    reasons maps each such trace to dense_reason; budget is "500 rows", "250 points" ...;
+    envelope is what the caller gets instead ("an envelope of 100 x slices"). At most
+    DENSE_NAMES_MAX traces are named; the others are counted."""
+    names = list(reasons)
+    within = f"too dense to follow within {_percent(tolerance)} in {budget}"
+    if len(names) == 1:
+        return (f"{names[0]} is {within} ({reasons[names[0]]}), so it is {envelope}; "
+                f"narrow xrange to see its waveform")
+    shown = names[:DENSE_NAMES_MAX]
+    listed = [f"{name} ({reasons[name]})" for name in shown]
+    if len(names) > len(shown):
+        listed.append(f"{len(names) - len(shown)} more traces")
+    envelopes = envelope.replace("an envelope", "envelopes", 1)
+    return f"{_and(listed)} are {within}, so they are {envelopes}; narrow xrange to see their waveforms"
+
+
 def summarize(ts: TraceSet, downsample: Optional[int] = None, tolerance: Optional[float] = None) -> dict:
     """JSON-serialisable description of ts: the file facts and overview(ts), then under
     "stats" per trace and per sweep count, min, max, mean, first and last, and points
@@ -203,6 +251,10 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None, tolerance: Optiona
     dense to follow within its points (an oscillation, a switching node) gets an
     "envelope" instead: {"from", "to", "min", "max"} lists, one entry per slice of x with
     the slice's bounds and the trace's lowest and highest sample in it (reduce.peak_detect).
+    It also gets "too_dense": {"points": the points it had, and "swings": how often it
+    swings by more than twice the tolerance (reduce.swings: more than those points can
+    follow), or "max_error": what the best of the points reach}. A top-level "note" names
+    every such series, so a caller cannot take an envelope for the waveform.
     A series holds at most downsample points (or half as many slices), and all of them at
     most SUMMARY_MAX_POINTS, shared evenly by the (trace, sweep) series (at least 2 each,
     so the cap holds only up to SUMMARY_MAX_POINTS / 2 series). The statistics always grow
@@ -222,6 +274,7 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None, tolerance: Optiona
         log = reduce.log_frequency(h)
         x_criteria = [reduce.x_criterion(a, log) for a in x]
     stats = {}
+    dense: Dict[str, list] = {}         # trace -> (sweep index, swings or None, error) of each enveloped series
     for name in ts.selected[1:]:
         if with_points:
             db = reduce.in_db(h, name)
@@ -236,19 +289,42 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None, tolerance: Optiona
                 entry.update(min=_json_float(lo), max=_json_float(hi), mean=_json_float(_nan_mean(a)),
                              first=_json_float(a[0]), last=_json_float(a[-1]))
                 if with_points:
-                    idx, error = reduce.breakpoints(x_criteria[i], [criteria[i]], [span], tolerance, cap, eps)
+                    swung = reduce.swings(x_criteria[i], criteria[i],
+                                          reduce.swing_height(tolerance, span, criteria[i], eps))
+                    if reduce.min_samples(swung) > cap:         # it swings more often than the points allow
+                        idx, error = None, math.inf
+                    else:
+                        idx, error, swung = *reduce.breakpoints(x_criteria[i], [criteria[i]], [span], tolerance,
+                                                                cap, eps), None
                     if error <= tolerance:
                         entry["x"] = _json_floats(x[i][idx])
                         entry["y"] = _json_floats(a[idx])
                         entry["max_error"] = float(f"{error:.3g}")
                     else:                           # too dense to follow: a peak-detect envelope instead
                         start, stop, mins, maxs = reduce.peak_detect(x[i], [a], max(1, cap // 2), log)
+                        entry["too_dense"] = ({"points": cap, "swings": swung} if swung is not None else
+                                              {"points": cap, "max_error": _json_float(float(f"{error:.3g}"))})
                         entry["envelope"] = {"from": _json_floats(start), "to": _json_floats(stop),
                                              "min": _json_floats(mins[0]), "max": _json_floats(maxs[0])}
+                        dense.setdefault(name, []).append((ts.sweep_indices[i], swung, error))
             per_sweep.append(entry)
         stats[name] = per_sweep
-    return {"path": h.path, "format": h.version, "analysis": h.analysis, "plot": h.plot,
-            "plots": h.plot_names, **overview(ts), "stats": stats}
+    result = {"path": h.path, "format": h.version, "analysis": h.analysis, "plot": h.plot,
+              "plots": h.plot_names, **overview(ts), "stats": stats}
+    if dense:
+        nsweeps = len(ts.sweep_values)
+        reasons = {}
+        for name, hits in dense.items():
+            where = ""
+            if nsweeps > 1:
+                where = (" in every sweep" if len(hits) == nsweeps else
+                         " in sweep" + ("s " if len(hits) > 1 else " ") + _and([str(k) for k, _, _ in hits]))
+            reasons[name] = dense_reason([t for _, t, _ in hits if t is not None],
+                                         [e for _, t, e in hits if t is None], tolerance, "points", where)
+        result["note"] = dense_phrase(reasons, tolerance, f"{cap} points",
+                                      f"an envelope of {max(1, cap // 2)} x slices (from, to, min, max) "
+                                      f"in place of x and y")
+    return result
 
 
 def default_dest(path, output: str) -> str:

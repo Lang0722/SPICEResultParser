@@ -1018,10 +1018,10 @@ class TestFormatText(unittest.TestCase):
     def test_points_too_few_for_the_tolerance_give_an_envelope(self):
         t = self.text(ASCII, ["v_out"], points=3)
         lines = t.splitlines()
-        self.assertTrue(lines[0].startswith("transient | x: time in [0, 2e-08] | 80 points (an envelope of 3 x "
-                                            "slices: too dense to follow every trace within 1% in 3 rows; "
-                                            "narrow xrange to see the waveform)"))
-        table = lines[lines.index(f"-- envelope: each row is a slice with every trace's min and max --") + 1:]
+        self.assertRegex(lines[0], r"^transient \| x: time in \[0, 2e-08\] \| 80 points \(v_out is too dense to "
+                                   r"follow within 1% in 3 rows \(it swings at least \d+ times by more than 2% of its range\), "
+                                   r"so it is an envelope of 3 x slices; narrow xrange to see its waveform\) \| plot 0")
+        table = lines[lines.index("-- envelope of v_out: each row is a slice of x with its min and max --") + 1:]
         self.assertEqual(table[0].split(), ["time_from", "time_to", "min(v_out)", "max(v_out)"])
         rows = [[float(v) for v in l.split()] for l in table[1:]]
         self.assertEqual(len(rows), 3)
@@ -1129,10 +1129,11 @@ class TestFormatText(unittest.TestCase):
     def test_row_cap(self):
         t = self.m.format_text(api.extract(HERE / "test_9601.tr0", ["v_vo"]), 10 ** 6, tolerance=0)
         lines = t.splitlines()
-        self.assertIn(f"(an envelope of {self.m.TEXT_MAX_ROWS} x slices: too dense to follow every trace "
-                      f"within 0% in {self.m.TEXT_MAX_ROWS} rows", lines[0])
+        self.assertIn(f"(v_vo is too dense to follow within 0% in {self.m.TEXT_MAX_ROWS} rows (its best rows miss "
+                      f"by 0.122% of its range), so it is an envelope of {self.m.TEXT_MAX_ROWS} x slices; narrow "
+                      f"xrange to see its waveform)", lines[0])
         # adaptive time steps leave some slices without a sample: the label says so
-        label = ("-- envelope: each row is a slice with every trace's min and max; slices without a sample "
+        label = ("-- envelope of v_vo: each row is a slice of x with its min and max; slices without a sample "
                  "are left out --")
         rows = [[float(v) for v in l.split()] for l in lines[lines.index(label) + 2:]]
         self.assertLessEqual(len(rows), self.m.TEXT_MAX_ROWS)
@@ -1152,14 +1153,19 @@ class TestFormatText(unittest.TestCase):
         heads = [l for l in lines if l.startswith("--")]
         self.assertEqual(len(heads), self.m.TEXT_MAX_TABLES + 1)
         self.assertIn("-- 40 tables not shown; pass sweeps=[...] to see them --", heads)
-        self.assertEqual(heads[0], "-- sweep 0: r1=0; envelope: each row is a slice with every trace's min and max --")
-        self.assertEqual(heads[-1], "-- sweep 59: r1=59; envelope: each row is a slice with every trace's min and max --")
+        self.assertEqual(heads[0], "-- sweep 0: r1=0; envelope of v_a and v_b: each row is a slice of x with their "
+                                   "min and max --")
+        self.assertEqual(heads[-1], "-- sweep 59: r1=59; envelope of v_a and v_b: each row is a slice of x with "
+                                    "their min and max --")
         self.assertIn("(all 60 sweeps)", lines[2])                # one min/max row per trace
         self.assertEqual(lines[3].split()[0], "v_a")
         self.assertEqual(lines[4].split()[0], "v_b")
         # 20 tables share 500 rows and 2000 numbers: 6 numbers a slice, so 16 slices each
-        self.assertIn("(an envelope of 16 x slices per table: too dense to follow every trace within 1% in "
-                      "25 rows per table; narrow xrange to see the waveform)", lines[0])
+        # 40 random points swing too few times to decide it; the best 25 rows miss by a third of the range
+        self.assertRegex(lines[0], r"\(v_a \(its best rows miss by up to [\d.]+% of its range in every table\) and "
+                                   r"v_b \(its best rows miss by up to [\d.]+% of its range in every table\) are too "
+                                   r"dense to follow within 1% in 25 rows per table, so they are envelopes of 16 x "
+                                   r"slices per table; narrow xrange to see their waveforms\)")
         self.assertIn("in 20 rows per table", self.text(path, points=20).splitlines()[0])
         rows = [l for l in lines if l.strip()[:1].isdigit()]
         self.assertLessEqual(len(rows) * 6, self.m.TEXT_MAX_CELLS)
@@ -1227,7 +1233,8 @@ class TestMcp(unittest.TestCase):
         out = self.m.extract(str(BIN), ["v(out)"], plot=2)
         self.assertIsInstance(out, str)
         self.assertTrue(out.startswith("dc sweep | x: v_v-sweep in [0, 1] | 5 points"))
-        self.assertIn("(an envelope of 6 x slices: ", self.m.extract(str(BIN), ["v(out)"], plot=1, downsample=6))
+        self.assertIn(" are too dense to follow within 1% in 6 rows, so they are envelopes of 6 x slices; narrow "
+                      "xrange to see their waveforms)", self.m.extract(str(BIN), ["v(out)"], plot=1, downsample=6))
         tools = {t.name: t for t in asyncio.run(self.m.server.list_tools())}
         schema = getattr(tools["extract"], "inputSchema", None) or tools["extract"].input_schema
         self.assertEqual(schema["properties"]["output"]["default"], "text")

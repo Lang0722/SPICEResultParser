@@ -102,14 +102,58 @@ values and audio peak files all do for the same reason:
   samples as ordinary rows: alternating max/min rows read like a slow oscillation, the
   aliasing that peak detect exists to avoid.
 - `text`: 100 slices per table by default (`downsample` sets them), within the row and
-  number budget. The header says `an envelope of 100 x slices: too dense to follow every
-  trace within 1% in 500 rows; narrow xrange to see the waveform`; mixed sweeps say how
-  many tables are envelopes. On the oscillator: 100 rows, 4.6k characters, the amplitude
+  number budget. The header said `an envelope of 100 x slices: too dense to follow every
+  trace within 1% in 500 rows; narrow xrange to see the waveform`; mixed sweeps said how
+  many tables were envelopes. (Replaced: see "Telling the caller" below.) On the oscillator: 100 rows, 4.6k characters, the amplitude
   growth over the whole run (the simplification's 500 rows took 11.7k).
 - `summary`: an entry whose points cannot meet the tolerance gets `envelope: {from, to,
   min, max}` with half as many slices as it had points, instead of `x`, `y`, `max_error`.
 
 The values stay real samples, so the fallback is still extraction, not post-processing.
+
+## Telling the caller
+
+The first version of the fallback did not tell the caller enough, and this belonged in
+the design from the start: a caller that does not learn that a signal is dense and was
+replaced by an envelope can take the envelope for the waveform. A fallback is part of
+the contract of an output. The output must say that it fell back, for which traces, why,
+and what to do next.
+
+What was missing:
+
+- `summary` had no message. The only sign was that `envelope` stood where `x` and `y`
+  would be.
+- Neither output said which trace was dense, or how far its rows missed: 98% is not
+  "almost".
+- `text` turned the whole table into an envelope when one trace was dense, so a slow
+  trace beside an oscillator lost its 12 rows.
+
+Now:
+
+- One wording for both outputs (`api.dense_phrase`, `api.dense_reason`):
+  `v_osc is too dense to follow within 1% in 500 rows (it swings at least 1992 times by
+  more than 2% of its range), so it is an envelope of 100 x slices; narrow xrange to see
+  its waveform`. With several traces, each one gets its reason; at most 5 are named.
+  The count is a lower bound, so the reason says "at least".
+- `summary`: a top-level `note` with that sentence, and in each enveloped series
+  `too_dense: {points, swings}` or `{points, max_error}`.
+- `text`: only the traces that cannot be followed leave the rows (`_split_table`). Each
+  trace alone first; of the traces that fit alone, as many as fit together keep the
+  rows, fewest rows first. A trace that fits alone but not with the others also goes to
+  the envelope, and the header says to select fewer names.
+- The reason comes from a swing count (`reduce.swings`). A straight line between two
+  rows cannot pass near a peak and both valleys around it, so `n` swings larger than
+  twice the tolerance need at least `n / 2 + 1` rows (`reduce.min_samples`). When that
+  is more than the rows, the trace is dense without a run of the greedy simplification,
+  which costs about points * rows on such a signal. Else the simplification runs, and
+  the reason is how far its best rows miss. The count is a lower bound: it skips the
+  zigzag inside a vertical jump and cuts a long trace to the extremes of 4096 runs, which
+  can only lower it. On 200 random and smooth signals it never asked for more rows than
+  the simplification kept.
+
+On the oscillator beside a slow `v_ctrl` (200,001 points), `text` took 4 s with the
+first fallback and 7 s with a check per trace. With the swing count it takes 0.15 s:
+`v_ctrl` keeps 12 rows and `v_osc` gets a table of 100 slices.
 
 ## Revisions after a bug hunt
 

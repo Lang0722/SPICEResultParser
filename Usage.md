@@ -153,7 +153,21 @@ s["stats"]["v_out"][2]["max"]                     # one sweep: index 2 of sweep_
 (`x`, `y`) and the error that they leave (`max_error`, a fraction of the range of the
 trace). If the points cannot follow the trace within `tolerance`, the entry holds an
 `envelope` instead: `from`, `to`, `min` and `max` lists with one value per slice (half as
-many slices as points). Without either parameter, `summary` lists no points. All the lists together hold at most
+many slices as points). The entry then also holds `too_dense`: the `points` it had, and
+`swings` (how often the trace swings by more than twice the tolerance, which is more
+than the points can follow) or `max_error` (what the best of the points reach). A
+top-level `note` names each such series and says what to do:
+
+```python
+s = extract("osc.tr0", output="summary", tolerance=0.01)
+s["note"]
+# 'v_osc is too dense to follow within 1% in 500 points (it swings at least 1992 times by
+#  more than 2% of its range), so it is an envelope of 250 x slices (from, to, min, max) in
+#  place of x and y; narrow xrange to see its waveform'
+s["stats"]["v_osc"][0]["too_dense"]               # {'points': 500, 'swings': 1992}
+```
+
+Without either parameter, `summary` lists no points. All the lists together hold at most
 1000 points (about 12k tokens of JSON), shared by the (trace, sweep) series, with at
 least 2 for each series. The size of the summary grows with the number of traces times
 the number of sweeps. On large files, select a few traces or sweeps. If you call
@@ -192,6 +206,21 @@ The reduction then shows an envelope, as the peak-detect mode of an oscilloscope
 - A slice without a sample is left out. The label of the table then says so.
 - The `text` envelope has 100 slices, or `downsample` slices, within the budget. To see
   the waveform itself, narrow `xrange`.
+- Only the traces that cannot be followed become envelopes. In `text`, the other traces
+  keep their rows, and the envelope gets its own table after them. A trace that fits
+  alone but not together with the others also goes to the envelope. The header then
+  says to select fewer names.
+- The output always says that it fell back, for which traces, and why. The `text`
+  header and the `note` of `summary` name each envelope. They give the reason: the trace
+  swings more often than the rows can follow (`it swings at least 1992 times by more
+  than 2% of its range`), or the best rows miss by a given part of its range.
+
+The swing count makes this fast. A straight line between two rows cannot pass near a
+peak and both valleys around it. Thus a trace with `n` swings larger than twice the
+tolerance needs at least `n / 2 + 1` rows (`reduce.swings`, `reduce.min_samples`). When
+that is more than the rows available, the trace is too dense, and the slow
+simplification does not run on it. On a 200,001-point oscillator, the `text` report took
+0.15 s, against 4 s before.
 
 An envelope row cannot be read as a waveform, so the agent cannot mistake the slices for
 a slow oscillation. Each value is still a sample of the file.
@@ -618,10 +647,12 @@ directory of the server. The server can run in a different directory from the ag
    gives their count and the error bound that they meet, for example
    `200001 points (38 shown, each trace within 1% of its range)`. A table holds at most
    `downsample` rows. All the tables together hold at most 500 rows and 2000 numbers. A
-   table that is too dense to follow in its rows is an envelope instead: one row per
-   slice of x, with every trace's min and max. The header says so, for example
-   `200001 points (an envelope of 100 x slices: too dense to follow every trace within
-   1% in 500 rows; narrow xrange to see the waveform)`.
+   trace that is too dense to follow in its rows goes to an envelope table instead: one
+   row per slice of x, with the trace's min and max. The other traces keep their rows.
+   The header names each envelope and says why, for example `200001 points (12 rows
+   shown, each trace within 1% of its range; v_osc is too dense to follow within 1% in
+   500 rows (it swings at least 1992 times by more than 2% of its range), so it is an
+   envelope of 100 x slices; narrow xrange to see its waveform)`.
 
 A trace that holds one value in the whole selection does not get a column. A
 `constant:` line names it with its value, for example `constant: v_0 = 0`.

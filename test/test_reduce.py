@@ -406,9 +406,10 @@ class TestEnvelopeFallback(unittest.TestCase):
 
     def test_text_shows_the_envelope_over_the_whole_run(self):
         text = self.m.format_text(read_traces(self.path))
-        self.assertIn("200001 points (an envelope of 100 x slices: too dense to follow every trace within 1% in "
-                      "500 rows; narrow xrange to see the waveform)", text.splitlines()[0])
-        self.assertIn("-- envelope: each row is a slice with every trace's min and max --", text)
+        self.assertIn("200001 points (v_osc is too dense to follow within 1% in 500 rows (it swings at least 1992 times by "
+                      "more than 2% of its range), so it is an envelope of 100 x slices; narrow xrange to see its "
+                      "waveform)", text.splitlines()[0])
+        self.assertIn("-- envelope of v_osc: each row is a slice of x with its min and max --", text)
         heading, rows = self.table(text)
         self.assertEqual(heading, ["TIME_from", "TIME_to", "min(v_osc)", "max(v_osc)"])
         self.assertEqual(len(rows), 100)
@@ -433,10 +434,12 @@ class TestEnvelopeFallback(unittest.TestCase):
         path = Path(self.tmp.name) / "mixed.tr0"
         fixtures.write_binary(path, "2001", ["TIME", "v(a", "case"], [1, 1], sweeps)
         text = self.m.format_text(read_traces(path))
-        self.assertIn("1 of 2 tables as envelopes: too dense to follow every trace within 1% in 250 rows per "
-                      "table", text.splitlines()[0])
+        self.assertRegex(text.splitlines()[0], r"\(4 rows shown, each trace within 1% of its range; v_a is too dense "
+                                               r"to follow within 1% in 250 rows per table \(its best rows miss by "
+                                               r"[\d.]+% of its range in 1 of 2 tables\), so it is an envelope of "
+                                               r"100 x slices per table; narrow xrange to see its waveform\)$")
         self.assertIn("-- sweep 0: case=1 --", text)
-        self.assertIn("-- sweep 1: case=2; envelope: each row is a slice with every trace's min and max --", text)
+        self.assertIn("-- sweep 1: case=2; envelope of v_a: each row is a slice of x with its min and max --", text)
 
     def test_summary_gives_the_envelope(self):
         s = api.extract(self.path, output="summary", tolerance=0.01, downsample=100)
@@ -447,6 +450,138 @@ class TestEnvelopeFallback(unittest.TestCase):
         self.assertEqual((env["from"][0], env["to"][-1]), (0.0, 1e-6))
         self.assertEqual((min(env["min"]), max(env["max"])), (entry["min"], entry["max"]))
         json.dumps(s, allow_nan=False)
+
+
+class TestSwings(unittest.TestCase):
+    """reduce.swings counts the zigzag legs longer than a height: a lower bound on the rows."""
+
+    def test_a_sine_swings_twice_a_cycle(self):
+        x = np.linspace(0, 1, 20_001)
+        y = np.sin(2 * np.pi * 50 * x)                             # 50 cycles from 0 to 0
+        self.assertEqual(reduce.swings(x, y, 0.5), 101)            # 0 to the first peak, then 100 legs
+        self.assertEqual(reduce.min_samples(101), 52)
+        self.assertEqual(reduce.swings(x, y, 2.5), 0)              # no leg is longer than 2.5
+        self.assertEqual(reduce.swings(x, 0.01 * y + x, 0.1), 1)   # a ramp is one leg; its small ripple adds none
+        self.assertEqual(reduce.min_samples(1), 2)
+        self.assertEqual(reduce.min_samples(0), 2)                 # the first and the last sample
+
+    def test_what_the_count_leaves_out(self):
+        x = np.array([0.0, 1, 1, 1, 1, 2])                         # a vertical jump that zigzags at x = 1
+        y = np.array([0.0, 0, 5, 0, 5, 5])
+        self.assertEqual(reduce.swings(x, y, 1.0), 1)              # the jump is one leg; its zigzag adds none
+        self.assertEqual(reduce.swings(np.arange(6.0), y, 1.0), 3)
+        y = np.array([0.0, 5, np.nan, 0, 5, 0])
+        self.assertEqual(reduce.swings(np.arange(6.0), y, 1.0), 4)     # NaN is skipped
+        # a long signal is cut to the extremes of runs: the count can only drop
+        x = np.linspace(0, 1, 400_001)
+        y = np.sin(2 * np.pi * 300 * x)
+        exact = reduce.swings(x[::50], y[::50], 0.5)                # 8001 samples: under the cut
+        self.assertEqual(exact, 601)
+        self.assertLessEqual(reduce.swings(x, y, 0.5), exact)
+        self.assertGreater(reduce.swings(x, y, 0.5), 0.9 * exact)
+
+    def test_the_count_never_asks_for_more_rows_than_breakpoints_keeps(self):
+        rng = np.random.default_rng(3)
+        for trial in range(200):
+            n = int(rng.integers(5, 300))
+            x = np.sort(rng.uniform(0, 1, n))
+            y = (rng.normal(size=n), np.sin(x * rng.uniform(1, 60)) + 0.05 * rng.normal(size=n),
+                 np.cumsum(rng.normal(size=n)))[trial % 3]
+            tol, span = float(rng.choice([0.001, 0.01, 0.05, 0.2])), float(np.ptp(y))
+            idx, _ = reduce.breakpoints(x, [y], [span], tol, None, 2.2e-16)
+            swung = reduce.swings(x, y, reduce.swing_height(tol, span, y, 2.2e-16))
+            self.assertLessEqual(reduce.min_samples(swung), len(idx), trial)
+
+
+class TestDenseIsSaid(unittest.TestCase):
+    """A caller always learns which traces are envelopes, why, and what to do next."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.dir = Path(cls.tmp.name)
+        t = np.linspace(0, 1e-3, 200_001)
+        cls.osc = 0.9 + 0.8 * (1 - np.exp(-t / 2e-4)) * np.sin(2 * np.pi * 1e6 * t)   # 1000 cycles
+        cls.ctrl = 1.2 * (1 - np.exp(-t / 1e-4))                                       # slow settling
+        cls.path = cls.dir / "osc.tr0"
+        fixtures.write_binary(cls.path, "2001", ["TIME", "v(osc", "v(ctrl"], [1, 1, 1],
+                              [([], np.c_[t, cls.osc, cls.ctrl])])
+        from spice_result_parser import mcp_server
+        cls.m = mcp_server
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_text_keeps_the_rows_of_the_traces_it_can_follow(self):
+        start = time.perf_counter()
+        text = self.m.extract(str(self.path))
+        self.assertLess(time.perf_counter() - start, 3.0)            # the swing count decides: no long reduction
+        lines = text.splitlines()
+        self.assertRegex(lines[0], r"\(\d+ rows shown, each trace within 1% of its range; v_osc is too dense to "
+                                   r"follow within 1% in 500 rows \(it swings at least \d+ times by more than 2% of its "
+                                   r"range\), so it is an envelope of 100 x slices; narrow xrange to see its waveform\)")
+        rows_at = lines.index(next(line for line in lines if line.split() == ["TIME", "v_ctrl"]))
+        env_at = lines.index("-- envelope of v_osc: each row is a slice of x with its min and max --")
+        self.assertLess(rows_at, env_at)
+        rows = np.array([[float(v) for v in line.split()] for line in lines[rows_at + 1:env_at]])
+        np.testing.assert_allclose(np.interp(np.linspace(0, 1e-3, 999), rows[:, 0], rows[:, 1]),
+                                   1.2 * (1 - np.exp(-np.linspace(0, 1e-3, 999) / 1e-4)), atol=0.012)
+        self.assertEqual(lines[env_at + 1].split(), ["TIME_from", "TIME_to", "min(v_osc)", "max(v_osc)"])
+
+    def test_traces_that_fit_alone_but_not_together(self):
+        # three staircases with their steps at other times: each alone fits 12 rows, not all three
+        t = np.linspace(0, 1, 4001)
+        stairs = [np.floor((t + k / 9) * 4) for k in range(3)]
+        path = self.dir / "stairs.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(a", "v(b", "v(c"], [1, 1, 1, 1], [([], np.c_[(t, *stairs)])])
+        text = self.m.extract(str(path), downsample=12)
+        head = text.splitlines()[0]
+        self.assertRegex(head, r"\(\d+ rows shown, each trace within 1% of its range; (v_b and v_c|v_a and v_c|v_a and "
+                               r"v_b) fit alone but not with the other traces in 12 rows, so they are envelopes too; "
+                               r"select fewer names to see their waveforms\)")
+        self.assertNotIn("too dense", head)
+        for name in ("v_a", "v_b", "v_c"):
+            alone = self.m.extract(str(path), [f"v({name[2:]})"], downsample=12)
+            self.assertNotIn("envelope", alone)
+
+    def test_summary_says_which_series_are_envelopes(self):
+        s = self.m.extract(str(self.path), output="summary", tolerance=0.01)
+        self.assertRegex(s["note"], r"^v_osc is too dense to follow within 1% in 500 points \(it swings at least \d+ times "
+                                    r"by more than 2% of its range\), so it is an envelope of 250 x slices \(from, "
+                                    r"to, min, max\) in place of x and y; narrow xrange to see its waveform$")
+        osc, ctrl = s["stats"]["v_osc"][0], s["stats"]["v_ctrl"][0]
+        self.assertEqual(set(osc["too_dense"]), {"points", "swings"})
+        self.assertEqual(osc["too_dense"]["points"], 500)
+        self.assertGreater(osc["too_dense"]["swings"], 1900)
+        self.assertNotIn("x", osc)
+        self.assertNotIn("too_dense", ctrl)
+        self.assertLessEqual(ctrl["max_error"], 0.01)
+        # zoomed in, both follow: no note
+        zoom = self.m.extract(str(self.path), output="summary", tolerance=0.01, xrange=[5e-4, 5.03e-4])
+        self.assertNotIn("note", zoom)
+        self.assertNotIn("too_dense", zoom["stats"]["v_osc"][0])
+
+    def test_summary_says_how_far_the_points_miss_when_swings_do_not_decide(self):
+        # 30 points of noise swing too few times to rule out 20 points; the best 20 points still miss
+        rng = np.random.default_rng(2)
+        sweeps = [([1.0], np.c_[np.arange(30.0), np.ones(30)]), ([2.0], np.c_[np.arange(30.0), rng.normal(size=30)])]
+        path = self.dir / "noise.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(n", "case"], [1, 1], sweeps)
+        s = api.extract(path, output="summary", downsample=20)
+        entry = s["stats"]["v_n"][1]
+        self.assertEqual(set(entry["too_dense"]), {"points", "max_error"})
+        self.assertGreater(entry["too_dense"]["max_error"], 0.01)
+        self.assertNotIn("too_dense", s["stats"]["v_n"][0])
+        self.assertRegex(s["note"], r"^v_n is too dense to follow within 1% in 20 points \(its best points miss by "
+                                    r"[\d.]+% of its range in sweep 1\), so it is an envelope of 10 x slices")
+
+    def test_the_mcp_layer_keeps_the_note(self):
+        result = self.m._json_result({"note": "v_osc is too dense", "points": 1,
+                                      "ranges": {f"v{i}": [0.0, 1.0] for i in range(101)}})
+        self.assertTrue(result["note"].startswith("v_osc is too dense; ranges lists the first 100 of 101 traces"))
+        self.assertEqual(api.dense_phrase({f"v{i}": "it swings 9 times by more than 2% of its range" for i in range(7)},
+                                          0.01, "20 rows", "an envelope of 10 x slices").count("(it swings"), 5)
 
 
 class TestBugHuntRegressions(unittest.TestCase):

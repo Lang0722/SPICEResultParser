@@ -209,6 +209,85 @@ def breakpoints(x: np.ndarray, ys: Sequence[np.ndarray], spans: Sequence[float],
     return np.array(sorted(keep), dtype=np.intp), reached
 
 
+SWING_SAMPLES = 16384           # samples a swing count looks at: the extremes of SWING_SAMPLES // 4 runs
+
+
+def _run_extremes(y: np.ndarray, runs: int) -> np.ndarray:
+    """Sorted indices of the first, lowest, highest and last sample of `runs` equal runs of
+    y (finite values only), in one numpy pass."""
+    n = y.size
+    size = -(-n // runs)
+    full = n // size
+    parts = []
+    if full:
+        block = y[:full * size].reshape(full, size)
+        base = np.arange(full) * size
+        parts += [base, base + block.argmin(axis=1), base + block.argmax(axis=1), base + size - 1]
+    if full * size < n:
+        start, tail = full * size, y[full * size:]
+        parts.append(np.array([start, start + int(tail.argmin()), start + int(tail.argmax()), n - 1]))
+    return np.unique(np.concatenate(parts))
+
+
+def swings(x: np.ndarray, y: np.ndarray, height: float) -> int:
+    """How many times y swings by more than height: the legs of a zigzag over its finite
+    samples, each from one extreme to the next and more than height long. A sine of 50
+    cycles from 0 to 0 has 101 legs that a height below its swing counts.
+
+    The swings + 1 ends of the legs are extremes, each more than height from the one before.
+    Between two samples that breakpoints keeps, a straight line can follow at most two of
+    them within height / 2 (one line cannot pass near a peak and both valleys around it).
+    So following y within tolerance * span takes at least min_samples(swings(x, y,
+    swing_height(...))) samples, and a trace that swings more often than its rows allow is
+    too dense without a breakpoints run (which costs about points * rows on such a signal).
+    The count is a lower bound: samples at one x (a vertical jump, which breakpoints draws
+    upright) count by their first and last one only, and a long y is cut to the extremes of
+    SWING_SAMPLES // 4 runs. Both can only lower it."""
+    keep = np.isfinite(y)
+    if x.size > 2:
+        inner = np.zeros(x.size, bool)
+        inner[1:-1] = (x[1:-1] == x[:-2]) & (x[1:-1] == x[2:])
+        keep &= ~inner
+    y = np.asarray(y[keep], dtype=np.float64)
+    if y.size < 3 or not height > 0:
+        return 0
+    if y.size > SWING_SAMPLES:
+        y = y[_run_extremes(y, SWING_SAMPLES // 4)]
+    count, up, hi, lo = 0, None, y[0], y[0]
+    for value in y[1:].tolist():
+        if up is None:
+            if value - lo > height:
+                count, up, hi = 1, True, value
+            elif hi - value > height:
+                count, up, lo = 1, False, value
+            else:
+                hi, lo = max(hi, value), min(lo, value)
+        elif up:
+            if value > hi:
+                hi = value
+            elif hi - value > height:
+                count, up, lo = count + 1, False, value
+        elif value < lo:
+            lo = value
+        elif value - lo > height:
+            count, up, hi = count + 1, True, value
+    return count
+
+
+def swing_height(tolerance: float, span: float, y: np.ndarray, eps: float) -> float:
+    """The swing that a line within tolerance * span cannot cut: twice the error allowed,
+    with breakpoints' allowance for rounding (4 eps of the values) and a margin on top."""
+    finite = y[np.isfinite(y)]
+    size = float(np.max(np.abs(finite))) if finite.size else 0.0
+    return 2 * (tolerance * span + 4 * eps * size) * (1 + 1e-9)
+
+
+def min_samples(swing_count: int) -> int:
+    """The fewest samples that follow a trace with swing_count swings (see swings): its
+    swing_count + 1 extremes, at most two per straight line, and one sample more."""
+    return (swing_count + 2) // 2 + 1
+
+
 def peak_detect(x: np.ndarray, ys: Sequence[np.ndarray], count: int, log: bool = False):
     """The envelope of traces that share x, as an oscilloscope's peak-detect mode shows it:
     the x range is cut into `count` slices of equal width (equal in log10 x on a log axis,

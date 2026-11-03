@@ -11,7 +11,7 @@ import math
 import os
 import signal
 import struct
-from typing import Annotated, List, Literal, Optional, Union
+from typing import Annotated, Dict, List, Literal, Optional, Union
 
 import numpy as np
 
@@ -235,6 +235,40 @@ def _percent(fraction: float) -> str:
 
 
 
+def _split_table(columns: List[str], fit, tolerance: float):
+    """(the traces whose rows follow them, those rows, {trace too dense: error its best rows
+    reach}, [traces that fit alone but not with the others]).
+
+    fit(names) gives reduce.breakpoints (rows, error) of those traces in the table's rows.
+    All traces together first. When they do not fit, each trace alone: one that does not
+    is too dense. Of the others, as many as fit together keep their rows, those that need
+    the fewest rows first; the rest fit alone only, and go to the envelope too."""
+    idx, error = fit(columns)
+    if error <= tolerance:
+        return list(columns), idx, {}, []
+    alone = {name: fit([name]) for name in columns}
+    dense = {name: err for name, (_, err) in alone.items() if err > tolerance}
+    follow = [name for name in columns if name not in dense]
+    if not follow:
+        return [], None, dense, []
+    if dense:
+        idx, error = fit(follow)
+        if error <= tolerance:
+            return follow, idx, dense, []
+    order = sorted(follow, key=lambda name: len(alone[name][0]))
+    kept, kept_idx = order[:1], alone[order[0]][0]
+    lo, hi = 2, len(order) - 1                      # all of them together do not fit
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        idx, error = fit(order[:mid])
+        if error <= tolerance:
+            kept, kept_idx, lo = order[:mid], idx, mid + 1
+        else:
+            hi = mid - 1
+    return ([name for name in follow if name in kept], kept_idx, dense,
+            [name for name in follow if name not in kept])
+
+
 def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFAULT_TOLERANCE) -> str:
     """Agent-readable text for a TraceSet: a header, per-trace min/max, then a table per
     sweep with x once and one column per trace.
@@ -246,11 +280,14 @@ def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFA
     dB. The header gives the x range, the point count and, when rows were dropped, how
     many are shown and the error bound they meet. A table holds at most `points` rows
     (None: no limit but the budget); all of them hold at most TEXT_MAX_ROWS rows and
-    TEXT_MAX_CELLS numbers. A table whose rows cannot meet the tolerance is too dense to
-    follow (an oscillation, a switching node): it becomes an envelope instead, one row
-    per slice of x with every trace's lowest and highest sample (reduce.peak_detect;
-    TEXT_ENVELOPE_SLICES slices, or `points`), and the header says so. A trace that
-    holds one value is named on a "constant:" line instead.
+    TEXT_MAX_CELLS numbers. A trace that the rows cannot follow within the tolerance is
+    too dense (an oscillation, a switching node): it leaves the rows for an envelope table
+    beside them, one row per slice of x with its lowest and highest sample
+    (reduce.peak_detect; TEXT_ENVELOPE_SLICES slices, or `points`). So does a trace that
+    fits alone but not with the others. The other traces keep their rows. The header
+    names each trace in an envelope, how far its best rows miss, and what to do next
+    (api.dense_phrase). A trace that holds one value is named on a "constant:" line
+    instead.
 
     Numbers are rounded to 6 significant digits; NaN and infinity print as nan/inf, and
     a change into or out of them is always shown. When an x window was applied, a line
@@ -294,9 +331,7 @@ def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFA
     per_table = max(2, budget // shown_tables)
     if points is not None:
         per_table = max(2, min(per_table, points))
-    # an envelope row holds a slice's two bounds and every trace's min and max
-    slices = max(2, min(per_table, TEXT_ENVELOPE_SLICES if points is None else points,
-                        TEXT_MAX_CELLS // ((2 + 2 * len(columns)) * shown_tables)))
+    cells = TEXT_MAX_CELLS // shown_tables          # numbers per table: its rows and its envelope share them
 
     log = reduce.log_frequency(h)
     db = {name: reduce.in_db(h, name) for name in columns}
@@ -305,7 +340,9 @@ def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFA
     eps = api.value_eps(ts)
     y_digits = {name: _range_digits(ts.data[name]) for name in varying}
     body: List[str] = []
-    shown, followed, enveloped = 0, 0, 0
+    shown, followed, slices = 0, 0, 0               # rows that follow traces, tables with them, envelope size
+    dense: Dict[str, list] = {}                     # trace -> ("swings", count) or ("error", fraction) per table
+    crowded: Dict[str, int] = {}                    # trace -> tables where it fits alone, not with the others
     for table in tables if columns else []:
         if table is None:
             tip = "pass sweeps=[...] to see them" if nsweeps > 1 else "output='csv' writes every point"
@@ -313,31 +350,58 @@ def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFA
             continue
         label, sl, i = table
         x = ts.data[x_name][i][sl]
-        values = [ts.data[name][i][sl] for name in columns]
-        idx, error = reduce.breakpoints(
-            reduce.x_criterion(x, log), [reduce.y_criterion(v, db[name]) for v, name in zip(values, columns)],
-            [spans[name] for name in columns], tolerance, per_table, eps)
-        if error <= tolerance:
+        values = {name: ts.data[name][i][sl] for name in columns}
+        xc = reduce.x_criterion(x, log)
+        yc = {name: reduce.y_criterion(values[name], db[name]) for name in columns}
+
+        def fit(names):
+            return reduce.breakpoints(xc, [yc[n] for n in names], [spans[n] for n in names], tolerance,
+                                      per_table, eps)
+
+        swung = {}                                  # traces that swing more often than the rows allow
+        for name in columns:
+            count = reduce.swings(xc, yc[name], reduce.swing_height(tolerance, spans[name], yc[name], eps))
+            if reduce.min_samples(count) > per_table:
+                swung[name] = count
+        rest = [name for name in columns if name not in swung]
+        follow, idx, too_dense, no_room = _split_table(rest, fit, tolerance) if rest else ([], None, {}, [])
+        for name, count in swung.items():
+            dense.setdefault(name, []).append(("swings", count))
+        used = 0
+        if follow:
             followed += 1
-            cols = [x[idx]] + [v[idx] for v in values]
-            digits = [_distinct_digits(cols[0])] + [y_digits[name] for name in columns]
-            rows = [[x_name, *columns]] + [[_num(v, d) for v, d in zip(row, digits)] for row in zip(*cols)]
-        else:                                       # too dense to follow: show it as a peak-detect envelope
-            enveloped += 1
-            start, stop, mins, maxs = reduce.peak_detect(x, values, slices, log)
+            cols = [x[idx]] + [values[name][idx] for name in follow]
+            digits = [_distinct_digits(cols[0])] + [y_digits[name] for name in follow]
+            rows = [[x_name, *follow]] + [[_num(v, d) for v, d in zip(row, digits)] for row in zip(*cols)]
+            shown += len(rows) - 1
+            used = (len(rows) - 1) * (1 + len(follow))
+            if label:
+                body.append(f"-- {label} --")
+            body.extend(_table(rows))
+        others = [name for name in columns if name in swung or name in too_dense or name in no_room]
+        if others:                                  # too dense to follow: a peak-detect envelope instead
+            for name, err in too_dense.items():
+                dense.setdefault(name, []).append(("error", err))
+            for name in no_room:
+                crowded[name] = crowded.get(name, 0) + 1
+            # an envelope row holds a slice's two bounds and each trace's min and max
+            count = max(2, min(per_table, TEXT_ENVELOPE_SLICES if points is None else points,
+                               (cells - used) // (2 + 2 * len(others))))
+            slices = max(slices, count)
+            start, stop, mins, maxs = reduce.peak_detect(x, [values[name] for name in others], count, log)
             cols = [start, stop] + [c for pair in zip(mins, maxs) for c in pair]
-            heading = [f"{x_name}_from", f"{x_name}_to"] + [f"{k}({name})" for name in columns
+            heading = [f"{x_name}_from", f"{x_name}_to"] + [f"{k}({name})" for name in others
                                                             for k in ("min", "max")]
             xd = _distinct_digits(np.concatenate([start, stop]))
-            digits = [xd, xd] + [y_digits[name] for name in columns for _ in range(2)]
+            digits = [xd, xd] + [y_digits[name] for name in others for _ in range(2)]
             rows = [heading] + [[_num(v, d) for v, d in zip(row, digits)] for row in zip(*cols)]
-            label = (f"{label}; " if label else "") + "envelope: each row is a slice with every trace's min and max"
+            what = (f"envelope of {api._and(others)}: each row is a slice of x with "
+                    f"{'its' if len(others) == 1 else 'their'} min and max")
+            what = f"{label}; {what}" if label else what
             if np.any(start[1:] != stop[:-1]):     # the simulator stepped over some slices
-                label += "; slices without a sample are left out"
-        shown += len(rows) - 1
-        if label:
-            body.append(f"-- {label} --")
-        body.extend(_table(rows))
+                what += "; slices without a sample are left out"
+            body.append(f"-- {what} --")
+            body.extend(_table(rows))
 
     head = f"{_ANALYSIS_WORDS.get(h.analysis, h.analysis)} | x: {x_name}"
     if total:
@@ -349,13 +413,28 @@ def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFA
         each = " per table" if shown_tables > 1 else ""
         fidelity = (f"each trace within {_percent(tolerance)} of its range"
                     + ("; _Mag compared in dB" if any(db.values()) else ""))
-        dense = f"too dense to follow every trace within {_percent(tolerance)} in {per_table} rows{each}"
-        if not enveloped and shown < total:
-            head += f" ({shown} shown, {fidelity})"
-        elif enveloped and not followed:
-            head += f" (an envelope of {slices} x slices{each}: {dense}; narrow xrange to see the waveform)"
-        elif enveloped:
-            head += f" ({shown} rows shown, {fidelity}; {enveloped} of {enveloped + followed} tables as envelopes: {dense})"
+        parts = []
+        if followed and (dense or crowded):
+            parts.append(f"{shown} rows shown, {fidelity}")
+        elif followed and shown < total:
+            parts.append(f"{shown} shown, {fidelity}")
+        if dense:
+            reasons = {}
+            for name, hits in dense.items():
+                where = ("" if shown_tables == 1 else " in every table" if len(hits) == shown_tables
+                         else f" in {len(hits)} of {shown_tables} tables")
+                reasons[name] = api.dense_reason([v for kind, v in hits if kind == "swings"],
+                                                 [v for kind, v in hits if kind == "error"], tolerance, "rows", where)
+            parts.append(api.dense_phrase(reasons, tolerance, f"{per_table} rows{each}",
+                                          f"an envelope of {slices} x slices{each}"))
+        if crowded:
+            names = list(crowded)
+            one = len(names) == 1
+            parts.append(f"{api._and(names)} {'fits' if one else 'fit'} alone but not with the other traces "
+                         f"in {per_table} rows{each}, so {'it is an envelope' if one else 'they are envelopes'} "
+                         f"too; select fewer names to see {'its waveform' if one else 'their waveforms'}")
+        if parts:
+            head += f" ({'; '.join(parts)})"
     if len(h.plot_names) > 1:
         head += f" | plot {h.plot}: {h.plot_names[h.plot]} (file has {len(h.plot_names)} plots)"
     if h.version == "waveview":
@@ -448,8 +527,9 @@ _AC_FORMAT_HELP = ("What each complex (AC) trace becomes: \"magphase\" (default;
 
 def _json_result(result: dict, ts=None) -> dict:
     """A JSON result as the agent gets it: at most MCP_MAX_RANGES trace ranges, and a
-    "note" when ranges were cut or the x window of ts kept no point."""
-    notes = []
+    "note" when ranges were cut or the x window of ts kept no point (after the note the
+    result has, such as summary's note on series too dense to follow)."""
+    notes = [result.pop("note")] if result.get("note") else []
     if ts is not None and ts.xrange is not None and ts.sweep_values and not result["points"]:
         notes.append(f"no points in xrange {_interval(ts.xrange)}; {_plot_extent(ts)}")
     ranges = result.get("ranges")
@@ -578,22 +658,23 @@ def extract(
     sweeps and yrange take. Start with text, zoom with xrange; csv or npz keep every
     point.
 
-    text: "TRUNCATED" first when the simulation had not finished writing; a header
-    (analysis, x range, point count, rows shown and their error bound); with xrange, the
-    whole plot's extent; constant traces on one line; a min/max table; then a table per
-    sweep with x once and a column per trace (at most 16). Rows are real samples: the
-    fewest whose straight lines stay within tolerance of every point (peaks, edges,
-    glitches stay). Too dense for that (oscillation, switching): an envelope, a row
-    per x slice with each trace's min and max. 6 significant digits.
+    text: "TRUNCATED" first if the file is cut; a header (analysis, x range, points,
+    rows shown, error bound); with xrange, the plot's extent; constant traces on one
+    line; a min/max table; a table per sweep, x once, a column per trace (at most 16).
+    Rows are real samples: the fewest whose straight lines stay within tolerance of every
+    point (peaks, edges, glitches stay). A trace too dense for that (oscillation,
+    switching) gets an envelope table instead, a row per x slice with its min and max;
+    the header names it and why. 6 significant digits.
 
-    The JSON outputs hold list_traces' fields for the data read: x, x_range, points,
-    sweeps, truncated, traces, ranges (at most 100; then a "note").
+    JSON outputs hold list_traces' fields for the data: x, x_range, points, sweeps,
+    truncated, traces, ranges (at most 100, then a "note").
     summary: also sweep_values, sweep_indices and stats: per trace and sweep count,
     min, max, mean (NaN skipped), first, last; with downsample or tolerance, x/y points
-    chosen the same way and their max_error, or an envelope. NaN and inf become null.
+    chosen alike and their max_error, or for a series too dense for them an envelope and
+    too_dense, named in "note". NaN and inf become null.
     csv, npz, png: the file is written; the result adds output, dest (absolute),
-    engine, sweep_indices when sweeps was given, and for png size [w, h]. For AC, plot
-    the magnitude and the phase separately.
+    engine, sweep_indices (with sweeps), for png size [w, h]. AC: plot magnitude and
+    phase apart.
     """
     if output == "arrays":
         raise ValueError(f"output='arrays' is not available over MCP; use one of {MCP_OUTPUTS}")
