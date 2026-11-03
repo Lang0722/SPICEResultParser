@@ -11,6 +11,7 @@ import math
 import os
 import signal
 import struct
+import time
 from typing import Annotated, Dict, List, Literal, Optional, Union
 
 import numpy as np
@@ -608,8 +609,14 @@ def list_traces(
     file (.mt#, .ms#, .ma#) use read_measures instead.
     """
     engine = waveview.resolve_engine(engine)
-    info = _json_result({**api.list_traces(path, plot, ac_format, names, header_only=header_only, engine=engine,
-                                           max_traces=MCP_MAX_TRACES), "engine": engine})
+    with waveview.listing_memo():                   # WaveView lists the file once for both calls
+        info = _json_result({**api.list_traces(path, plot, ac_format, names, header_only=header_only,
+                                               engine=engine, max_traces=MCP_MAX_TRACES), "engine": engine})
+        cost = api.read_cost(path, plot, ac_format, names, engine)
+    if cost.large:
+        what = "these traces" if cost.engine == "waveview" else "this file"
+        note = f"extract reads {what} only with allow_large=True"
+        info["note"] = f"{info['note']}; {note}" if "note" in info else note
     values = info.get("sweep_values")
     if values is not None and len(values) > MCP_MAX_SWEEP_VALUES:
         info["sweep_values"] = values[:MCP_MAX_SWEEP_VALUES]
@@ -659,8 +666,9 @@ def extract(
                     "beside the input. An error with text or summary.")] = None,
     xrange: Annotated[Optional[List[float]], Number, Field(
         description="[min, max] on x (list_traces gives x_range): keep only rows inside the "
-                    "closed interval, for every output. Applied while reading, so a narrow "
-                    "window on a huge file is cheap: prefer it to reading everything.")] = None,
+                    "closed interval, for every output. Applied while reading, so memory follows "
+                    "the window, but the read still goes through the whole file (WaveView: "
+                    "every point of the traces).")] = None,
     yrange: Annotated[Optional[List[float]], Number, Field(
         description="[min, max] vertical axis limits of the png plot (list_traces gives each "
                     "trace's range); other outputs do not use it, but a malformed value is "
@@ -669,6 +677,11 @@ def extract(
                                            "list_traces). Must be 0 for HSPICE files.")] = 0,
     ac_format: Annotated[Literal[tuple(AC_FORMATS)], Field(description=_AC_FORMAT_HELP)] = "magphase",
     engine: Annotated[Engine, ENGINE_FIELD] = None,
+    allow_large: Annotated[bool, Field(
+        description="True reads a large file: over 1 GB, or through WaveView over 2 M values of the "
+                    "selected traces. Default False: extract then fails before it reads, and says "
+                    "what the read costs (its time, and the memory without xrange). list_traces "
+                    "says so first. The result of a large read gives the time that it took.")] = False,
 ):
     """Read traces from an HSPICE result file or a Nutmeg rawfile. Call list_traces
     first: its names, x_range, sweeps and ranges are what names, xrange, sweeps and
@@ -702,34 +715,78 @@ def extract(
     xrange = api.validate_range("xrange", xrange)
     yrange = api.validate_range("yrange", yrange, finite=True)
     engine = waveview.resolve_engine(engine)
-    if output in ("text", "summary"):
-        if dest is not None:
-            raise ValueError(f"dest applies to csv, npz and png only, not to output={output!r}")
-        ts = api.extract(path, names, sweeps, "arrays", xrange=xrange, plot=plot, ac_format=ac_format,
-                         engine=engine)
-        if output == "text":
-            return format_text(ts, downsample, reduce.DEFAULT_TOLERANCE if tolerance is None else tolerance)
+    if output in ("text", "summary") and dest is not None:
+        raise ValueError(f"dest applies to csv, npz and png only, not to output={output!r}")
+    if output not in ("text", "summary"):
+        api.resolve_dest(path, output, dest)         # fail before the read, not after it
+        if output == "png":
+            api._require_matplotlib()
+    with waveview.listing_memo():                   # WaveView lists the file once for the cost and the read
+        cost = api.read_cost(path, plot, ac_format, names, engine)
+        if output == "summary" and cost.traces > MCP_MAX_SERIES:
+            raise _too_many_series(cost.traces)     # before the read: each trace is a series of each sweep
+        if cost.large and not allow_large:
+            raise ValueError(_large_read(cost, output, xrange is not None))
+        start = time.perf_counter()
+        ts = api.extract(path, names, sweeps, "arrays", downsample if output in ("csv", "npz") else None,
+                         xrange=xrange, plot=plot, ac_format=ac_format, engine=engine)
+        took = time.perf_counter() - start         # png draws every point's envelope; text and summary reduce
+    note = _large_took(cost, took) if cost.large else None
+    if output == "text":
+        text = format_text(ts, downsample, reduce.DEFAULT_TOLERANCE if tolerance is None else tolerance)
+        return f"{text}\n-- {note} --" if note else text
+    if output == "summary":
         traces, nsweeps = len(ts.selected) - 1, len(ts.sweep_values)
         if traces * nsweeps > MCP_MAX_SERIES:
-            raise ValueError(f"a summary of {traces} traces x {nsweeps} sweeps = {traces * nsweeps} series is too "
-                             f"large for one reply (at most {MCP_MAX_SERIES}): select fewer with names=[...] or "
-                             f"sweeps=[...], or use output='text' (always bounded) or 'csv'")
-        return _json_result(api.summarize(ts, downsample, tolerance), ts)
-    api.resolve_dest(path, output, dest)             # fail before the read, not after it
-    if output == "png":
-        api._require_matplotlib()
-    ts = api.extract(path, names, sweeps, "arrays", None if output == "png" else downsample, xrange=xrange,
-                     plot=plot, ac_format=ac_format, engine=engine)    # png draws every point's envelope
-    written = os.path.abspath(api.write_file(ts, output, dest, yrange))
-    facts = api.overview(ts)
-    result = {"output": output, "dest": written}
-    for key in ("x", "x_range", "points", "sweeps", "sweep_indices", "truncated", "traces", "ranges"):
-        if key != "sweep_indices" or sweeps is not None:
-            result[key] = facts[key]
-    result["engine"] = engine
-    if output == "png":
-        result["size"] = list(_png_size(written))
+            raise _too_many_series(traces, nsweeps)
+        result = api.summarize(ts, downsample, tolerance)
+    else:
+        written = os.path.abspath(api.write_file(ts, output, dest, yrange))
+        facts = api.overview(ts)
+        result = {"output": output, "dest": written}
+        for key in ("x", "x_range", "points", "sweeps", "sweep_indices", "truncated", "traces", "ranges"):
+            if key != "sweep_indices" or sweeps is not None:
+                result[key] = facts[key]
+        result["engine"] = engine
+        if output == "png":
+            result["size"] = list(_png_size(written))
+    if note:
+        result["note"] = f"{result['note']}; {note}" if result.get("note") else note
     return _json_result(result, ts)
+
+
+def _too_many_series(traces: int, nsweeps: Optional[int] = None) -> ValueError:
+    """The error of a summary of too many (trace, sweep) series; nsweeps None: before the read."""
+    count = (f"{traces} traces x {nsweeps} sweeps = {traces * nsweeps} series" if nsweeps is not None
+             else f"{traces} traces (a series per trace and sweep)")
+    return ValueError(f"a summary of {count} is too large for one reply (at most {MCP_MAX_SERIES} series): select "
+                      f"fewer with names=[...] or sweeps=[...], or use output='text' (always bounded) or 'csv'")
+
+
+def _large_read(cost: api.ReadCost, output: str, windowed: bool) -> str:
+    """The error of extract before a large read without allow_large=True: what the read costs."""
+    traces = f"{cost.traces} selected trace{'s' if cost.traces != 1 else ''}"
+    if cost.engine == "waveview":
+        return (f"extract did not run WaveView: for the {traces} it would write {cost.values:,} values, more than "
+                f"the {api.WAVEVIEW_SCAN_MAX_VALUES:,} that extract takes without allow_large=True. That takes "
+                f"{api.read_time(cost)} and about {api._size(cost.memory)} of memory, for any xrange (it applies "
+                f"after the read). Pass allow_large=True to read them, or select fewer traces")
+    then = " Then text and summary reduce each point that they keep." if output in ("text", "summary") else ""
+    memory = (f"With this xrange, memory holds only the window of x and the {traces}" if windowed else
+              f"Without xrange, x and the {traces} take about {api._size(cost.memory)} of memory; with xrange, "
+              f"only their window")
+    return (f"extract did not read the file: it has {api._size(cost.bytes)}, about {api._amount(cost.points)} "
+            f"points, more than the {api._size(api.SCAN_MAX_BYTES)} that extract reads without "
+            f"allow_large=True. Each extract goes through all of it, for any names, sweeps and xrange: "
+            f"{api.read_time(cost)}.{then} {memory}. Pass allow_large=True to read it")
+
+
+def _large_took(cost: api.ReadCost, took: float) -> str:
+    """The note of a large read: how long it took, as every later read of the file takes it again."""
+    if cost.engine == "waveview":
+        return f"WaveView took {api._duration(took)} to write the {cost.values:,} values of these traces"
+    return (f"this read took {api._duration(took)}: each extract reads all {api._size(cost.bytes)} of the "
+            f"file again, for any names, sweeps and xrange")
 
 
 @_tool(read_only=True)

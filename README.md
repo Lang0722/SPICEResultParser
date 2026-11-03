@@ -105,8 +105,15 @@ parameters.
 
 A pass over a 100 GB file takes minutes. Thus `list_traces` reads the data only of a
 file of at most 1 GB. Of a larger file it reads only the header, and a `note` says so.
-`header_only=False` reads the data of any file. `names` does not make that pass
-shorter, because each point of the file holds every trace.
+The note gives the size, the point count and the time of a pass. `header_only=False`
+reads the data of any file. `names` does not make that pass shorter, because each point
+of the file holds every trace. `xrange` does not make it shorter either: it keeps only
+the window in memory, but the reader still goes through the whole file.
+
+Over MCP, `extract` warns before a large read. It reads a file over 1 GB only with
+`allow_large=True`. Without it, the call fails before the read, and the error gives
+the time of the read and the memory of the selected traces. `list_traces` says so first.
+After a large read, the result gives the time that the read took.
 
 `list_traces(path, max_traces=N)` lists at most `N` trace names. `trace_count` gives
 the number of traces, and `groups` counts all of them by name prefix:
@@ -184,7 +191,7 @@ pip install "spice_result_parser[mcp,plot] @ git+https://github.com/Lang0722/SPI
 The server has three tools:
 
 - `list_traces(path, names, plot, ac_format, header_only, engine)`
-- `extract(path, names, sweeps, output, downsample, tolerance, dest, xrange, yrange, plot, ac_format, engine)`
+- `extract(path, names, sweeps, output, downsample, tolerance, dest, xrange, yrange, plot, ac_format, engine, allow_large)`
 - `read_measures(path, names, rows, engine)`
 
 `list_traces` and `extract` accept HSPICE result files and Nutmeg rawfiles. `plot`

@@ -429,7 +429,8 @@ class TestListTraces(FakeWaveView):
                                           "sweep_params", "trace_count", "traces", "note"])
             self.assertEqual(info["note"], f"list_traces read only the WaveView listing: the ranges of these 4 "
                                            f"traces take {values:,} values from WaveView, more than the "
-                                           f"{values - 1:,} that it reads by default; header_only=False reads "
+                                           f"{values - 1:,} that list_traces reads by default, about 1 s (at the "
+                                           f"250,000 values per second of the test VM); header_only=False reads "
                                            f"them, and names with fewer traces takes fewer")
             self.assertIn("ranges", api.list_traces(WV / "rc.tr0", names="v(out", engine="waveview"))
             self.assertIn("ranges", api.list_traces(WV / "rc.tr0", engine="waveview", header_only=False))
@@ -1175,6 +1176,24 @@ class TestMcpOutputs(FakeWaveView):
 
     def tools(self):
         return {t.name: t for t in asyncio.run(self.m.server.list_tools())}
+
+    def test_extract_asks_before_a_large_waveview_read(self):
+        _, values, _ = waveview.scan_cost(WV / "rc.tr0", names="v(out")
+        with mock.patch.object(api, "WAVEVIEW_SCAN_MAX_VALUES", values - 1):
+            with mock.patch.object(waveview, "_run", wraps=waveview._run) as run:
+                with self.assertRaisesRegex(self.m.ToolError, rf"^extract did not run WaveView: for the 1 selected "
+                                                              rf"trace it would write {values:,} values, more than "
+                                                              rf"the {values - 1:,} that extract takes without "
+                                                              rf"allow_large=True\. That takes about 1 s"):
+                    self.m.extract(str(WV / "rc.tr0"), "v(out", engine="waveview")
+            self.assertEqual([c.args[0] for c in run.call_args_list], ["list_traces.tcl"])     # no export
+            with mock.patch.object(waveview, "_run", wraps=waveview._run) as run:
+                text = self.m.extract(str(WV / "rc.tr0"), "v(out", engine="waveview", allow_large=True)
+            self.assertEqual([c.args[0] for c in run.call_args_list], ["list_traces.tcl", "extract.tcl"])
+            self.assertRegex(text.splitlines()[-1], rf"^-- WaveView took \d+ s to write the {values:,} values of "
+                                                    rf"these traces --$")
+            note = self.m.list_traces(str(WV / "rc.tr0"), names="v(out", engine="waveview")["note"]
+            self.assertTrue(note.endswith("; extract reads these traces only with allow_large=True"))
 
     def test_signal_stops_waveview_first(self):
         with mock.patch.object(waveview, "stop_all") as stop, mock.patch.object(self.m.os, "_exit") as end:

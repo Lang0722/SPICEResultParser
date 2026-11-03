@@ -199,7 +199,48 @@ list_traces("chip.tr0")["note"]
 ```
 
 `header_only=False` reads the data of any file. `names` does not make the pass shorter,
-because each point of the file holds every trace.
+because each point of the file holds every trace. `sweeps` and `xrange` do not make it
+shorter either: the reader goes through the whole file and keeps only what they select.
+`list_traces` notes a large file also with `header_only=True` and `header_only=False`.
+
+`api.read_cost(path, plot, ac_format, names, engine)` gives the cost of a read before
+it starts, from the header alone (`scan=True`: the pass of `list_traces`). The result is
+a `ReadCost`:
+
+- `bytes`: the size of the file. The Python engine reads all of it.
+- `points`: the points in the file, from its size. The estimate is within 0.5% for the
+  binary formats and HSPICE ASCII, and within 4% for Nutmeg ASCII.
+- `traces` and `memory`: the selected traces, and the bytes that they and x take
+  without `xrange`. With `xrange`, only the window takes memory.
+- `seconds`: the time of the read, about, as (the file in memory, the file on a disk that
+  reads 200 MB/s). The rates of the file in memory are in `api.PASS_RATES`. They come
+  from this machine: for example, 1.5 GB/s for a 9601 file and 120 MB/s for an ASCII
+  file. A text file is slower than any disk, so both times are the same.
+- `large`: the file is over `api.SCAN_MAX_BYTES` (1 GB).
+
+For the WaveView engine, `values` is the count of values that WaveView writes for the
+selected traces, from the point counts of its listing. `seconds` then comes from the
+rate of the test VM (250,000 values per second), and `large` means more than 2 M values.
+
+Over MCP, `extract` warns before a large read. It reads a large file only with
+`allow_large=True`. Without it, the call fails before the read:
+
+```
+extract did not read the file: it has 100 GB, about 4.16e6 points, more than the 1 GB
+that extract reads without allow_large=True. Each extract goes through all of it, for
+any names, sweeps and xrange: about 50 s to 8 min (the file in memory, or on a disk
+that reads 200 MB/s). Then text and summary reduce each point that they keep. Without
+xrange, x and the 111 selected traces take about 3.73 GB of memory; with xrange, only
+their window. Pass allow_large=True to read it
+```
+
+The `list_traces` result of a large file ends its `note` with `extract reads this file
+only with allow_large=True`. Thus the agent knows the cost before its first `extract`.
+After a large read, the result gives the time that the read took: a last line
+`-- this read took 3 min: each extract reads all 100 GB of the file again, for any
+names, sweeps and xrange --` in `text`, and the same words in the `note` of the JSON
+results. An agent does not see the time pass, so the result tells it what each later
+read of the file costs. A `summary` of more than 200 traces fails before the read too.
 
 A large design can write a million traces. `list_traces(path, max_traces=N)` lists at
 most `N` of them in `traces` and `ranges`. `trace_count` gives the number of traces
@@ -657,7 +698,7 @@ pip install 'spice_result_parser[mcp]'
 
 Tools: `list_traces(path, names, plot, ac_format, header_only, engine)`, `extract(path,
 names, sweeps, output, downsample, tolerance, dest, xrange, yrange, plot, ac_format,
-engine)` and `read_measures(path, names, rows, engine)`. `engine` selects the reader (see
+engine, allow_large)` and `read_measures(path, names, rows, engine)`. `engine` selects the reader (see
 [WaveView engine](#waveview-engine)). `list_traces` and `extract` accept HSPICE result
 files and Nutmeg rawfiles. `read_measures` accepts HSPICE measure files. `plot` selects
 one plot of a rawfile. `ac_format` names AC traces as above. `list_traces` and `extract`
@@ -769,8 +810,9 @@ NaN and infinity print as `nan`/`inf`.
 needs it.
 
 `xrange=[lo, hi]` restricts every output to the rows whose x value lies in that closed
-interval. The reader applies it while the file streams, so a narrow window on a huge
-file is cheap. `yrange=[lo, hi]` sets the vertical axis limits of the `png` image
+interval. The reader applies it while the file streams, so memory follows the window.
+The read still goes through the whole file, so a window of a huge file takes as long as
+the whole file (see [Large files](#large-files)). `yrange=[lo, hi]` sets the vertical axis limits of the `png` image
 (finite numbers). The other outputs do not use it, but a malformed value is still an
 error. For AC data, the `png` image draws every selected trace on one y axis. Thus
 request the magnitude and the phase in separate calls.

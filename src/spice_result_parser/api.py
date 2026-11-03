@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import dataclasses
 import errno
 import math
 import operator
@@ -27,9 +28,84 @@ def readers(engine: Optional[str] = None):
     return read_header, read_traces, scan
 
 
-SCAN_MAX_BYTES = 1_000_000_000      # list_traces reads the data of a file up to this size by default: a pass
-                                    # takes about 2 s at the 630 MB/s of a 9601 file (ASCII: about 10 s)
-WAVEVIEW_SCAN_MAX_VALUES = 2_000_000    # and through WaveView up to this many values: about 8 s on the test VM
+SCAN_MAX_BYTES = 1_000_000_000      # a larger file is large: list_traces reads only its header by default, and the
+                                    # MCP extract reads it only with allow_large=True
+WAVEVIEW_SCAN_MAX_VALUES = 2_000_000    # through WaveView, more values for the selected traces are large
+
+# Bytes per second of a pass over the data, measured with the file in the page cache: (the
+# scan of list_traces, read_traces of one trace). A disk can be slower: the slow estimate
+# takes DISK_RATE. The text formats are slower than any disk: they parse every value.
+PASS_RATES = {"9601": (600e6, 1.5e9), "2013": (330e6, 0.9e9), "2001": (1e9, 2e9), "ascii": (120e6, 120e6),
+              "nutmeg": (1.5e9, 3e9), "nutmeg ascii": (75e6, 75e6)}
+DISK_RATE = 200e6
+WAVEVIEW_RATE = 250_000             # values that WaveView writes per second: 1 M in about 4 s on the test VM
+_VALUE_BYTES = {"ascii": 13.2, "nutmeg ascii": 24.0}  # bytes of one value in a text file, about
+_WAVEVIEW_VALUE_MEMORY = 33         # bytes per value through WaveView: its text, then a float64
+
+
+@dataclasses.dataclass
+class ReadCost:
+    """What a read of the data costs, from the header (WaveView: its listing) alone. The
+    Python engine reads the whole file for any names, sweeps and xrange; the WaveView engine
+    writes every point of the selected signals, for any xrange."""
+    engine: str
+    bytes: int                      # size of the file
+    points: int                     # points in the file, about (from its size); 0 for WaveView
+    traces: int                     # selected traces
+    values: int                     # WaveView: the values that it writes for them, x included; 0 for Python
+    memory: int                     # bytes that x and the selected traces take without xrange, about
+    seconds: Tuple[float, float]    # how long the read takes, about: the file in memory, the file on a disk
+    large: bool                     # over SCAN_MAX_BYTES (WaveView: over WAVEVIEW_SCAN_MAX_VALUES)
+
+
+def read_cost(path, plot: int = 0, ac_format: str = "magphase", names=None, engine: Optional[str] = None,
+              scan: bool = False) -> ReadCost:
+    """The cost of reading the traces that names selects, as read_traces reads them (scan=True:
+    the pass of list_traces). It reads only the header; WaveView lists the file, and within
+    waveview.listing_memo() that listing serves the read that follows."""
+    read_head, _, _ = readers(engine)
+    header = read_head(path, plot, ac_format)
+    return _cost(path, header, resolve_columns(header, names), plot, ac_format, scan)
+
+
+def _cost(path, header, cols: List[int], plot, ac_format: str, scan: bool) -> ReadCost:
+    size = os.path.getsize(path)
+    if header.version == "waveview":
+        _, values, _ = waveview.scan_cost(path, plot, ac_format, [header.names[c] for c in cols[1:]])
+        seconds = values / WAVEVIEW_RATE
+        return ReadCost("waveview", size, 0, len(cols) - 1, values, values * _WAVEVIEW_VALUE_MEMORY,
+                        (seconds, seconds), values > WAVEVIEW_SCAN_MAX_VALUES)
+    kind = header.version + ("" if header.is_binary or header.version != "nutmeg" else " ascii")
+    points = int(size / (header.stream_width * _VALUE_BYTES.get(kind, header.dtype.itemsize)))
+    memory = points * sum(header.column_dtype(c).itemsize for c in cols)
+    rate = PASS_RATES.get(kind, (DISK_RATE, DISK_RATE))[0 if scan else 1]
+    return ReadCost("python", size, points, len(cols) - 1, 0, memory, (size / rate, size / min(rate, DISK_RATE)),
+                    size > SCAN_MAX_BYTES)
+
+
+def _duration(seconds: float) -> str:
+    if seconds < 90:
+        return f"{max(1, round(seconds))} s"
+    if seconds < 5400:
+        return f"{round(seconds / 60)} min"
+    return f"{seconds / 3600:.2g} h"
+
+
+def read_time(cost: ReadCost) -> str:
+    """How long the read of cost takes, in words: 'about 1 to 8 min (...)'."""
+    fast, slow = (_duration(s) for s in cost.seconds)
+    if cost.engine == "waveview":
+        return f"about {fast} (at the {WAVEVIEW_RATE:,} values per second of the test VM)"
+    if fast == slow:
+        return f"about {fast}"
+    if fast.split()[1] == slow.split()[1]:
+        fast = fast.split()[0]
+    return f"about {fast} to {slow} (the file in memory, or on a disk that reads {_size(DISK_RATE)}/s)"
+
+
+def _amount(n: int) -> str:
+    """A count in few digits: 1.25e9, 3200."""
+    return str(n) if n < 10_000 else f"{n:.3g}".replace("e+0", "e").replace("e+", "e")
 
 
 def list_traces(path, plot: int = 0, ac_format: str = "magphase", names=None,
@@ -71,10 +147,15 @@ def list_traces(path, plot: int = 0, ac_format: str = "magphase", names=None,
         cols = resolve_columns(h, names)[1:]
         shown = cols if max_traces is None else cols[:max_traces]
         notes = []
-        if header_only is None:
-            why = _why_header_only(path, h, shown, through_wv, plot, ac_format)
-            header_only = why is not None
-            notes += [why] if why else []
+        why = _own_x(path, h, shown, plot, ac_format) if through_wv and header_only is None else None
+        cost = _cost(path, h, [0, *shown], plot, ac_format, scan=True)
+        if why is None and cost.large:
+            why = _large_note(cost, header_only is None)
+        if why is not None:
+            notes.append(why)
+            header_only = True if header_only is None else header_only
+        elif header_only is None:
+            header_only = False
         if not header_only:
             s = scan_plot(path, plot, ac_format, names if len(shown) == len(cols) else [h.names[c] for c in shown])
     result = {"path": h.path, "format": h.version, "analysis": h.analysis, "plot": h.plot,
@@ -118,24 +199,29 @@ def _size(n: int) -> str:
     return f"{n} bytes"
 
 
-def _why_header_only(path, header, cols: List[int], through_wv: bool, plot, ac_format: str) -> Optional[str]:
-    """Why list_traces reads only the header by default (see list_traces), or None to read the data."""
-    if through_wv:
-        signals, values, shared_x = waveview.scan_cost(path, plot, ac_format, [header.names[c] for c in cols])
-        if signals > 1 and not shared_x:
-            return ("list_traces read only the WaveView listing: in this file each signal has its own x points, "
-                    "and WaveView ranges one signal at a time (names with one trace)")
-        if values > WAVEVIEW_SCAN_MAX_VALUES:
-            return (f"list_traces read only the WaveView listing: the ranges of these {len(cols)} traces take "
-                    f"{values:,} values from WaveView, more than the {WAVEVIEW_SCAN_MAX_VALUES:,} that it reads by "
-                    f"default; header_only=False reads them, and names with fewer traces takes fewer")
-        return None
-    size = os.path.getsize(path)
-    if size > SCAN_MAX_BYTES:
-        return (f"list_traces read only the header: the file has {_size(size)}, more than the {_size(SCAN_MAX_BYTES)} "
-                f"that it reads by default; header_only=False reads it all for x_range, points, sweep_values, "
-                f"truncated and ranges (names does not make that read shorter)")
+def _own_x(path, header, cols: List[int], plot, ac_format: str) -> Optional[str]:
+    """Why list_traces does not range these traces through WaveView: a file whose signals have
+    their own x points (extract.tcl stops at the second signal); None to range them."""
+    signals, _, shared_x = waveview.scan_cost(path, plot, ac_format, [header.names[c] for c in cols])
+    if signals > 1 and not shared_x:
+        return ("list_traces read only the WaveView listing: in this file each signal has its own x points, "
+                "and WaveView ranges one signal at a time (names with one trace)")
     return None
+
+
+def _large_note(cost: ReadCost, skipped: bool) -> str:
+    """list_traces' note on a large read (see ReadCost.large): what it costs, and with
+    skipped (header_only=None) that list_traces did not make it and how to."""
+    if cost.engine == "waveview":
+        facts = (f"the ranges of these {cost.traces} traces take {cost.values:,} values from WaveView, more than "
+                 f"the {WAVEVIEW_SCAN_MAX_VALUES:,} that list_traces reads by default, {read_time(cost)}")
+        return (f"list_traces read only the WaveView listing: {facts}; header_only=False reads them, and names "
+                f"with fewer traces takes fewer") if skipped else facts
+    facts = (f"the file has {_size(cost.bytes)}, about {_amount(cost.points)} points, more than the "
+             f"{_size(SCAN_MAX_BYTES)} that list_traces reads by default: a pass over the data goes through all "
+             f"of it for any names, sweeps and xrange, {read_time(cost)}")
+    return (f"list_traces read only the header: {facts}; header_only=False makes it, for x_range, points, "
+            f"sweep_values, truncated and ranges") if skipped else facts
 
 
 def value_eps(ts: TraceSet) -> float:

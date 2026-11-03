@@ -385,7 +385,11 @@ _LISTINGS: contextvars.ContextVar = contextvars.ContextVar("srp_waveview_listing
 def listing_memo():
     """Within the block, WaveView lists each (path, plot, ac_format) once: api.list_traces
     takes the header, the cost of a scan (scan_cost) and the scan from one run of
-    list_traces.tcl. Outside a block every call runs WaveView, as the file can change."""
+    list_traces.tcl. A block inside a block shares its listings. Outside a block every
+    call runs WaveView, as the file can change."""
+    if _LISTINGS.get() is not None:
+        yield
+        return
     token = _LISTINGS.set({})
     try:
         yield

@@ -1311,21 +1311,63 @@ class TestApi(unittest.TestCase):
 
     def test_list_traces_reads_only_the_header_of_a_large_file(self):
         size = self.path.stat().st_size
+        cost = api.read_cost(self.path, scan=True)
+        facts = (f"the file has {api._size(size)}, about {api._amount(cost.points)} points, more than the 1 kB "
+                 f"that list_traces reads by default: a pass over the data goes through all of it for any names, "
+                 f"sweeps and xrange, {api.read_time(cost)}")
         with mock.patch.object(api, "SCAN_MAX_BYTES", 1000), \
                 mock.patch.object(api, "scan", side_effect=AssertionError("data read")):
             info = api.list_traces(self.path)
         self.assertEqual(list(info), ["path", "format", "analysis", "plot", "plots", "x", "sweeps",
                                       "sweep_params", "trace_count", "traces", "note"])
-        self.assertEqual(info["note"], f"list_traces read only the header: the file has {api._size(size)}, more "
-                                       f"than the 1 kB that it reads by default; header_only=False reads it all "
-                                       f"for x_range, points, sweep_values, truncated and ranges (names does not "
-                                       f"make that read shorter)")
+        self.assertEqual(info["note"], f"list_traces read only the header: {facts}; header_only=False makes it, for "
+                                       f"x_range, points, sweep_values, truncated and ranges")
         with mock.patch.object(api, "SCAN_MAX_BYTES", 1000):
-            self.assertIn("ranges", api.list_traces(self.path, header_only=False))      # asked for: read it all
-            self.assertNotIn("note", api.list_traces(self.path, header_only=True))
-        self.assertIn("ranges", api.list_traces(self.path))                              # small: read
+            asked = api.list_traces(self.path, header_only=False)                  # asked for: read it all
+            self.assertEqual((asked["note"], "ranges" in asked), (facts, True))
+            self.assertEqual(api.list_traces(self.path, header_only=True)["note"], facts)   # told it is large
+        self.assertNotIn("note", api.list_traces(self.path))                        # small: read, no note
         self.assertEqual([api._size(n) for n in (999, 1000, 1_500_000, 10 ** 11)],
                          ["999 bytes", "1 kB", "1.5 MB", "100 GB"])
+
+    def test_read_cost_comes_from_the_header(self):
+        rng = np.random.default_rng(4)
+        files = {"2001": make_multi(self.dir, "2001")[0], "9601": make_multi(self.dir, "9601")[0],
+                 "ascii": self.dir / "a.tr0"}
+        fixtures.write_ascii(files["ascii"], ASCII_NAMES, ASCII_CODES, [([1.0], rng.random((3000, 4)))])
+        nutmeg = self.dir / "n.raw"
+        fixtures.write_nutmeg(nutmeg, [("Transient Analysis", ["time", "v(a)", "v(b)"], rng.random((3000, 3)),
+                                        False)], binary=False)
+        files["nutmeg ascii"] = nutmeg
+        from spice_result_parser import nutmeg as nut
+        for kind, path in files.items():
+            with self.subTest(kind), mock.patch.object(reader, "_feed_data", side_effect=AssertionError("read")), \
+                    mock.patch.object(nut, "_read_data", side_effect=AssertionError("read")):
+                cost = api.read_cost(path, names=["TIME", "v_a"] if kind != "nutmeg ascii" else ["v(a)"])
+            points = reader.scan(path).points
+            self.assertAlmostEqual(cost.points / points, 1, delta=0.1)                  # from the size alone
+            header = reader.read_header(path)
+            self.assertEqual(cost.memory, cost.points * (header.x_dtype.itemsize + header.dtype.itemsize))
+            self.assertEqual((cost.engine, cost.traces, cost.values, cost.large), ("python", 1, 0, False))
+            self.assertLessEqual(cost.seconds[0], cost.seconds[1])
+            self.assertEqual(cost.bytes, Path(path).stat().st_size)
+        with mock.patch.object(api, "SCAN_MAX_BYTES", 1000):
+            self.assertTrue(api.read_cost(files["2001"]).large)
+        with self.assertRaisesRegex(ValueError, "did you mean v_a"):               # names fail first
+            api.read_cost(files["2001"], names="v_aa")
+
+    def test_read_time_in_words(self):
+        def cost(seconds, engine="python"):
+            return api.ReadCost(engine, 10 ** 11, 10 ** 9, 2, 0, 8 * 10 ** 9, seconds, True)
+        disk = "(the file in memory, or on a disk that reads 200 MB/s)"
+        self.assertEqual(api.read_time(cost((67, 500))), f"about 67 s to 8 min {disk}")
+        self.assertEqual(api.read_time(cost((130, 290))), f"about 2 to 5 min {disk}")
+        self.assertEqual(api.read_time(cost((13, 13))), "about 13 s")
+        self.assertEqual(api.read_time(cost((0.2, 0.4))), "about 1 s")
+        self.assertEqual(api.read_time(cost((9000, 9000))), "about 2.5 h")
+        self.assertEqual(api.read_time(cost((200, 200), "waveview")),
+                         "about 3 min (at the 250,000 values per second of the test VM)")
+        self.assertEqual([api._amount(n) for n in (3200, 2_500_000, 1_250_000_000)], ["3200", "2.5e6", "1.25e9"])
 
     def test_list_traces_and_summary_share_their_keys(self):
         info = api.list_traces(self.path)
@@ -2390,9 +2432,60 @@ class TestMcp(unittest.TestCase):
         with mock.patch.object(api, "SCAN_MAX_BYTES", 1000):
             out = self.m.list_traces(str(HERE / "test_9601.tr0"))
             self.assertNotIn("ranges", out)
-            self.assertIn("header_only=False reads it all", out["note"])
+            self.assertIn("header_only=False makes it", out["note"])
+            self.assertTrue(out["note"].endswith("; extract reads this file only with allow_large=True"))
             self.assertEqual(out["engine"], "python")
+            out = self.m.list_traces(str(HERE / "test_9601.tr0"), header_only=True)
+            self.assertIn("extract reads this file only with allow_large=True", out["note"])
             self.assertIn("ranges", self.m.list_traces(str(HERE / "test_9601.tr0"), header_only=False))
+        self.assertNotIn("note", self.m.list_traces(str(HERE / "test_9601.tr0")))
+
+    def test_extract_asks_before_a_large_read(self):
+        path = str(HERE / "test_9601.tr0")
+        size = (HERE / "test_9601.tr0").stat().st_size
+        with mock.patch.object(api, "SCAN_MAX_BYTES", 1000):
+            cost = api.read_cost(path, names="v(vo")
+            for output in ("text", "summary", "csv"):
+                with self.subTest(output), \
+                        mock.patch.object(reader, "_feed_data", side_effect=AssertionError("data read")):
+                    with self.assertRaises(self.m.ToolError) as caught:
+                        self.m.extract(path, "v(vo", output=output, dest=str(self.dir / "o.csv") if output == "csv"
+                                       else None)
+                then = " Then text and summary reduce each point that they keep." if output != "csv" else ""
+                self.assertEqual(str(caught.exception),
+                                 f"extract did not read the file: it has {api._size(size)}, about "
+                                 f"{api._amount(cost.points)} points, more than the 1 kB that extract reads without "
+                                 f"allow_large=True. Each extract goes through all of it, for any names, sweeps "
+                                 f"and xrange: {api.read_time(cost)}.{then} Without xrange, x and the 1 selected "
+                                 f"trace take about {api._size(cost.memory)} of memory; with xrange, only their "
+                                 f"window. Pass allow_large=True to read it")
+            with self.assertRaisesRegex(self.m.ToolError, r"With this xrange, memory holds only the window of x "
+                                                          r"and the 2 selected traces\. Pass allow_large=True"):
+                self.m.extract(path, ["v(vo", "v(vs"], xrange=[0, 0.001])
+            took = re.compile(rf"this read took \d+ s: each extract reads all {re.escape(api._size(size))} of the "
+                              rf"file again, for any names, sweeps and xrange")
+            text = self.m.extract(path, "v(vo", allow_large=True)
+            self.assertRegex(text.splitlines()[-1], rf"^-- {took.pattern} --$")    # the time, after the data
+            self.assertRegex(self.m.extract(path, "v(vo", output="summary", allow_large=True)["note"], took)
+            written = self.m.extract(path, "v(vo", output="csv", dest=str(self.dir / "o.csv"), allow_large=True)
+            self.assertRegex(written["note"], took)
+        self.assertNotIn("this read took", self.m.extract(path, "v(vo"))           # small: no note
+
+    def test_a_summary_of_too_many_traces_fails_before_the_read(self):
+        names = ["TIME"] + [f"v(n{i}" for i in range(self.m.MCP_MAX_SERIES + 1)]
+        path = self.dir / "wide.tr0"
+        fixtures.write_binary(path, "2001", names, [1] * len(names), [([], np.ones((3, len(names))))])
+        with mock.patch.object(reader, "_feed_data", side_effect=AssertionError("data read")):
+            with self.assertRaisesRegex(self.m.ToolError, rf"^a summary of {self.m.MCP_MAX_SERIES + 1} traces \(a "
+                                                          rf"series per trace and sweep\) is too large"):
+                self.m.extract(str(path), output="summary")
+
+    def test_the_tools_state_what_a_large_read_costs(self):
+        props = self.schema(self.tools()["extract"])["properties"]
+        self.assertIn("the read still goes through the whole file", props["xrange"]["description"])
+        self.assertNotIn("cheap", props["xrange"]["description"])
+        self.assertIn(f"over {api._size(api.SCAN_MAX_BYTES)}", props["allow_large"]["description"])
+        self.assertIn(f"over {api.WAVEVIEW_SCAN_MAX_VALUES / 1e6:g} M values", props["allow_large"]["description"])
 
     def test_list_traces_documents_its_cut_result(self):
         names = ["TIME"] + [f"v(x{c}.n{i}" for c in range(3) for i in range(50)]
