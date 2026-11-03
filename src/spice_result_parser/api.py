@@ -212,7 +212,32 @@ def dense_reason(swung: List[int], errors: List[float], tolerance: float, unit: 
     return f"its changes between numbers, NaN and infinities alone need more {unit}{where}"
 
 
-def dense_phrase(reasons: Dict[str, str], tolerance: float, budget: str, envelope: str) -> str:
+def _round_sig(value: float, digits: int, up: bool) -> float:
+    """value (> 0) rounded up or down to `digits` significant digits."""
+    scale = 10.0 ** (math.floor(math.log10(value)) - digits + 1)
+    return float(f"{(math.ceil if up else math.floor)(value / scale) * scale:.12g}")
+
+
+def zoom_advice(window: Optional[Tuple[float, float]], log: bool) -> Optional[Tuple[List[float], str]]:
+    """A reduce.zoom_window (criterion values of x) as the caller passes it: ([lo, hi] in x,
+    "xrange=[lo, hi], or another window up to <width> wide"). On a log-frequency axis the
+    width is a factor, and the bounds are rounded inward to 3 digits. None for None."""
+    if window is None:
+        return None
+    a, b = window
+    if log:
+        lo, hi = _round_sig(10.0 ** a, 3, up=True), _round_sig(10.0 ** b, 3, up=False)
+        if not hi > lo:
+            return None
+        width = f"a factor of {hi / lo:.3g}"
+    else:
+        lo, hi = a, b
+        width = f"{b - a:.3g}"
+    return [lo, hi], f"xrange=[{lo:.6g}, {hi:.6g}], or another window up to {width} wide"
+
+
+def dense_phrase(reasons: Dict[str, str], tolerance: float, budget: str, envelope: str,
+                 zoom: Optional[str] = None) -> str:
     """What every output says of the traces that it cannot follow within the tolerance:
 
         v_osc is too dense to follow within 1% in 500 rows (it swings at least 1992 times by more
@@ -220,19 +245,23 @@ def dense_phrase(reasons: Dict[str, str], tolerance: float, budget: str, envelop
         its waveform
 
     reasons maps each such trace to dense_reason; budget is "500 rows", "250 points" ...;
-    envelope is what the caller gets instead ("an envelope of 100 x slices"). At most
-    DENSE_NAMES_MAX traces are named; the others are counted."""
+    envelope is what the caller gets instead ("an envelope of 100 x slices"). zoom is the
+    window to look at next (zoom_advice): a caller that gets an envelope zooms in, so it
+    learns how far at once. At most DENSE_NAMES_MAX traces are named; the others are
+    counted."""
     names = list(reasons)
+    one = len(names) == 1
     within = f"too dense to follow within {_percent(tolerance)} in {budget}"
-    if len(names) == 1:
-        return (f"{names[0]} is {within} ({reasons[names[0]]}), so it is {envelope}; "
-                f"narrow xrange to see its waveform")
+    see = "its waveform" if one else "their waveforms"
+    advice = f"to see {see}, zoom in with {zoom}" if zoom else f"narrow xrange to see {see}"
+    if one:
+        return f"{names[0]} is {within} ({reasons[names[0]]}), so it is {envelope}; {advice}"
     shown = names[:DENSE_NAMES_MAX]
     listed = [f"{name} ({reasons[name]})" for name in shown]
     if len(names) > len(shown):
         listed.append(f"{len(names) - len(shown)} more traces")
     envelopes = envelope.replace("an envelope", "envelopes", 1)
-    return f"{_and(listed)} are {within}, so they are {envelopes}; narrow xrange to see their waveforms"
+    return f"{_and(listed)} are {within}, so they are {envelopes}; {advice}"
 
 
 def summarize(ts: TraceSet, downsample: Optional[int] = None, tolerance: Optional[float] = None) -> dict:
@@ -253,7 +282,9 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None, tolerance: Optiona
     the slice's bounds and the trace's lowest and highest sample in it (reduce.peak_detect).
     It also gets "too_dense": {"points": the points it had, and "swings": how often it
     swings by more than twice the tolerance (reduce.swings: more than those points can
-    follow), or "max_error": what the best of the points reach}. A top-level "note" names
+    follow), or "max_error": what the best of the points reach, and "zoom": an xrange
+    [lo, hi] that its points follow within the tolerance (reduce.zoom_window), the place
+    to look next}. A top-level "note" names
     every such series, so a caller cannot take an envelope for the waveform.
     A series holds at most downsample points (or half as many slices), and all of them at
     most SUMMARY_MAX_POINTS, shared evenly by the (trace, sweep) series (at least 2 each,
@@ -274,7 +305,7 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None, tolerance: Optiona
         log = reduce.log_frequency(h)
         x_criteria = [reduce.x_criterion(a, log) for a in x]
     stats = {}
-    dense: Dict[str, list] = {}         # trace -> (sweep index, swings or None, error) of each enveloped series
+    dense: Dict[str, list] = {}         # trace -> (sweep index, swings or None, error, i, entry) per enveloped series
     for name in ts.selected[1:]:
         if with_points:
             db = reduce.in_db(h, name)
@@ -306,24 +337,39 @@ def summarize(ts: TraceSet, downsample: Optional[int] = None, tolerance: Optiona
                                               {"points": cap, "max_error": _json_float(float(f"{error:.3g}"))})
                         entry["envelope"] = {"from": _json_floats(start), "to": _json_floats(stop),
                                              "min": _json_floats(mins[0]), "max": _json_floats(maxs[0])}
-                        dense.setdefault(name, []).append((ts.sweep_indices[i], swung, error))
+                        dense.setdefault(name, []).append((ts.sweep_indices[i], swung, error, i, entry))
             per_sweep.append(entry)
         stats[name] = per_sweep
     result = {"path": h.path, "format": h.version, "analysis": h.analysis, "plot": h.plot,
               "plots": h.plot_names, **overview(ts), "stats": stats}
     if dense:
         nsweeps = len(ts.sweep_values)
-        reasons = {}
-        for name, hits in dense.items():
+        reasons, narrowest = {}, None
+        for n, (name, hits) in enumerate(dense.items()):
             where = ""
             if nsweeps > 1:
                 where = (" in every sweep" if len(hits) == nsweeps else
-                         " in sweep" + ("s " if len(hits) > 1 else " ") + _and([str(k) for k, _, _ in hits]))
-            reasons[name] = dense_reason([t for _, t, _ in hits if t is not None],
-                                         [e for _, t, e in hits if t is None], tolerance, "points", where)
+                         " in sweep" + ("s " if len(hits) > 1 else " ") + _and([str(h[0]) for h in hits]))
+            reasons[name] = dense_reason([h[1] for h in hits if h[1] is not None],
+                                         [h[2] for h in hits if h[1] is None], tolerance, "points", where)
+            if n >= DENSE_NAMES_MAX:
+                continue                                    # the note names these: zoom where it does
+            # where to zoom: on the sweep where it swings most (or misses most), for every sweep
+            i = max(hits, key=lambda h: (h[1] if h[1] is not None else -1, h[2]))[3]
+            criterion = reduce.y_criterion(np.asarray(ts.data[name][i]), reduce.in_db(h, name))
+            window = reduce.zoom_window(x_criteria[i], [criterion],
+                                        [reduce.finite_span(reduce.y_criterion(np.asarray(a), reduce.in_db(h, name))
+                                                            for a in ts.data[name])],
+                                        tolerance, cap, eps)
+            advice = zoom_advice(window, log)
+            if advice is not None:
+                for hit in hits:
+                    hit[4]["too_dense"]["zoom"] = advice[0]
+                if narrowest is None or window[1] - window[0] < narrowest[0]:
+                    narrowest = (window[1] - window[0], advice[1])
         result["note"] = dense_phrase(reasons, tolerance, f"{cap} points",
                                       f"an envelope of {max(1, cap // 2)} x slices (from, to, min, max) "
-                                      f"in place of x and y")
+                                      f"in place of x and y", narrowest[1] if narrowest else None)
     return result
 
 

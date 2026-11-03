@@ -1020,7 +1020,8 @@ class TestFormatText(unittest.TestCase):
         lines = t.splitlines()
         self.assertRegex(lines[0], r"^transient \| x: time in \[0, 2e-08\] \| 80 points \(v_out is too dense to "
                                    r"follow within 1% in 3 rows \(it swings at least \d+ times by more than 2% of its range\), "
-                                   r"so it is an envelope of 3 x slices; narrow xrange to see its waveform\) \| plot 0")
+                                   r"so it is an envelope of 3 x slices; to see its waveform, zoom in with "
+                                   r"xrange=\[3e-09, 3.01e-09\], or another window up to 1e-11 wide\) \| plot 0")
         table = lines[lines.index("-- envelope of v_out: each row is a slice of x with its min and max --") + 1:]
         self.assertEqual(table[0].split(), ["time_from", "time_to", "min(v_out)", "max(v_out)"])
         rows = [[float(v) for v in l.split()] for l in table[1:]]
@@ -1130,8 +1131,8 @@ class TestFormatText(unittest.TestCase):
         t = self.m.format_text(api.extract(HERE / "test_9601.tr0", ["v_vo"]), 10 ** 6, tolerance=0)
         lines = t.splitlines()
         self.assertIn(f"(v_vo is too dense to follow within 0% in {self.m.TEXT_MAX_ROWS} rows (its best rows miss "
-                      f"by 0.122% of its range), so it is an envelope of {self.m.TEXT_MAX_ROWS} x slices; narrow "
-                      f"xrange to see its waveform)", lines[0])
+                      f"by 0.122% of its range), so it is an envelope of {self.m.TEXT_MAX_ROWS} x slices; to see its "
+                      f"waveform, zoom in with xrange=[0.0078, 0.0098], or another window up to 0.002 wide)", lines[0])
         # adaptive time steps leave some slices without a sample: the label says so
         label = ("-- envelope of v_vo: each row is a slice of x with its min and max; slices without a sample "
                  "are left out --")
@@ -1165,7 +1166,8 @@ class TestFormatText(unittest.TestCase):
         self.assertRegex(lines[0], r"\(v_a \(its best rows miss by up to [\d.]+% of its range in every table\) and "
                                    r"v_b \(its best rows miss by up to [\d.]+% of its range in every table\) are too "
                                    r"dense to follow within 1% in 25 rows per table, so they are envelopes of 16 x "
-                                   r"slices per table; narrow xrange to see their waveforms\)")
+                                   r"slices per table; to see their waveforms, zoom in with xrange=\[3e-07, 8e-07\], "
+                                   r"or another window up to 5e-07 wide\)")
         self.assertIn("in 20 rows per table", self.text(path, points=20).splitlines()[0])
         rows = [l for l in lines if l.strip()[:1].isdigit()]
         self.assertLessEqual(len(rows) * 6, self.m.TEXT_MAX_CELLS)
@@ -1233,8 +1235,14 @@ class TestMcp(unittest.TestCase):
         out = self.m.extract(str(BIN), ["v(out)"], plot=2)
         self.assertIsInstance(out, str)
         self.assertTrue(out.startswith("dc sweep | x: v_v-sweep in [0, 1] | 5 points"))
-        self.assertIn(" are too dense to follow within 1% in 6 rows, so they are envelopes of 6 x slices; narrow "
-                      "xrange to see their waveforms)", self.m.extract(str(BIN), ["v(out)"], plot=1, downsample=6))
+        head = self.m.extract(str(BIN), ["v(out)"], plot=1, downsample=6).splitlines()[0]
+        window = re.search(r" are too dense to follow within 1% in 6 rows, so they are envelopes of 6 x slices; to see "
+                           r"their waveforms, zoom in with xrange=\[([^,]+), ([^\]]+)\], or another window up to a "
+                           r"factor of [\d.]+ wide\)", head)
+        self.assertIsNotNone(window, head)
+        zoomed = self.m.extract(str(BIN), ["v(out)"], plot=1, downsample=6,
+                                xrange=[float(window.group(1)), float(window.group(2))])
+        self.assertNotIn("envelope", zoomed)
         tools = {t.name: t for t in asyncio.run(self.m.server.list_tools())}
         schema = getattr(tools["extract"], "inputSchema", None) or tools["extract"].input_schema
         self.assertEqual(schema["properties"]["output"]["default"], "text")

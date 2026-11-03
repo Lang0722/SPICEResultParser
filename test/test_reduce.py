@@ -1,6 +1,7 @@
 """Tests for the shape-preserving reduction (reduce.py) and the outputs that use it."""
 import asyncio
 import json
+import re
 import sys
 import tempfile
 import time
@@ -407,8 +408,8 @@ class TestEnvelopeFallback(unittest.TestCase):
     def test_text_shows_the_envelope_over_the_whole_run(self):
         text = self.m.format_text(read_traces(self.path))
         self.assertIn("200001 points (v_osc is too dense to follow within 1% in 500 rows (it swings at least 1992 times by "
-                      "more than 2% of its range), so it is an envelope of 100 x slices; narrow xrange to see its "
-                      "waveform)", text.splitlines()[0])
+                      "more than 2% of its range), so it is an envelope of 100 x slices; to see its waveform, zoom in "
+                      "with xrange=[9.78e-07, 9.98e-07], or another window up to 2e-08 wide)", text.splitlines()[0])
         self.assertIn("-- envelope of v_osc: each row is a slice of x with its min and max --", text)
         heading, rows = self.table(text)
         self.assertEqual(heading, ["TIME_from", "TIME_to", "min(v_osc)", "max(v_osc)"])
@@ -437,7 +438,8 @@ class TestEnvelopeFallback(unittest.TestCase):
         self.assertRegex(text.splitlines()[0], r"\(4 rows shown, each trace within 1% of its range; v_a is too dense "
                                                r"to follow within 1% in 250 rows per table \(its best rows miss by "
                                                r"[\d.]+% of its range in 1 of 2 tables\), so it is an envelope of "
-                                               r"100 x slices per table; narrow xrange to see its waveform\)$")
+                                               r"100 x slices per table; to see its waveform, zoom in with "
+                                               r"xrange=\[8.9e-08, 9.9e-08\], or another window up to 1e-08 wide\)$")
         self.assertIn("-- sweep 0: case=1 --", text)
         self.assertIn("-- sweep 1: case=2; envelope of v_a: each row is a slice of x with its min and max --", text)
 
@@ -520,7 +522,8 @@ class TestDenseIsSaid(unittest.TestCase):
         lines = text.splitlines()
         self.assertRegex(lines[0], r"\(\d+ rows shown, each trace within 1% of its range; v_osc is too dense to "
                                    r"follow within 1% in 500 rows \(it swings at least \d+ times by more than 2% of its "
-                                   r"range\), so it is an envelope of 100 x slices; narrow xrange to see its waveform\)")
+                                   r"range\), so it is an envelope of 100 x slices; to see its waveform, zoom in with "
+                                   r"xrange=\[0.000978, 0.000998\], or another window up to 2e-05 wide\)")
         rows_at = lines.index(next(line for line in lines if line.split() == ["TIME", "v_ctrl"]))
         env_at = lines.index("-- envelope of v_osc: each row is a slice of x with its min and max --")
         self.assertLess(rows_at, env_at)
@@ -549,9 +552,10 @@ class TestDenseIsSaid(unittest.TestCase):
         s = self.m.extract(str(self.path), output="summary", tolerance=0.01)
         self.assertRegex(s["note"], r"^v_osc is too dense to follow within 1% in 500 points \(it swings at least \d+ times "
                                     r"by more than 2% of its range\), so it is an envelope of 250 x slices \(from, "
-                                    r"to, min, max\) in place of x and y; narrow xrange to see its waveform$")
+                                    r"to, min, max\) in place of x and y; to see its waveform, zoom in with "
+                                    r"xrange=\[0.000978, 0.000998\], or another window up to 2e-05 wide$")
         osc, ctrl = s["stats"]["v_osc"][0], s["stats"]["v_ctrl"][0]
-        self.assertEqual(set(osc["too_dense"]), {"points", "swings"})
+        self.assertEqual(set(osc["too_dense"]), {"points", "swings", "zoom"})
         self.assertEqual(osc["too_dense"]["points"], 500)
         self.assertGreater(osc["too_dense"]["swings"], 1900)
         self.assertNotIn("x", osc)
@@ -570,7 +574,7 @@ class TestDenseIsSaid(unittest.TestCase):
         fixtures.write_binary(path, "2001", ["TIME", "v(n", "case"], [1, 1], sweeps)
         s = api.extract(path, output="summary", downsample=20)
         entry = s["stats"]["v_n"][1]
-        self.assertEqual(set(entry["too_dense"]), {"points", "max_error"})
+        self.assertEqual(set(entry["too_dense"]), {"points", "max_error", "zoom"})
         self.assertGreater(entry["too_dense"]["max_error"], 0.01)
         self.assertNotIn("too_dense", s["stats"]["v_n"][0])
         self.assertRegex(s["note"], r"^v_n is too dense to follow within 1% in 20 points \(its best points miss by "
@@ -582,6 +586,141 @@ class TestDenseIsSaid(unittest.TestCase):
         self.assertTrue(result["note"].startswith("v_osc is too dense; ranges lists the first 100 of 101 traces"))
         self.assertEqual(api.dense_phrase({f"v{i}": "it swings 9 times by more than 2% of its range" for i in range(7)},
                                           0.01, "20 rows", "an envelope of 10 x slices").count("(it swings"), 5)
+
+
+class TestZoomWindow(unittest.TestCase):
+    """reduce.zoom_window: the window a caller that got an envelope zooms into."""
+
+    def test_the_window_fits_and_so_does_another_of_its_width(self):
+        t = np.linspace(0, 1e-3, 200_001)
+        y = 0.9 + 0.8 * (1 - np.exp(-t / 2e-4)) * np.sin(2 * np.pi * 1e6 * t)
+        span = reduce.finite_span([y])
+        lo, hi = reduce.zoom_window(t, [y], [span], 0.01, 500, 2.2e-16)
+        width = hi - lo
+        mantissa = float(f"{width:.3e}".split("e")[0])
+        self.assertIn(mantissa, (1.0, 2.0, 5.0))                     # a round width
+        self.assertGreater(width, 5e-6)                              # several cycles, not one
+        for start in (lo, 1e-4, 4e-4, 1e-3 - width):
+            keep = (t >= start) & (t <= start + width)
+            _, error = reduce.breakpoints(t[keep], [y[keep]], [span], 0.01, 500, 2.2e-16)
+            self.assertLessEqual(error, 0.01, start)
+
+    def test_a_square_wave_gets_a_wider_window_than_the_estimate(self):
+        # straight lines follow a square wave with about 2 rows a swing, not the 7.9 of a sine
+        t = np.linspace(0, 1, 100_001)
+        y = (np.sin(2 * np.pi * 2000 * t) > 0).astype(float)
+        lo, hi = reduce.zoom_window(t, [y], [1.0], 0.01, 500, 2.2e-16)
+        guess = 1.0 * (500 - 2) / (4000 * np.pi / (4 * np.sqrt(0.01)))
+        self.assertGreater(hi - lo, guess)
+        keep = (t >= lo) & (t <= hi)
+        self.assertLessEqual(reduce.breakpoints(t[keep], [y[keep]], [1.0], 0.01, 500, 2.2e-16)[1], 0.01)
+
+    def test_no_window(self):
+        x = np.r_[np.linspace(0, 1, 600), np.linspace(0, 1, 600)]    # x restarts: a window cannot pick a part
+        y = np.sin(80 * x)
+        self.assertIsNone(reduce.zoom_window(x, [y], [2.0], 0.01, 500, 2.2e-16))
+        self.assertIsNone(reduce.zoom_window(x[:400], [y[:400]], [2.0], 0.01, 500, 2.2e-16))   # all fits
+
+
+class TestZoomWorkflow(unittest.TestCase):
+    """What a caller does after an envelope: zoom with the window it was given, and see the waveform."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.dir = Path(cls.tmp.name)
+        t = np.linspace(0, 1e-3, 200_001)
+        osc = 0.9 + 0.8 * (1 - np.exp(-t / 2e-4)) * np.sin(2 * np.pi * 1e6 * t)
+        cls.path = cls.dir / "osc.tr0"
+        fixtures.write_binary(cls.path, "2001", ["TIME", "v(osc", "v(ctrl"], [1, 1, 1],
+                              [([], np.c_[t, osc, 1.2 * (1 - np.exp(-t / 1e-4))])])
+        from spice_result_parser import mcp_server
+        cls.m = mcp_server
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def window_in(self, text):
+        found = re.search(r"zoom in with xrange=\[([^,]+), ([^\]]+)\], or another window up to (.+?) wide", text)
+        self.assertIsNotNone(found, text.splitlines()[0])
+        return [float(found.group(1)), float(found.group(2))], found.group(3)
+
+    def test_text(self):
+        window, width = self.window_in(self.m.extract(str(self.path)))
+        self.assertEqual(width, f"{window[1] - window[0]:.3g}")
+        zoomed = self.m.extract(str(self.path), xrange=window)
+        self.assertNotIn("envelope", zoomed)
+        self.assertIn(" shown, each trace within 1% of its range)", zoomed.splitlines()[0])
+        self.assertIn(f"window: xrange [{window[0]:g}, {window[1]:g}]", zoomed)
+        # "or another window up to that width": at the start-up too
+        start = self.m.extract(str(self.path), xrange=[2e-4, 2e-4 + window[1] - window[0]])
+        self.assertNotIn("envelope", start)
+
+    def test_summary(self):
+        s = self.m.extract(str(self.path), output="summary", tolerance=0.01)
+        zoom = s["stats"]["v_osc"][0]["too_dense"]["zoom"]
+        self.assertEqual(self.window_in(s["note"])[0], zoom)
+        zoomed = self.m.extract(str(self.path), output="summary", tolerance=0.01, xrange=zoom)
+        self.assertNotIn("note", zoomed)
+        entry = zoomed["stats"]["v_osc"][0]
+        self.assertNotIn("too_dense", entry)
+        self.assertLessEqual(entry["max_error"], 0.01)
+        self.assertEqual((entry["x"][0], entry["x"][-1]), (zoom[0], zoom[1]))
+        json.dumps(s, allow_nan=False)
+
+    def test_ac_gives_a_factor(self):
+        f = np.logspace(3, 9, 60_001)
+        h = (1 + 0.9 * np.exp(-2j * np.pi * f / 2e6)) / 1.9             # notches every 2 MHz
+        path = self.dir / "comb.ac0"
+        fixtures.write_binary(path, "2001", ["HERTZ", "v(out"], [2, 1], [([], np.c_[f, h.real, h.imag])])
+        window, width = self.window_in(self.m.extract(str(path), ["v(out)"]))
+        self.assertTrue(width.startswith("a factor of "), width)
+        self.assertLessEqual(window[1] / window[0], float(width.split()[-1]) * 1.001)
+        self.assertNotIn("envelope", self.m.extract(str(path), ["v(out)"], xrange=window))
+
+    def test_sweeps_share_the_window(self):
+        t = np.linspace(0, 1e-6, 20_001)
+        sweeps = [([float(k)], np.c_[t, np.sin(2 * np.pi * f * t)]) for k, f in enumerate((1e6, 5e8, 2e9))]
+        path = self.dir / "tones.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(tone", "case"], [1, 1], sweeps)
+        window, _ = self.window_in(self.m.extract(str(path)))
+        zoomed = self.m.extract(str(path), xrange=window)
+        self.assertNotIn("envelope", zoomed)
+        self.assertIn("in 3 sweeps", zoomed.splitlines()[0])
+
+    def test_a_random_walk_is_ranged_in_the_window(self):
+        # A window of a random walk spans far less than the whole walk. The zoomed call ranges
+        # the trace there, so 1% of the window's range is far less: the window is checked so.
+        walk = np.cumsum(np.random.default_rng(4).normal(size=300_000))
+        t = np.linspace(0, 1e-3, walk.size)
+        path = self.dir / "walk.tr0"
+        fixtures.write_binary(path, "2001", ["TIME", "v(w"], [1, 1], [([], np.c_[t, walk])])
+        for output in ("text", "summary"):
+            first = self.m.extract(str(path), output=output, **({"tolerance": 0.01} if output == "summary" else {}))
+            if output == "text":
+                window, _ = self.window_in(first)
+                zoomed = self.m.extract(str(path), xrange=window)
+                self.assertNotIn("envelope", zoomed)
+            else:
+                window = first["stats"]["v_w"][0]["too_dense"]["zoom"]
+                zoomed = self.m.extract(str(path), output="summary", tolerance=0.01, xrange=window)
+                self.assertNotIn("note", zoomed)
+
+    def test_a_nested_sweep_written_flat(self):
+        # x restarts. text has a table per run, and one x window picks the same part of each:
+        # it can zoom. A summary series holds both runs, so no window picks out a part of it.
+        x = np.tile(np.linspace(0, 1, 4000), 2)
+        y = np.r_[np.sin(2 * np.pi * 300 * x[:4000]), np.sin(2 * np.pi * 310 * x[4000:])]
+        path = self.dir / "flat.sw0"
+        fixtures.write_binary(path, "2001", ["v(in", "v(out"], [3, 1], [([], np.c_[x, y])])
+        window, _ = self.window_in(self.m.extract(str(path)))
+        zoomed = self.m.extract(str(path), xrange=window)
+        self.assertNotIn("envelope", zoomed)
+        self.assertIn("run 2 of 2 (x restarts)", zoomed)
+        s = self.m.extract(str(path), output="summary", tolerance=0.01)
+        self.assertNotIn("zoom", s["stats"]["v_out"][0]["too_dense"])
+        self.assertTrue(s["note"].endswith("; narrow xrange to see its waveform"), s["note"])
 
 
 class TestBugHuntRegressions(unittest.TestCase):

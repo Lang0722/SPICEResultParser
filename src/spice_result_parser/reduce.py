@@ -229,10 +229,11 @@ def _run_extremes(y: np.ndarray, runs: int) -> np.ndarray:
     return np.unique(np.concatenate(parts))
 
 
-def swings(x: np.ndarray, y: np.ndarray, height: float) -> int:
+def swings(x: np.ndarray, y: np.ndarray, height: float, positions: bool = False):
     """How many times y swings by more than height: the legs of a zigzag over its finite
     samples, each from one extreme to the next and more than height long. A sine of 50
-    cycles from 0 to 0 has 101 legs that a height below its swing counts.
+    cycles from 0 to 0 has 101 legs that a height below its swing counts. positions=True
+    also returns the x and the y of the legs' ends (swings + 1 of them), in order.
 
     The swings + 1 ends of the legs are extremes, each more than height from the one before.
     Between two samples that breakpoints keeps, a straight line can follow at most two of
@@ -248,30 +249,145 @@ def swings(x: np.ndarray, y: np.ndarray, height: float) -> int:
         inner = np.zeros(x.size, bool)
         inner[1:-1] = (x[1:-1] == x[:-2]) & (x[1:-1] == x[2:])
         keep &= ~inner
-    y = np.asarray(y[keep], dtype=np.float64)
-    if y.size < 3 or not height > 0:
-        return 0
-    if y.size > SWING_SAMPLES:
-        y = y[_run_extremes(y, SWING_SAMPLES // 4)]
-    count, up, hi, lo = 0, None, y[0], y[0]
-    for value in y[1:].tolist():
+    at = np.flatnonzero(keep)
+    v = np.asarray(y[at], dtype=np.float64)
+    if v.size < 3 or not height > 0:
+        return (0, np.empty(0), np.empty(0)) if positions else 0
+    if v.size > SWING_SAMPLES:
+        cut = _run_extremes(v, SWING_SAMPLES // 4)
+        at, v = at[cut], v[cut]
+    count, up, hi, lo, hi_at, lo_at = 0, None, v[0], v[0], 0, 0
+    ends: List[int] = []                             # indices (in v) of the extremes that end a leg
+    for k, value in enumerate(v[1:].tolist(), 1):
         if up is None:
             if value - lo > height:
-                count, up, hi = 1, True, value
+                count, up, hi, hi_at = 1, True, value, k
+                ends.append(lo_at)
             elif hi - value > height:
-                count, up, lo = 1, False, value
+                count, up, lo, lo_at = 1, False, value, k
+                ends.append(hi_at)
             else:
-                hi, lo = max(hi, value), min(lo, value)
+                if value > hi:
+                    hi, hi_at = value, k
+                if value < lo:
+                    lo, lo_at = value, k
         elif up:
             if value > hi:
-                hi = value
+                hi, hi_at = value, k
             elif hi - value > height:
-                count, up, lo = count + 1, False, value
+                count, up, lo, lo_at = count + 1, False, value, k
+                ends.append(hi_at)
         elif value < lo:
-            lo = value
+            lo, lo_at = value, k
         elif value - lo > height:
-            count, up, hi = count + 1, True, value
-    return count
+            count, up, hi, hi_at = count + 1, True, value, k
+            ends.append(lo_at)
+    if not positions:
+        return count
+    if count:
+        ends.append(hi_at if up else lo_at)          # the end of the last leg
+    ends_at = np.asarray(ends, dtype=np.intp)
+    return count, np.asarray(x[at[ends_at]], dtype=np.float64), v[ends_at]
+
+
+def _nice_floor(value: float) -> float:
+    """The largest 1, 2 or 5 times a power of ten that is at most value (value > 0)."""
+    power = 10.0 ** math.floor(math.log10(value))
+    return next(step * power for step in (5.0, 2.0, 1.0) if step * power <= value * (1 + 1e-12))
+
+
+def zoom_window(x: np.ndarray, ys: Sequence[np.ndarray], spans: Sequence[float], tolerance: float,
+                budget: int, eps: float) -> Optional[Tuple[float, float]]:
+    """A window of x, in the criterion values (x_criterion), that `budget` samples follow
+    within tolerance (breakpoints, all of ys together): what a caller that got an envelope
+    passes as xrange to see the waveform.
+
+    Each swing (see swings) of length L takes about (pi / 4) sqrt(L / (tolerance * span))
+    samples: what straight lines need to follow a sine within the tolerance (7.9 for a
+    swing over the whole range at 1%). Summed over a sliding window, that finds where a
+    width is hardest to follow, and the widest width that the estimate allows. breakpoints
+    then checks it at that place, with each trace ranged over the window as the zoomed
+    call ranges it (a window of a random walk spans far less than the whole), and narrows
+    it until it fits (or widens it, where the estimate was too careful, as for a square
+    wave). The width is then rounded down to a 1,
+    2 or 5 times a power of ten, and its start, near the hardest place, to a tenth of it;
+    that window is checked as the caller will pass it. So another window of that width fits
+    too, unless the signal is harder there than the estimate says. None when x is not
+    monotonic (an x window cannot pick out a part of it) or when every sample already fits."""
+    n = len(x)
+    if n <= budget or budget < 3 or not bool(np.all(np.diff(x) >= 0)):
+        return None
+    total = float(x[-1] - x[0])
+    if not total > 0:
+        return None
+    # any window narrower than the closest `budget` samples holds fewer of them: it fits
+    floor = float(np.min(x[budget - 1:] - x[:n - budget + 1]))
+    if not floor > 0:
+        floor = total / n
+    where, cost = [np.empty(0)], [np.empty(0)]
+    for y, span in zip(ys, spans):
+        count, at, value = swings(x, y, swing_height(tolerance, span, y, eps), positions=True)
+        if count and span > 0:
+            where.append((at[1:] + at[:-1]) / 2)                       # each leg at its middle
+            scale = tolerance * span if tolerance > 0 else span / budget ** 2
+            cost.append(math.pi / 4 * np.sqrt(np.abs(np.diff(value)) / scale))
+    order = np.argsort(np.concatenate(where), kind="stable")
+    where, cost = np.concatenate(where)[order], np.concatenate(cost)[order]
+    summed = np.concatenate([[0.0], np.cumsum(cost)])
+
+    def hardest(w: float) -> Tuple[float, float]:
+        """(start, estimated samples) of the window of width w that the estimate finds hardest."""
+        if not where.size:
+            return float(x[0]), 2.0
+        held = summed[np.searchsorted(where, where + w, side="right")] - summed[:-1]
+        k = int(np.argmax(held))
+        return float(min(max(where[k], x[0]), x[-1] - w)), float(held[k]) + 2
+
+    def fits_at(a: float, w: float) -> bool:
+        """Whether the samples in [a, a + w] fit, ranged as the zoomed call ranges them: the
+        tolerance is a fraction of each trace's range in the selection, so in the window."""
+        i, j = int(np.searchsorted(x, a, "left")), int(np.searchsorted(x, a + w, "right"))
+        if j - i <= budget:
+            return True
+        part = [y[i:j] for y in ys]
+        _, error = breakpoints(x[i:j], part, [finite_span([p]) for p in part], tolerance, budget, eps)
+        return error <= tolerance
+
+    lo, hi = floor, total / 2                               # the widest width the estimate allows
+    for _ in range(40):
+        mid = math.sqrt(lo * hi)
+        if hardest(mid)[1] <= budget:
+            lo = mid
+        else:
+            hi = mid
+        if hi <= lo * 1.01:
+            break
+    width = lo
+    if fits_at(hardest(width)[0], width):
+        for _ in range(2):                                  # wider, where the estimate was too careful
+            if 2 * width > total / 2 or not fits_at(hardest(2 * width)[0], 2 * width):
+                break
+            width *= 2
+    else:                                                   # narrower: floor fits, width does not
+        lo, hi = floor, width
+        for _ in range(16):
+            if hi <= lo * 1.25:
+                break
+            mid = math.sqrt(lo * hi)
+            if fits_at(hardest(mid)[0], mid):
+                lo = mid
+            else:
+                hi = mid
+        width = lo
+    nice = _nice_floor(width)
+    for _ in range(6):                                      # a round window, checked as the caller passes it
+        step = nice / 10
+        a = math.floor(hardest(nice)[0] / step) * step
+        a, b = float(f"{a:.12g}"), float(f"{a + nice:.12g}")
+        if fits_at(a, b - a):
+            return a, b
+        nice = _nice_floor(nice * 0.99)
+    return None
 
 
 def swing_height(tolerance: float, span: float, y: np.ndarray, eps: float) -> float:

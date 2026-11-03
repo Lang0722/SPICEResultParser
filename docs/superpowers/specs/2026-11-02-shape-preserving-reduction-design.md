@@ -155,6 +155,48 @@ On the oscillator beside a slow `v_ctrl` (200,001 points), `text` took 4 s with 
 first fallback and 7 s with a check per trace. With the swing count it takes 0.15 s:
 `v_ctrl` keeps 12 rows and `v_osc` gets a table of 100 slices.
 
+## The next step: zooming in
+
+A caller that gets an envelope zooms in to see the waveform. That step belongs in the
+design of the fallback too, and it was missing: the output said only "narrow xrange",
+so the caller guessed a width. Too wide gave another envelope, and too narrow cost more
+calls than needed.
+
+Now the dense sentence ends with a window that is checked to work: `to see its
+waveform, zoom in with xrange=[0.000978, 0.000998], or another window up to 2e-05
+wide`. `summary` also gives it as numbers, `too_dense.zoom`, which the caller passes on.
+
+`reduce.zoom_window(x, ys, spans, tolerance, budget, eps)` finds it:
+
+1. An estimate of the rows that a window needs: each swing of length L takes about
+   pi / 4 * sqrt(L / (tolerance * span)) samples, what straight lines need to follow a
+   sine (7.9 for a full-range swing at 1%). A sliding sum over the swings
+   (`swings(..., positions=True)` gives where they are) finds the hardest window of a
+   width, and a search finds the widest width that the estimate allows.
+2. breakpoints checks that width at the hardest place, with each trace ranged over the
+   window, as the zoomed call ranges it. A first version ranged the traces over the whole
+   plot. That held for the oscillator, whose window spans its whole range, but a random
+   walk spans far less in a window than in the whole run, so 1% of the window's range is
+   far stricter: zooming into the window gave envelopes again. A width that fails is
+   narrowed by bisection (floor always fits). A width that fits is tried at twice its
+   size, twice, for signals where the estimate is too careful: a square wave needs about
+   2 rows a swing, not 7.9.
+3. The width is rounded down to a 1, 2 or 5 times a power of ten, the start to a tenth
+   of that, and this round window is checked as the caller will pass it.
+
+text computes it for the 3 hardest tables, with every trace of the table (they share the
+rows when zoomed), and gives the narrowest window, because an `xrange` applies to every
+sweep. summary computes it per trace, on its hardest sweep, for the traces that the note
+names. On a log-frequency axis the width is a factor (`up to a factor of 1.05`). When x
+is not monotonic in a series, no window picks out a part of it, and the advice stays
+"narrow xrange".
+
+On the oscillator (200,001 points) the window is 20 us: 20 cycles where the swing is
+largest, which the next call shows in 303 rows within 1%. A window of the same width at
+the start-up fits too. The search takes about 0.1 s. On 19 random walks of 1 M points the
+window holds 100 samples, all shown: such a trace has no shape coarser than its samples
+at 1%. Every window in the tests is followed by the call that a caller makes next.
+
 ## Revisions after a bug hunt
 
 - Segment lines: the repeated-x rule ("a sample between the ends of a vertical jump is no

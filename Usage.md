@@ -153,18 +153,21 @@ s["stats"]["v_out"][2]["max"]                     # one sweep: index 2 of sweep_
 (`x`, `y`) and the error that they leave (`max_error`, a fraction of the range of the
 trace). If the points cannot follow the trace within `tolerance`, the entry holds an
 `envelope` instead: `from`, `to`, `min` and `max` lists with one value per slice (half as
-many slices as points). The entry then also holds `too_dense`: the `points` it had, and
+many slices as points). The entry then also holds `too_dense`: the `points` it had,
 `swings` (how often the trace swings by more than twice the tolerance, which is more
-than the points can follow) or `max_error` (what the best of the points reach). A
-top-level `note` names each such series and says what to do:
+than the points can follow) or `max_error` (what the best of the points reach), and
+`zoom`: an `xrange` `[lo, hi]` that the points follow within `tolerance`. A top-level
+`note` names each such series, says why, and gives the window to zoom into:
 
 ```python
 s = extract("osc.tr0", output="summary", tolerance=0.01)
 s["note"]
 # 'v_osc is too dense to follow within 1% in 500 points (it swings at least 1992 times by
 #  more than 2% of its range), so it is an envelope of 250 x slices (from, to, min, max) in
-#  place of x and y; narrow xrange to see its waveform'
-s["stats"]["v_osc"][0]["too_dense"]               # {'points': 500, 'swings': 1992}
+#  place of x and y; to see its waveform, zoom in with xrange=[0.000978, 0.000998], or
+#  another window up to 2e-05 wide'
+zoom = s["stats"]["v_osc"][0]["too_dense"]["zoom"]  # [0.000978, 0.000998]
+extract("osc.tr0", output="summary", tolerance=0.01, xrange=zoom)   # x and y: 303 points
 ```
 
 Without either parameter, `summary` lists no points. All the lists together hold at most
@@ -214,6 +217,18 @@ The reduction then shows an envelope, as the peak-detect mode of an oscilloscope
   header and the `note` of `summary` name each envelope. They give the reason: the trace
   swings more often than the rows can follow (`it swings at least 1992 times by more
   than 2% of its range`), or the best rows miss by a given part of its range.
+- The output also gives the window to zoom into, because zooming in is what a caller
+  does next: `zoom in with xrange=[0.000978, 0.000998], or another window up to 2e-05
+  wide`. `reduce.zoom_window` finds it. It estimates where a window is hardest to follow
+  (each swing of length L takes about pi / 4 * sqrt(L / (tolerance * range)) rows, as a
+  sine does), checks the window there with the simplification itself, narrows or widens
+  it, and rounds it to a 1, 2 or 5 times a power of ten. The check ranges each trace over
+  the window, as the zoomed call does. A window of a random walk spans far less than the
+  whole walk, so 1% of it is far less. Such a trace gets a window narrow enough to show
+  every sample. On a log-frequency axis the
+  width is a factor. A table where x restarts (a nested sweep written flat) gets a window
+  too, because an `xrange` picks the same part of each run. A `summary` series of such a
+  sweep gets none, and the advice is then to narrow `xrange`.
 
 The swing count makes this fast. A straight line between two rows cannot pass near a
 peak and both valleys around it. Thus a trace with `n` swings larger than twice the
@@ -649,10 +664,11 @@ directory of the server. The server can run in a different directory from the ag
    `downsample` rows. All the tables together hold at most 500 rows and 2000 numbers. A
    trace that is too dense to follow in its rows goes to an envelope table instead: one
    row per slice of x, with the trace's min and max. The other traces keep their rows.
-   The header names each envelope and says why, for example `200001 points (12 rows
-   shown, each trace within 1% of its range; v_osc is too dense to follow within 1% in
-   500 rows (it swings at least 1992 times by more than 2% of its range), so it is an
-   envelope of 100 x slices; narrow xrange to see its waveform)`.
+   The header names each envelope, says why, and gives the window to zoom into, for
+   example `200001 points (12 rows shown, each trace within 1% of its range; v_osc is too
+   dense to follow within 1% in 500 rows (it swings at least 1992 times by more than 2% of
+   its range), so it is an envelope of 100 x slices; to see its waveform, zoom in with
+   xrange=[0.000978, 0.000998], or another window up to 2e-05 wide)`.
 
 A trace that holds one value in the whole selection does not get a column. A
 `constant:` line names it with its value, for example `constant: v_0 = 0`.

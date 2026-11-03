@@ -213,7 +213,10 @@ Douglas-Peucker simplification:
   dense traces become envelopes. The other traces keep their rows.
 - The output always says so. The `text` header and the `note` of `summary` name each
   envelope and say why: the trace swings more often than the rows can follow, or the
-  best rows miss by a given part of its range. They also say what to do: narrow `xrange`.
+  best rows miss by a given part of its range.
+- They also give the window to zoom into next. A caller that gets an envelope zooms in,
+  so it learns at once how far: an `xrange` checked to follow the trace within the
+  tolerance where it is hardest, and the widest window that does (for AC, a factor).
 
 For example, a 200,001-point step response with ringing and a 1 ns glitch needs 38 rows
 at 1%. These rows show the step, each ringing peak, the settling and the glitch. 20
@@ -224,12 +227,12 @@ in 100 rows, and the header says why:
 ```
 transient | x: TIME in [0, 0.001] | 200001 points (12 rows shown, each trace within 1% of
 its range; v_osc is too dense to follow within 1% in 500 rows (it swings at least 1992
-times by more than 2% of its range), so it is an envelope of 100 x slices; narrow xrange
-to see its waveform)
+times by more than 2% of its range), so it is an envelope of 100 x slices; to see its
+waveform, zoom in with xrange=[0.000978, 0.000998], or another window up to 2e-05 wide)
 ```
 
-The slowly settling `v_ctrl` beside it keeps its 12 rows. A narrow `xrange` then shows
-the waveform of a few cycles.
+The slowly settling `v_ctrl` beside it keeps its 12 rows. With the `xrange` that the
+header gives, the next call shows 20 cycles of the waveform in 303 rows within 1%.
 
 The tolerance is relative to the selected range. Thus an `xrange` on a small-signal part,
 for example the settling tail, shows that part in detail. A smaller `tolerance` gives

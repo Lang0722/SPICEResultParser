@@ -342,6 +342,7 @@ def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFA
     body: List[str] = []
     shown, followed, slices = 0, 0, 0               # rows that follow traces, tables with them, envelope size
     dense: Dict[str, list] = {}                     # trace -> ("swings", count) or ("error", fraction) per table
+    hard: list = []                                 # (hardness, table data) of the tables with a dense trace
     crowded: Dict[str, int] = {}                    # trace -> tables where it fits alone, not with the others
     for table in tables if columns else []:
         if table is None:
@@ -378,6 +379,9 @@ def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFA
             if label:
                 body.append(f"-- {label} --")
             body.extend(_table(rows))
+        if swung or too_dense:                      # where to zoom: the tables where the traces are hardest
+            hard.append(((max(swung.values(), default=0), max(too_dense.values(), default=0.0)),
+                         (xc, [yc[name] for name in columns], [spans[name] for name in columns])))
         others = [name for name in columns if name in swung or name in too_dense or name in no_room]
         if others:                                  # too dense to follow: a peak-detect envelope instead
             for name, err in too_dense.items():
@@ -425,8 +429,15 @@ def format_text(ts, points: Optional[int] = None, tolerance: float = reduce.DEFA
                          else f" in {len(hits)} of {shown_tables} tables")
                 reasons[name] = api.dense_reason([v for kind, v in hits if kind == "swings"],
                                                  [v for kind, v in hits if kind == "error"], tolerance, "rows", where)
+            # the window to zoom into: the narrowest of the hardest tables (an xrange applies to all)
+            zoom = None
+            for _, (xs, ys, sp) in sorted(hard, key=lambda item: item[0], reverse=True)[:3]:
+                window = reduce.zoom_window(xs, ys, sp, tolerance, per_table, eps)
+                advice = api.zoom_advice(window, log)
+                if advice is not None and (zoom is None or window[1] - window[0] < zoom[0]):
+                    zoom = (window[1] - window[0], advice[1])
             parts.append(api.dense_phrase(reasons, tolerance, f"{per_table} rows{each}",
-                                          f"an envelope of {slices} x slices{each}"))
+                                          f"an envelope of {slices} x slices{each}", zoom[1] if zoom else None))
         if crowded:
             names = list(crowded)
             one = len(names) == 1
@@ -632,7 +643,7 @@ def extract(
                     "selection (default 0.01 = 1%; 0 drops only points on a straight line). "
                     "Rows are real samples, each trace's min and max among them. A signal too "
                     "dense for that in the rows (oscillation, switching) shows as an envelope "
-                    "of x slices instead; narrow xrange to see its waveform. The range is the "
+                    "of x slices instead, with an xrange to zoom into that shows its waveform. The range is the "
                     "selection's, so an xrange on a small-signal part (settling, ripple) shows "
                     "it in detail; lower tolerance for more rows anywhere. AC: chosen on log "
                     "frequency, _Mag compared in dB. An error with csv, npz and png.")] = None,
@@ -653,28 +664,27 @@ def extract(
     ac_format: Annotated[Literal[tuple(AC_FORMATS)], Field(description=_AC_FORMAT_HELP)] = "magphase",
     engine: Annotated[Engine, ENGINE_FIELD] = None,
 ):
-    """Read selected traces from an HSPICE result file or a Nutmeg rawfile. Call
-    list_traces first: its names, x_range, sweeps and ranges are what names, xrange,
-    sweeps and yrange take. Start with text, zoom with xrange; csv or npz keep every
-    point.
+    """Read traces from an HSPICE result file or a Nutmeg rawfile. Call list_traces
+    first: its names, x_range, sweeps and ranges are what names, xrange, sweeps and
+    yrange take. Start with text; csv or npz keep every point.
 
     text: "TRUNCATED" first if the file is cut; a header (analysis, x range, points,
-    rows shown, error bound); with xrange, the plot's extent; constant traces on one
+    rows, error bound); with xrange, the plot's extent; constant traces on one
     line; a min/max table; a table per sweep, x once, a column per trace (at most 16).
-    Rows are real samples: the fewest whose straight lines stay within tolerance of every
-    point (peaks, edges, glitches stay). A trace too dense for that (oscillation,
+    Rows are real samples, the fewest whose lines stay within tolerance of every point
+    (peaks, edges, glitches stay). A trace too dense for that (oscillation,
     switching) gets an envelope table instead, a row per x slice with its min and max;
-    the header names it and why. 6 significant digits.
+    the header names it, why, and an xrange to zoom into. 6 significant digits.
 
     JSON outputs hold list_traces' fields for the data: x, x_range, points, sweeps,
     truncated, traces, ranges (at most 100, then a "note").
     summary: also sweep_values, sweep_indices and stats: per trace and sweep count,
     min, max, mean (NaN skipped), first, last; with downsample or tolerance, x/y points
     chosen alike and their max_error, or for a series too dense for them an envelope and
-    too_dense, named in "note". NaN and inf become null.
+    too_dense (zoom: an xrange that it fits), named in "note". NaN and inf: null.
     csv, npz, png: the file is written; the result adds output, dest (absolute),
-    engine, sweep_indices (with sweeps), for png size [w, h]. AC: plot magnitude and
-    phase apart.
+    engine, sweep_indices (with sweeps), png size [w, h]. AC: plot magnitude, phase
+    apart.
     """
     if output == "arrays":
         raise ValueError(f"output='arrays' is not available over MCP; use one of {MCP_OUTPUTS}")
