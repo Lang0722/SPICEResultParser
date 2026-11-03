@@ -17,7 +17,7 @@ VM = os.environ.get("SRP_VM", "Windows 11")
 WV = os.environ.get("SRP_VM_WV", r"C:\synopsys\Custom WaveView O-2018.09-SP2\wv.exe")
 HOME = os.path.realpath(os.path.expanduser("~"))
 FORWARDED = ("SRP_IN", "SRP_OUT", "SRP_SIGNALS")     # paths
-FLAGS = ("SRP_XCHECK",)                             # values, forwarded as they are
+FLAGS = ("SRP_XCHECK", "SRP_NPOINTS", "SRP_XLO", "SRP_XHI", "SRP_MAX_VALUES")   # values, as they are
 
 
 def vm_path(path: str) -> str:

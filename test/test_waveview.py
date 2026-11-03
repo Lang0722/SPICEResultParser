@@ -598,6 +598,24 @@ class TestReadTraces(FakeWaveView):
                                                                                 "v\\(g36\\)"):
                     waveview.read_traces(WV / "big9.tr0", names)
 
+    def test_point_counts_come_from_the_export(self):
+        text, end, _ = waveview._run("extract.tcl", str(TR), ["v(vo)"])
+        self.assertEqual(waveview._export_info(text, end).npoints, {"v(vo)": 2605})
+        self.assertEqual(waveview._parse_points(text, end, str(TR))[0][0].size, 2605)    # records hold no values
+        wrong = waveview._ExportInfo(npoints={"v(vo)": 2606})
+        with mock.patch.object(waveview, "_export_info", return_value=wrong):
+            with self.assertRaisesRegex(WaveViewError, r"reads 2605 of the 2606 points of v\(vo\)"):
+                waveview.read_traces(TR, ["v(vo"])
+
+    def test_every_count_only_for_a_file_that_is_not_complete(self):
+        with tempfile.TemporaryDirectory() as tmp, warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cut = self.cut(tmp, "cut_t9601.tr0", TR, 0.6)
+            for path, want in ((TR, None), (cut, "all")):
+                with mock.patch.object(waveview, "run_script", wraps=waveview.run_script) as run:
+                    waveview.read_traces(path, ["v(vo"])
+                self.assertEqual(run.call_args_list[-1].args[1].get("SRP_NPOINTS"), want, path)
+
     def test_truncated_sweep(self):
         # rc9.tr0 cut inside sweep 1: WaveView reads sweep 0 only, the header declares 3.
         with tempfile.TemporaryDirectory() as tmp:

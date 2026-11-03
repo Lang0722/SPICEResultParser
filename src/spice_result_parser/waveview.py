@@ -54,7 +54,10 @@ TCL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tcl")
 CONSOLE_TAIL = 10               # console lines quoted in an error when none names an error
 NUTMEG_LIMIT = 1e30             # WaveView sets a larger Nutmeg value to +-1e30
 
-_SCRIPT_VARIABLES = ("SRP_IN", "SRP_OUT", "SRP_SIGNALS", "SRP_XCHECK")   # set by _run only, never by the caller
+# Set by _run only, never by the caller.
+_SCRIPT_VARIABLES = ("SRP_IN", "SRP_OUT", "SRP_SIGNALS", "SRP_XCHECK", "SRP_NPOINTS", "SRP_XLO", "SRP_XHI",
+                     "SRP_MAX_VALUES")
+_INFO_RECORDS = ("npoints", "span", "stopped", "limit")          # extract.tcl records without values
 
 _ERROR_LINE = re.compile(r"ERROR|error|Tcl Error")
 _ERROR_RECORD = re.compile(r"^error\t(.*)$", re.M)
@@ -194,12 +197,14 @@ def stop_all() -> None:
 atexit.register(stop_all)
 
 
-def _run(name: str, path: str, signals: Optional[List[str]] = None, xcheck: bool = False) -> Tuple[str, int, str]:
+def _run(name: str, path: str, signals: Optional[List[str]] = None, xcheck: bool = False,
+         npoints_all: bool = False) -> Tuple[str, int, str]:
     """Run a script on `path`; return its output, the offset of the final srp_done, where
     the records end, and the console. The text is not sliced: an extract output can be large.
 
     signals: exact WaveView names written to SRP_SIGNALS, one per line; None leaves it unset.
     xcheck: set SRP_XCHECK (extract.tcl checks that all signals have the same x points).
+    npoints_all: set SRP_NPOINTS=all (extract.tcl writes the point count of every signal).
     Raises WaveViewError when the output has no srp_done or holds an error record.
     """
     # A WaveView that outlives a timeout can hold files in tmp (Windows): the clean-up must
@@ -216,6 +221,8 @@ def _run(name: str, path: str, signals: Optional[List[str]] = None, xcheck: bool
         env = {"SRP_IN": full, "SRP_OUT": out}
         if xcheck:
             env["SRP_XCHECK"] = "1"
+        if npoints_all:
+            env["SRP_NPOINTS"] = "all"
         if signals is not None:
             env["SRP_SIGNALS"] = os.path.join(tmp, "signals.txt")
             with open(env["SRP_SIGNALS"], "w", encoding="utf-8", newline="\n") as f:
@@ -556,6 +563,8 @@ def _parse_points(text: str, end: int, path: str) -> List[Tuple[np.ndarray, Dict
     traces: List[Tuple[np.ndarray, Dict[str, np.ndarray]]] = []
     for i, mark in enumerate(marks[1:], 1):
         kind, name = mark.group(1), mark.group(2)
+        if kind in _INFO_RECORDS:               # no values follow it (see _export_info)
+            continue
         if kind == "trace":
             traces.append((np.empty(0), {}))
             continue
@@ -570,6 +579,23 @@ def _parse_points(text: str, end: int, path: str) -> List[Tuple[np.ndarray, Dict
         else:
             traces[-1][1][name] = values
     return traces
+
+
+@dataclass
+class _ExportInfo:
+    """The records of extract.tcl that hold no values."""
+    npoints: Dict[str, int] = field(default_factory=dict)  # WaveView name -> -npoints (one more per sweep)
+
+
+def _export_info(text: str, end: int) -> _ExportInfo:
+    """The records of extract.tcl output up to `end` that hold no values (_INFO_RECORDS)."""
+    info = _ExportInfo()
+    for mark in _RECORD.finditer(text, 0, end):
+        if mark.group(1) == "npoints":
+            name, _, count = mark.group(2).rpartition("\t")
+            if count.isdigit():
+                info.npoints[name] = int(count)
+    return info
 
 
 def _split(trace: Tuple[np.ndarray, Dict[str, np.ndarray]], nsplit: int, npoints: int,
@@ -591,15 +617,16 @@ def _warn_truncated(path: str, listing: _Listing, found: str) -> None:
     warnings.warn(f"{path}: {found}: the file is probably truncated, and {lost}", RuntimeWarning)
 
 
-def _check_counts(path: str, listing: _Listing, traces, signals: List[str]) -> None:
-    """The points of a signal must be WaveView's count of them, less one per sweep. WaveView
-    ends a scan early after some values of about 1e34 or more. A file that is not complete
-    can have more: a cut ASCII file has one more, and the file can grow between the runs."""
+def _check_counts(path: str, listing: _Listing, traces, signals: List[str], npoints: Dict[str, int]) -> None:
+    """The points of a signal must be WaveView's count of them (npoints, from extract.tcl),
+    less one per sweep. WaveView ends a scan early after some values of about 1e34 or more.
+    A file that is not complete can have more: a cut ASCII file has one more, and the file
+    can grow between the runs."""
     extra = listing.ntraces if listing.params else 0
     counts = [(signals[0] if signals else listing.first, sum(x.size for x, _ in traces))]
     counts += [(name, sum(len(ys.get(name, ())) for _, ys in traces)) for name in signals]
     for name, count in counts:
-        want = listing.npoints.get(name)
+        want = npoints.get(name)
         if want is not None and (count < want - extra or (count > want - extra and not listing.incomplete)):
             raise WaveViewError(f"{path}: WaveView reads {count} of the {want - extra} points of {name}: WaveView "
                                 f"stops early on some values of about 1e34 or more, so the engine cannot read this "
@@ -654,7 +681,8 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
         wv_name = listing.columns[c][0]
         if wv_name not in signals:
             signals.append(wv_name)
-    text, end, _ = _run("extract.tcl", path, signals, xcheck=not listing.shared_x)
+    text, end, _ = _run("extract.tcl", path, signals, xcheck=not listing.shared_x, npoints_all=listing.incomplete)
+    info = _export_info(text, end)
     traces = _parse_points(text, end, path)
     del text
     if len(traces) > listing.ntraces:   # the simulator ended a sweep between the two WaveView runs
@@ -662,15 +690,16 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
     if len(traces) != listing.ntraces:
         raise WaveViewError(f"{path}: WaveView wrote {len(traces)} traces; its listing has {listing.ntraces} "
                             f"(the file can have changed between the two WaveView runs)")
-    _check_counts(path, listing, traces, signals)
+    _check_counts(path, listing, traces, signals, info.npoints)
     if listing.incomplete:
         # The last row can be partial: keep the points that every signal of the file has.
-        # -npoints shows the signals that have a point of that row. WaveView also reads a
-        # value that the cut makes short, so a Nutmeg plot keeps the count of nutmeg.py.
-        low = min(listing.npoints.values(), default=0)
+        # -npoints shows the signals that have a point of that row (extract.tcl writes the
+        # counts of all signals here). WaveView also reads a value that the cut makes short,
+        # so a Nutmeg plot keeps the count of nutmeg.py.
+        low = min(info.npoints.values(), default=0)
         x, ys = traces[-1]
-        sizes = [x.size - listing.npoints.get(signals[0] if signals else listing.first, low) + low]
-        sizes += [len(v) - listing.npoints.get(name, low) + low for name, v in ys.items()]
+        sizes = [x.size - info.npoints.get(signals[0] if signals else listing.first, low) + low]
+        sizes += [len(v) - info.npoints.get(name, low) + low for name, v in ys.items()]
         if listing.nut_complete is not None:
             sizes.append(listing.nut_complete)
         n = max(0, min(sizes))

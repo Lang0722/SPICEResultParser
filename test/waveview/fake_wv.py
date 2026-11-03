@@ -12,6 +12,10 @@ For extract.tcl and read_measures.tcl a set SRP_SIGNALS keeps only the records o
 listed signals, as the scripts do (no names in it: x only), and an unknown name gives
 the error record of the scripts.
 
+For extract.tcl the fake also writes what the script writes and the canned output has
+not: the npoints records (see with_counts). They come from the canned listing of the
+same file, which holds WaveView's real -npoints values.
+
 SRP_FAKE_WV selects a failure: "no_done" (the script stops on a Tcl error; exit code 1),
 "silent" (no output file at all), "sleep" (never finishes), "launcher" (never finishes,
 in a child process that holds the console pipe, as when wv is a launcher script; its
@@ -51,6 +55,37 @@ def sliced(lines, signals):
     return kept
 
 
+def listed_counts(source):
+    """(name, -npoints) of each signal of the canned listing of source, in its order."""
+    path = os.path.join(CANNED, f"{os.path.basename(source)}.list_traces.txt")
+    counts = []
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            for line in f:
+                fields = line.rstrip(b"\r\n").split(b"\t")
+                if fields[0] == b"signal" and len(fields) > 3 and fields[3].isdigit():
+                    counts.append((fields[1], fields[3]))
+    return counts
+
+
+def with_counts(lines, source, signals):
+    """Add the npoints records before srp_done, as extract.tcl writes them: the x signal and
+    each written signal (signals None: every signal; no names: x only, the first signal), or
+    every signal with SRP_NPOINTS=all. An error output gets none."""
+    if any(line.startswith(b"error\t") for line in lines):
+        return lines
+    counts = listed_counts(source)
+    if os.environ.get("SRP_NPOINTS") == "all" or signals is None:
+        names = {name for name, _ in counts}
+    elif not signals:
+        names = {name for name, _ in counts[:1]}
+    else:
+        names = set(signals)
+    records = [b"npoints\t" + name + b"\t" + n + b"\r\n" for name, n in counts if name in names]
+    end = len(lines) - 1 if lines and lines[-1].rstrip(b"\r\n") == b"srp_done" else len(lines)
+    return lines[:end] + records + lines[end:]
+
+
 def main(argv) -> int:
     script = os.path.splitext(os.path.basename(argv[-1]))[0]
     open(os.path.join(os.path.dirname(os.path.abspath(argv[-1])), "ace_tcl.log"), "wb").close()  # as WaveView
@@ -74,10 +109,13 @@ def main(argv) -> int:
         return 0
     with open(stem + ".txt", "rb") as f:
         lines = f.readlines()
+    signals = None
     if "SRP_SIGNALS" in os.environ and script in ("extract", "read_measures"):
         with open(os.environ["SRP_SIGNALS"], "rb") as f:
             signals = [line.rstrip(b"\r\n") for line in f if line.strip()]
         lines = sliced(lines, signals)
+    if script == "extract":
+        lines = with_counts(lines, source, signals)
     if mode == "no_done":
         lines = lines[:len(lines) // 2]
         console += TCL_ERROR

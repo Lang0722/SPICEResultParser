@@ -16,6 +16,8 @@
 #                     No names in it: x only.
 #         SRP_XCHECK  optional: set, the script checks that all signals have
 #                     the same x points (see write_points).
+#         SRP_NPOINTS optional: "all" writes the npoints record of every signal,
+#                     not only of the x signal and the written signals.
 # Output: SRP_OUT     a text file. Records have a tab; value lines do not:
 #   srp_extract 1
 #   trace   <i>           0-based; one per sweep trace, one when not swept
@@ -23,6 +25,9 @@
 #   real    <signal>      then the y value of each point, one per line
 #   complex <signal>      then "<real part> <imaginary part>" per point
 #   ...                   (the signals in the order of the file)
+#   npoints <signal> <n>  after the last trace: WaveView's point count of the x
+#                         signal and of each written signal, in the order of the
+#                         file, each once (in a swept file one more per sweep)
 #   srp_done
 # NaN prints as 1.#QNAN on Windows. A file that does not open, a signal name
 # that the file does not have, or signals with their own x points (an HSPICE
@@ -195,6 +200,14 @@ for {set i 0} {$i < $ntrace} {incr i} {
         }
         puts $out "$kind\t$nameof($s)"
         write_points $s $i $swept $kind
+    }
+}
+# The scans loaded these signals, so their counts cost no more loads. The counts of
+# all signals cost a load of each signal that the export did not read.
+set every [expr {[info exists env(SRP_NPOINTS)] && [string equal $env(SRP_NPOINTS) all]}]
+foreach name $order {
+    if {$every || [string equal $name $xname] || [info exists wanted($name)]} {
+        puts $out "npoints\t$name\t[sx_signal_attribute $object($name) -npoints]"
     }
 }
 finish
