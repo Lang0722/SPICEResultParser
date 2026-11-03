@@ -57,7 +57,8 @@ testing.
 ## Verified facts (probed on WaveView O-2018.09-SP2, Windows 11)
 
 Batch mode: `wv -ace_no_gui script.tcl`. It needs no display. Start-up is
-about 0.25 s. The embedded Tcl is **8.4.20**: no `dict`, `lassign`, `{*}`,
+about 0.25 s. (On 2026-11-03 each start on the Parallels VM took about 29 s.
+The cause is not known.) The embedded Tcl is **8.4.20**: no `dict`, `lassign`, `{*}`,
 `lmap`, `apply`, `string cat`. Environment variables are visible as
 `$env(NAME)`. Console messages (`*** loading waveform file ...`, `[ error ]
 ...`, `[Tcl Error] [line N]:...`) go to stdout. **The exit code does not show
@@ -118,7 +119,10 @@ TIME v(0) v(in)
   from `sx_get_sweep_conditions`, matched by position.
 - Failed values export as `NAN`.
 - `sx_export_range` resamples (it adds interpolated points), so it is not used.
-  The x window is applied in Python on the exported original points.
+  The x window comes from a POINT scan that starts with `sx_jump_to_x`, and Python
+  masks the result. The rules of the jumps, the cost of the first data query of a
+  signal (about 0.1 s and 1.5 MB on an FSDB) and the x units are in
+  `2026-11-03-waveview-windowed-extract-design.md`.
 - Exporting a `.mt#` file repeats its first row. So measures use the scan
   commands, not the export.
 
@@ -187,10 +191,13 @@ title<TAB><title, trimmed>
 xname<TAB><xname of the first signal>
 param<TAB><name>              (one per sweep parameter, in order)
 sweep<TAB><value>...           (one per trace: each parameter's value, %g; none when not swept)
-signal<TAB><name><TAB><real|complex><TAB><npoints>
+signal<TAB><name><TAB><real|complex>
 ...
 srp_done
 ```
+
+The listing asks for no point count: `-npoints` loads the signal. `extract.tcl`
+writes the counts of the signals that it reads.
 
 Each name goes through `encoding convertfrom utf-8 [encoding convertto utf-8 ...]`
 in all three scripts: WaveView gives the bytes of the file, and a Latin-1 byte would
@@ -209,11 +216,21 @@ in the file's order, from a POINT scan with `tcl_precision 17`:
 ```
 srp_extract 1
 trace<TAB><i>          (0-based; one per sweep trace, one when not swept)
+span<TAB><first x><TAB><last x>   (with the window: the x range of the trace)
 x<TAB><signal>         then one x value per line
 real<TAB><signal>      then one y value per line
 complex<TAB><signal>   then "<real> <imaginary>" per line
+stopped<TAB><signal>   (with the window: the scan ended before the last x of the trace)
+limit<TAB><values><TAB><trace><TAB><x>   (at SRP_MAX_VALUES, in place of the rest)
+npoints<TAB><signal><TAB><n>   (after the last trace: the x signal and each written signal)
 srp_done
 ```
+
+The other inputs: `SRP_XCHECK` (all signals must have the same x points),
+`SRP_NPOINTS=all` (the counts of every signal, for a file that is not complete),
+`SRP_XLO` and `SRP_XHI` (the window, used when the x unit is `s` or `Hz`), and
+`SRP_MAX_VALUES` (the x scan counts each point as its whole row). The header comment
+of the script has the details.
 
 An unknown name: `error<TAB>unknown signal <name>`. An `SRP_SIGNALS` file with
 no names gives x only. The input path goes to `sx_open_sim_file_read` as one
@@ -270,8 +287,9 @@ gets `"waveview": float64`):
   value block with numpy (also map `1.#QNAN`, `-1.#IND`, `1.#INF`), and check
   the value count against the line count (some NumPy versions only warn about a
   value they cannot read, and a warnings filter is not safe in threads). The points
-  of each selected signal (and of the x signal) must be its `npoints` less one per
-  sweep: else `WaveViewError` (WaveView ends a scan early after some values of about
+  of each selected signal (and of the x signal) must be its `npoints` (from the
+  `npoints` records of `extract.tcl`) less one per sweep, when there is no window:
+  else `WaveViewError` (WaveView ends a scan early after some values of about
   1e34 or more). In a file that the console calls not complete they can be more (a
   cut ASCII file has one more, and the file can grow between the two runs), not
   fewer. Then the last trace keeps the points that every signal of the file has: each

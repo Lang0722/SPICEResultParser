@@ -218,9 +218,10 @@ a `ReadCost`:
   file. A text file is slower than any disk, so both times are the same.
 - `large`: the file is over `api.SCAN_MAX_BYTES` (1 GB).
 
-For the WaveView engine, `values` is the count of values that WaveView writes for the
-selected traces, from the point counts of its listing. `seconds` then comes from the
-rate of the test VM (250,000 values per second), and `large` means more than 2 M values.
+For the WaveView engine, `values`, `memory` and `seconds` are 0, because its listing
+gives no point counts. `large` means more than 200 selected traces
+(`api.WAVEVIEW_MAX_TRACES`). The MCP `extract` also stops WaveView at 2 M values
+(`api.WAVEVIEW_SCAN_MAX_VALUES`), and its error says where WaveView stopped.
 
 Over MCP, `extract` warns before a large read. It reads a large file only with
 `allow_large=True`. Without it, the call fails before the read:
@@ -590,17 +591,25 @@ then says so. Set `TMP` (Windows) or `TMPDIR` to a folder with an ASCII path.
 
 The WaveView engine is different from the Python engine in these ways:
 
-- It reads every point of the selected traces into memory. It applies `xrange` after
-  the read. Each `extract` starts WaveView two times. On the test VM, 1 M values took
-  about 4 s. `list_traces` also reads every point, to give `x_range`, `points` and
-  `ranges`, because WaveView has no pass that keeps nothing. `header_only=True` runs only
-  WaveView's listing.
-- By default `list_traces` reads the points only when WaveView writes at most 2 M values
-  for the listed traces (`api.WAVEVIEW_SCAN_MAX_VALUES`). The listing gives the point
-  count of each signal, so the engine knows the count before it reads.
-  `waveview.scan_cost` gives it. In a file whose signals have their own x points (an
-  HSPICE `post=3` file), `extract.tcl` stops at the second signal, so `list_traces`
-  ranges only one trace at a time. Else the result is the listing alone, with a `note`.
+- It reads the selected traces into memory. With `xrange`, WaveView writes only the
+  window and at most 8 points before it, when all of these are true: the x unit is `s`
+  or `Hz` (time or frequency), the file is complete, and it is not a Nutmeg plot with a
+  `Dimensions` line. Else WaveView writes every point. Python then applies the `xrange`
+  mask. Each `extract` starts WaveView two times. `list_traces` reads every point, to
+  give `x_range`, `points` and `ranges`, because WaveView has no pass that keeps
+  nothing. `header_only=True` runs only WaveView's listing.
+- The listing loads no signal, because it asks for no point count. WaveView loads each
+  signal on its first use: on an FSDB, about 0.1 s and 1.5 MB per signal. Thus a read
+  of more than 200 selected traces is large (`api.WAVEVIEW_MAX_TRACES`).
+- By default `list_traces` ranges at most 200 traces, and it stops WaveView at 2 M
+  values (`api.WAVEVIEW_SCAN_MAX_VALUES`). A point counts its whole row: x, one value
+  per real trace and two per complex one. At either limit the result is the listing
+  alone, with a `note`. The MCP `extract` uses both limits unless `allow_large=True`. In
+  Python, `api.extract(..., engine="waveview", max_values=N)` stops at N values and
+  raises `waveview.ValueLimitError`, a `ValueError`.
+- In a file whose signals have their own x points (an HSPICE `post=3` file),
+  `extract.tcl` stops at the second signal, so `list_traces` ranges only one trace at a
+  time. `waveview.scan_cost` gives the signals and whether they share their x points.
   `list_traces` runs the listing once for both steps.
 - It reads plot 0 of a Nutmeg rawfile only. `plots` holds one name, and `plot=1` raises
   `ValueError`.

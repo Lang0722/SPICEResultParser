@@ -13,6 +13,7 @@ The tests compare both engines on every file the Python reader can read, the HSP
 post_version 2013 files among them. Known differences are asserted as such, so that a
 change on either side shows.
 """
+import math
 import os
 import shutil
 import tempfile
@@ -247,6 +248,57 @@ class TestParity(Base):
                     self.assertEqual(got.data["HERTZ"][i].size, 51)
                     np.testing.assert_allclose(got.data["v_out_dB"][i], got.data["vdb_out"][i], atol=2e-5)
                 self.assert_same(got, want, rtol, names={"HERTZ": "HERTZ", "vdb_out": "vdb_out"})
+
+
+class TestWindow(Base):
+    """xrange through the real WaveView against the Python engine: the jump rules of
+    sx_jump_to_x (docs/superpowers/specs/2026-11-03-waveview-windowed-extract-design.md)."""
+
+    def x(self, path):
+        ts = read_traces(path)
+        return np.unique(np.concatenate(ts.data[ts.header.x_name]))
+
+    def windows_match(self, path, windows, rtol=0.0):
+        with waveview.listing_memo():               # one listing, then one export per window
+            for w in windows:
+                with self.subTest(path=path.name, window=w):
+                    got, want = waveview.read_traces(path, xrange=w), read_traces(path, xrange=w)
+                    self.assert_same(got, want, rtol)
+                    self.assertEqual(got.plot_points, want.plot_points)
+                    np.testing.assert_array_equal(got.plot_x_range, want.plot_x_range)
+
+    def test_bounds_beside_points(self):
+        for path in (WV / "rc.tr0", HERE / "test_9601.tr0"):        # post_version 2013 (float64 x), 9601
+            x = self.x(path)
+            a, b = x[x.size // 3], x[x.size // 3 + 10]
+            self.windows_match(path, [(float(a), float(b)),
+                                      (float(np.nextafter(a, -np.inf)), float(np.nextafter(b, np.inf))),
+                                      (float(np.nextafter(a, np.inf)), float(np.nextafter(b, -np.inf)))])
+
+    def test_window_at_the_start_of_a_later_sweep(self):
+        x1 = read_traces(WV / "two.tr0").data["TIME"][1]
+        self.windows_match(WV / "two.tr0", [(float(x1[2]), float(x1[12])), (float(x1[9]), float(x1[20]))])
+
+    def test_window_past_the_end_and_half_infinite(self):
+        x = self.x(WV / "rc.ac0")
+        self.windows_match(WV / "rc.ac0", [(float(x[-1]) * 2, float(x[-1]) * 3), (-math.inf, float(x[5])),
+                                           (float(x[-5]), math.inf)])
+
+    def test_window_with_a_scan_that_stops_early(self):
+        x = self.x(WV / "big9.tr0")
+        with self.assertRaisesRegex(WaveViewError, r"WaveView stops its scan of v\(g36\) in sweep 0"):
+            waveview.read_traces(WV / "big9.tr0", ["v(g36"], xrange=(float(x[90]), math.inf))
+
+    def test_dc_sweep_is_not_windowed(self):
+        x = self.x(WV / "dc2.sw0")                  # 3 sweeps of 0, 0.5 and 1 V
+        self.windows_match(WV / "dc2.sw0", [(float(x[1]), float(x[2]))])
+
+    def test_value_limit(self):
+        # A point of x counts its whole row: x and v(vo), 2 values. 50 rows fit in 101.
+        x = read_traces(HERE / "test_9601.tr0").data["TIME"][0]
+        with self.assertRaises(waveview.ValueLimitError) as caught:
+            waveview.read_traces(HERE / "test_9601.tr0", ["v(vo"], max_values=101)
+        self.assertEqual((caught.exception.values, caught.exception.x), (100, float(x[49])))
 
 
 class TestPostVersion2013(Base):

@@ -170,10 +170,11 @@ read_measures("run.mt0", engine="waveview")
 - `SRP_WAVEVIEW` names the `wv` binary. Not set: `wv` on the `PATH`.
 - `SRP_WAVEVIEW_TIMEOUT` sets the time limit of one WaveView run (default 600 s).
 
-The WaveView engine reads every point of the selected traces into memory, and only plot
-0 of a Nutmeg rawfile. Thus `list_traces` ranges the traces through WaveView only up to
-2 M values. In a file whose signals have their own x points (an HSPICE `post=3` file),
-it ranges one trace at a time. Else it gives WaveView's listing alone, with a `note`. The three Tcl scripts in `spice_result_parser/tcl/` also run by
+The WaveView engine reads the selected traces into memory, and only plot 0 of a Nutmeg
+rawfile. With `xrange` on a time or frequency x, WaveView writes only the window. Else it
+writes every point. Thus `list_traces` ranges the traces through WaveView only up to 200
+traces and 2 M values. In a file whose signals have their own x points (an HSPICE
+`post=3` file), it ranges one trace at a time. Else it gives WaveView's listing alone, with a `note`. The three Tcl scripts in `spice_result_parser/tcl/` also run by
 hand with `wv -ace_no_gui`. Run a copy in a working directory, because WaveView writes
 `ace_tcl.log` beside the script. [Usage.md](Usage.md#waveview-engine) gives the details
 and the known differences between the two engines.

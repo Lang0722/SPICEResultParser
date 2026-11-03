@@ -13,6 +13,15 @@ window, not every point of the selected signals. The owner works with files up t
 pass (1 skipped). The e2e tests (`test/test_waveview_e2e.py`) did not run in this
 work: they need WaveView.
 
+**Status, later on 2026-11-03:** tasks 1 to 3 are done on the Mac, through the Parallels
+VM. The results are in `docs/superpowers/specs/2026-11-03-waveview-windowed-extract-design.md`.
+The owner skipped the e2e baseline: each WaveView start on the VM took 29 s, so the suite
+would take more than 95 minutes. Tasks 4 and 5 are replaced by
+`docs/superpowers/plans/2026-11-03-waveview-windowed-extract.md`. The owner approved
+it, and it is done on this branch. On the VM, `TestWindow.test_window_past_the_end_and_half_infinite`
+passed, and a windowed export of `rc.ac0` wrote 48 value lines in place of 204. The
+other e2e tests of the plan (about 40 minutes) wait for the owner.
+
 ## What the owner wants
 
 - Design from the view of the agent that calls the tools: an agent cannot see time
