@@ -194,6 +194,12 @@ def _build_header(path: str, is_bin: bool, version: str, nauto: int, nprobe: int
     type_codes = [int(t) for t in tokens[:nvars]]
     raw_names = list(tokens[nvars:2 * nvars])
     sweep_params_raw = list(tokens[2 * nvars:expected])
+    if nsweepparam > 1:
+        # Only a .data sweep (.tran ... sweep data=pts) names more than one: its table, then
+        # its columns (pts rval cval). Each sweep starts with a value per column; the
+        # table itself has none. HSPICE P-2019.06 files show it, and WaveView agrees.
+        sweep_params_raw = sweep_params_raw[1:]
+        nsweepparam -= 1
     analysis = _ANALYSIS_BY_TYPE_CODE.get(type_codes[0])
     if analysis is None:
         raise ValueError(f"{path}: unknown analysis type code {type_codes[0]}")

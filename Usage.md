@@ -523,15 +523,11 @@ The WaveView engine is different from the Python engine in these ways:
 The Python reader has these known errors. The WaveView engine does not have them:
 
 - It rejects HSPICE `post_version` 2013 binaries.
-- In a `.data` sweep, it counts the name of the `.data` table as a sweep parameter. Thus
-  the sweep values and the data shift by one value.
 - In a Monte Carlo measure file, the lines that start with `$` (`$OPTION ...`) come
   before `.TITLE`. The Python reader takes them for the title and the names, and it
   reads 0 rows, with only a `RuntimeWarning`.
 - An ASCII header can wrap a long name over two lines. The Python reader then reads two
   names, and each later name labels the column before it.
-- An AC file can hold real signals such as `vdb(out)`. The Python reader reads each AC
-  signal as a complex pair, so the columns after a real signal shift.
 
 The tests against the real WaveView are in `test/test_waveview_e2e.py`. They run only
 when you set `SRP_E2E_WAVEVIEW=1`. Also set `SRP_WAVEVIEW` to the `wv` binary. If you

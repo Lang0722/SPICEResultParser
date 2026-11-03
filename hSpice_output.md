@@ -72,6 +72,7 @@ The variable list holds three blanks, the type codes, five blanks, then the name
   - The first name is the x variable, for example `TIME`, `HERTZ` or the swept source of a `.dc` (`gg` for `.dc gg 0 1 0.1`).
   - The probe outputs come last.
 - **Sweep parameter names**: one name per sweep parameter, in a field of 16 columns.
+  - A `.data` sweep (`.tran 10n 10u sweep data=pts`) names its table before the columns of the table: `pts rval cval`. The header counts all three names. The data hold a value for each column (`rval`, `cval`), and no value for the table. Only a `.data` sweep has more than one sweep parameter name.
   - **Note:** Some analyses have 2D sweeps (such as `.dc` analysis that sweeps two sources). For 2D sweeps, the second source is the sweep parameter. For example, suppose that a `.dc` analysis sweeps `gg` and `dd` and monitors `v(A)`, `v(B)`, and `v(C)`. Then the names would be: `gg v(A v(B v(C dd`.
 - **End marker**: the string `$&%#` and four blanks. The block tail follows.
 
@@ -126,7 +127,7 @@ The data blocks follow the header block and contain the actual simulation result
 
 - The data section is a flat sequence of binary numbers representing the simulation results.
 - The file stores the values in an *interleaved* order. For each time point (or sweep point), the file gives the value of each variable. The values follow the order of the variable list in the header. For example, if the variables are `TIME`, `v(0)`, `v(vo)`, the data will be: `TIME_0, v(0)_0, v(vo)_0, TIME_1, v(0)_1, v(vo)_1, ...`.
-- If there are multiple sweeps, the data of each sweep uses the same interleaved pattern. An additional value at the start of each sweep gives the value of the swept parameter for that sweep.
+- If there are multiple sweeps, the data of each sweep uses the same interleaved pattern. Additional values at the start of each sweep give the values of the swept parameters for that sweep: one value, or for a `.data` sweep one value per column of the table.
 - A special *termination value* marks the end of a sweep:
 	- For 9601: `1.0000000150474662e+30`
 	- For 2001: `1e+30`

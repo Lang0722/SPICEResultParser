@@ -262,6 +262,39 @@ class TestAcProbes(unittest.TestCase):
         self.assertNotIn("vdb_out_Mag", text)
 
 
+class TestDataSweeps(unittest.TestCase):
+    """A .data sweep (.tran ... sweep data=pts) names its table before its columns
+    (pts rval cval); each sweep starts with a value per column, none for the table."""
+
+    def test_real_files(self):
+        wv = HERE / "waveview"                  # HSPICE P-2019.06: two9.tr0 binary 9601, twoa.tr0 ASCII
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")      # read one value off, the sweeps would end in stray values
+            binary, text = read_traces(wv / "two9.tr0"), read_traces(wv / "twoa.tr0")
+        for ts in (binary, text):
+            self.assertEqual(ts.header.sweep_params, ["rval", "cval"])
+            self.assertEqual([len(a) for a in ts.data["TIME"]], [46, 46, 46])
+            np.testing.assert_allclose(ts.sweep_values, [[1000, 1e-9], [2000, 1e-9], [2000, 2e-9]], rtol=1e-7)
+            np.testing.assert_allclose(ts.data["TIME"][0][:4], [0, 2.5e-10, 5e-10, 1e-9], rtol=1e-7)
+            np.testing.assert_array_equal(ts.data["v_in"][0][:4], [0, 0.25, 0.5, 1])     # the 1 ns rise of the pulse
+        for name in binary.selected:
+            for a, b in zip(text.data[name], binary.data[name]):
+                np.testing.assert_allclose(a, b, rtol=1e-6, atol=1e-12, err_msg=name)
+        info = api.list_traces(wv / "two9.tr0")
+        self.assertEqual((info["sweeps"], info["sweep_params"]), (3, ["rval", "cval"]))
+
+    def test_fixture_in_hspice_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "data.tr0"
+            x = np.linspace(0, 1e-9, 5)
+            sweeps = [([r, c], np.column_stack([x, x * r])) for r, c in ((1e3, 1e-9), (2e3, 2e-9))]
+            fixtures.write_binary(path, "9601", ["TIME", "v(out", "rval", "cval"], [1, 1], sweeps, layout="hspice")
+            self.assertIn(b"pts             rval            cval", path.read_bytes())
+            ts = read_traces(path)
+            self.assertEqual((ts.header.nsweepparam, ts.header.sweep_params), (2, ["rval", "cval"]))
+            np.testing.assert_allclose(ts.data["v_out"][1], x * 2e3, rtol=1e-6)
+
+
 class TestStrayValues(unittest.TestCase):
     def test_a_wrong_column_count_is_reported(self):
         # 7 values per point under a header that declares 5: the values before the

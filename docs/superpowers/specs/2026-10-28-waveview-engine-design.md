@@ -378,6 +378,8 @@ through the existing generic error branch (`WaveViewError: ...`).
 - `.data` sweeps: the Python reader reports sweep params `pts rval cval` with
   values `[1000, 1e-9, 0]`; WaveView reports `rval=1000:cval=1n`. The `.data`
   table name seems to be counted as a parameter, so values shift by one.
+  (Fixed after the merge into feature/low-memory-reader: the header names the
+  table before its columns, and the data hold no value for it.)
 - `.mt0`: `PARAM_COUNT=3` for a two-parameter `.data` sweep made `read_measures`
   mark the first measure (`tdel`) as a parameter. The cause is not the `.data`
   table name: `PARAM_COUNT` counts the `index` column too (`d1.mt0`: one

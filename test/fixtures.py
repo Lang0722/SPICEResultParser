@@ -58,6 +58,17 @@ def hspice_header_text(version, raw_names, type_codes, nsweepparam, sweep_count,
     return text[:-8]                     # the terminator's field is 8 columns: "$&%#" and four blanks
 
 
+def data_table(raw_names, nsweepparam):
+    """(names, sweep parameter count) as the header gives them. Only a .data sweep has more
+    than one parameter, and HSPICE names its table before its columns ("pts rval cval");
+    the data hold no value for the table."""
+    if nsweepparam < 2:
+        return list(raw_names), nsweepparam
+    names = list(raw_names)
+    names.insert(len(names) - nsweepparam, "pts")
+    return names, nsweepparam + 1
+
+
 def _block(payload: bytes) -> bytes:
     size = struct.pack("<i", len(payload))
     return _ENDIAN_HEAD + size + payload + size
@@ -85,10 +96,11 @@ def write_binary(path, version, raw_names, type_codes, sweeps, block_bytes=8192,
     dtype = np.dtype("<f4") if version == "9601" else np.dtype("<f8")
     nsweepparam = len(sweeps[0][0])
     count = announce if announce is not None else len(sweeps) if nsweepparam else 0
+    raw_names, header_params = data_table(raw_names, nsweepparam)
     if layout == "hspice":
-        text = hspice_header_text(version, raw_names, type_codes, nsweepparam, count, nprobe, **header)
+        text = hspice_header_text(version, raw_names, type_codes, header_params, count, nprobe, **header)
     elif layout == "free" and not header:
-        text = header_text(version, raw_names, type_codes, nsweepparam, count, nprobe).encode("utf-8")
+        text = header_text(version, raw_names, type_codes, header_params, count, nprobe).encode("utf-8")
     else:
         raise ValueError(f"layout {layout!r} with {sorted(header)}")
     parts = []
@@ -138,8 +150,9 @@ def write_ascii(path, raw_names, type_codes, sweeps, per_line=5, nprobe=0, layou
     nsweepparam = len(sweeps[0][0])
     nvars = len(raw_names) - nsweepparam
     count = len(sweeps) if nsweepparam else 0
+    raw_names, header_params = data_table(raw_names, nsweepparam)
     if layout == "hspice":
-        text = hspice_header_text("2001", raw_names, type_codes, nsweepparam, count, nprobe, **header)
+        text = hspice_header_text("2001", raw_names, type_codes, header_params, count, nprobe, **header)
         text = text.decode("utf-8").rstrip(" ")
         text = text.ljust(-(-len(text) // 80) * 80)
         with open(path, "w") as f:
@@ -148,7 +161,7 @@ def write_ascii(path, raw_names, type_codes, sweeps, per_line=5, nprobe=0, layou
         raise ValueError(f"layout {layout!r} with {sorted(header)}")
     with open(path, "a" if layout == "hspice" else "w") as f:
         if layout == "free":
-            f.write(f"{nvars - nprobe:4d}{nprobe:4d}{nsweepparam:4d}    ascii * fixture.sp\n")
+            f.write(f"{nvars - nprobe:4d}{nprobe:4d}{header_params:4d}    ascii * fixture.sp\n")
             f.write("01/01/2026 00:00:00 Copyright (c) 2026 Fixture. All Rights Reserved.\n")
             f.write(f"  {count}\n")
             f.write(" ".join(str(t) for t in type_codes) + " " + " ".join(raw_names) + " $&%#\n")
