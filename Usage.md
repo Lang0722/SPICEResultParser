@@ -595,10 +595,13 @@ The WaveView engine is different from the Python engine in these ways:
 - It reads the selected traces into memory. With `xrange`, WaveView writes only the
   window and at most 8 points before it, when all of these are true: the x unit is `s`
   or `Hz` (time or frequency), the file is complete, and it is not a Nutmeg plot with a
-  `Dimensions` line. Else WaveView writes every point. Python then applies the `xrange`
-  mask. Each `extract` starts WaveView two times. `list_traces` reads every point, to
-  give `x_range`, `points` and `ranges`, because WaveView has no pass that keeps
-  nothing. `header_only=True` runs only WaveView's listing.
+  `Dimensions` line. Else WaveView writes every point. For a frequency x, WaveView first
+  scans the x of each trace, and a frequency that goes down in a trace (an AC list of
+  points) also gets every point. A time x must grow in each trace, as in each SPICE
+  result. Python then applies the `xrange` mask. Each `extract` starts WaveView two
+  times. `list_traces` reads every point, to give `x_range`, `points` and `ranges`,
+  because WaveView has no pass that keeps nothing. `header_only=True` runs only
+  WaveView's listing.
 - The listing loads no signal, because it asks for no point count. WaveView loads each
   signal on its first use: on an FSDB, about 0.1 s and 1.5 MB per signal. Thus a read
   of more than 200 selected traces is large (`api.WAVEVIEW_MAX_TRACES`).

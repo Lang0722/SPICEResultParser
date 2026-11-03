@@ -228,7 +228,8 @@ srp_done
 
 The other inputs: `SRP_XCHECK` (all signals must have the same x points),
 `SRP_NPOINTS=all` (the counts of every signal, for a file that is not complete),
-`SRP_XLO` and `SRP_XHI` (the window, used when the x unit is `s` or `Hz`), and
+`SRP_XLO` and `SRP_XHI` (the window, used when the x unit is `s`, or `Hz` with a
+frequency that does not go down in a trace), and
 `SRP_MAX_VALUES` (the x scan counts each point as its whole row). The header comment
 of the script has the details.
 

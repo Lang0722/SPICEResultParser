@@ -24,7 +24,8 @@
 #         SRP_XLO, SRP_XHI optional: the window [SRP_XLO, SRP_XHI] of x. One of
 #                     them alone leaves the other side open. When the x unit of the
 #                     x signal is s or Hz, the scans write the window and at most 8
-#                     points before it. Else they write every point.
+#                     points before it. Else they write every point. A frequency
+#                     that goes down in a trace also gets every point.
 # Output: SRP_OUT     a text file. Records have a tab; value lines do not:
 #   srp_extract 1
 #   trace   <i>           0-based; one per sweep trace, one when not swept
@@ -114,6 +115,26 @@ proc seek {scan lo trace} {
         set last $x
     }
     return [jump $scan FIRST $trace]
+}
+
+# 1 when the x of trace `trace` of signal `sig` does not go down. An AC file can list
+# its frequencies in any order (a list of points), and seek needs an x that grows.
+proc rising {sig trace} {
+    set scan [sx_scan_data_points $sig POINT]
+    set up 1
+    if {[jump $scan FIRST $trace]} {
+        set last [sx_x_value $scan]
+        while {[sx_jump_to_x $scan NEXT]} {
+            set x [sx_x_value $scan]
+            if {$x < $last} {
+                set up 0
+                break
+            }
+            set last $x
+        }
+    }
+    sx_release $scan
+    return $up
 }
 
 # Write "span<TAB><first x><TAB><last x>" of trace `trace` of the x signal, and keep
@@ -308,12 +329,21 @@ if {[info exists env(SRP_XLO)]} {
 if {[info exists env(SRP_XHI)]} {
     set xhi $env(SRP_XHI)
 }
-# The window applies to a time or frequency x only: such x values grow within a
-# trace, and seek needs that. Any other x (a DC sweep can go down) gets every point.
+# The window applies to a time or frequency x only, because seek needs an x that grows
+# within a trace. The time of a SPICE result grows. A frequency can go down (an AC list
+# of points), so a frequency x gets one scan of each trace first. Any other x (a DC
+# sweep can go down) gets every point.
 set windowed 0
-if {([string length $xlo] || [string length $xhi])
-        && [lsearch -exact {s Hz} [sx_signal_attribute $xsig -xunit]] >= 0} {
-    set windowed 1
+if {[string length $xlo] || [string length $xhi]} {
+    set unit [sx_signal_attribute $xsig -xunit]
+    if {[string equal $unit s] || [string equal $unit Hz]} {
+        set windowed 1
+    }
+    if {[string equal $unit Hz]} {
+        for {set i 0} {$i < $ntrace && $windowed} {incr i} {
+            set windowed [rising $xsig $i]
+        }
+    }
 }
 set span_last ""
 set count 0

@@ -138,6 +138,11 @@ so extra points at the edges do no harm.
 and frequency do not decrease, and the seek needs that. Any other x gets the full scan, as
 now. For example, the x of a DC sweep can decrease.
 
+(Change after the final review of 2026-11-04.) A frequency can decrease: an AC file can list
+its points in any order. So for the unit `Hz`, `extract.tcl` first scans the x of each
+trace. When the x of a trace decreases, the whole file gets the full scan. The time of a
+SPICE result is taken to grow in each trace, and it gets no such scan.
+
 With the window, each trace starts with `span<TAB><first x><TAB><last x>` of the x signal.
 The first x is the `FIRST` x. The last x is the `LAST` x, or the `PREV` x when the `LAST`
 x is `1e30` or more. Each scan does these steps:

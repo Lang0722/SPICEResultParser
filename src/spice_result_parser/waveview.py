@@ -688,7 +688,8 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
     Two WaveView runs: list_traces.tcl for the names, then extract.tcl for the points of
     the selected signals. With xrange, extract.tcl writes only the window and at most 8
     points before it, when x is time or frequency (x unit s or Hz), the file is complete,
-    and it is not a Nutmeg plot of a Dimensions line. Else it writes every point. The
+    and it is not a Nutmeg plot of a Dimensions line. A frequency that goes down in a
+    trace (an AC list of points) also gets every point. Else it writes every point. The
     sweeps filter and the closed xrange mask are applied afterwards.
 
     max_values: the most values that extract.tcl writes. A point of x counts its whole

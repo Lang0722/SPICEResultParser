@@ -28,6 +28,7 @@ HERE = Path(__file__).parent.resolve()
 WV = HERE / "waveview"
 ENABLED = os.environ.get("SRP_E2E_WAVEVIEW") == "1"
 
+import fixtures  # noqa: E402
 from spice_result_parser import api, measure, waveview  # noqa: E402
 from spice_result_parser.reader import read_traces  # noqa: E402
 from spice_result_parser.waveview import WaveViewError  # noqa: E402
@@ -108,9 +109,14 @@ class TestParity(Base):
     def test_listing_and_values(self):
         for path, rtol in PARITY.items():
             with self.subTest(path.name):
-                want_list = api.list_traces(path)
-                got_list = api.list_traces(path, engine="waveview")
+                # header_only=False: through WaveView, list_traces ranges at most
+                # api.WAVEVIEW_MAX_TRACES traces by default, and l340_9.tr0 has 343.
+                want_list = api.list_traces(path, header_only=False)
+                got_list = api.list_traces(path, engine="waveview", header_only=False)
                 self.assertEqual(got_list.pop("format"), "waveview")
+                if got_list["trace_count"] > api.WAVEVIEW_MAX_TRACES:
+                    self.assertEqual(got_list.pop("note"), f"list_traces ranges at most {api.WAVEVIEW_MAX_TRACES} "
+                                                           f"traces by default, and {got_list['trace_count']} are selected")
                 want_list.pop("format")
                 if path.suffix == ".raw":                      # WaveView opens plot 0 only
                     self.assertEqual(got_list.pop("plots"), want_list.pop("plots")[:1])
@@ -288,6 +294,20 @@ class TestWindow(Base):
         x = self.x(WV / "big9.tr0")
         with self.assertRaisesRegex(WaveViewError, r"WaveView stops its scan of v\(g36\) in sweep 0"):
             waveview.read_traces(WV / "big9.tr0", ["v(g36"], xrange=(float(x[90]), math.inf))
+
+    def test_frequency_out_of_order(self):
+        # An AC file can list its frequencies in any order (a list of points). The window would
+        # then lose points: WaveView writes every point, as for a DC sweep.
+        f = np.array([1e5, 1e3, 1e4, 2e3, 3e4, 5e2, 7e4, 4e3])
+        rng = np.random.default_rng(5)
+        data = np.column_stack([f] + [rng.uniform(-2, 2, f.size) for _ in range(4)])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "order.ac0"
+            fixtures.write_binary(path, "2001", ["HERTZ", "v(a", "i(b"], [2, 1, 8], [([], data)], layout="hspice")
+            self.windows_match(path, [(5e3, 2e4), (1.5e3, 5e4)], rtol=1e-13)     # 1 ulp: see test_ac_formats
+        x = self.x(WV / "rc.ac0")                   # its frequencies grow: the window applies
+        text, end, _ = waveview._run("extract.tcl", str(WV / "rc.ac0"), None, window=(float(x[20]), float(x[30])))
+        self.assertEqual(len(waveview._export_info(text, end).spans), 2)
 
     def test_dc_sweep_is_not_windowed(self):
         x = self.x(WV / "dc2.sw0")                  # 3 sweeps of 0, 0.5 and 1 V

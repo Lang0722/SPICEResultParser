@@ -39,6 +39,8 @@ TCL_ERROR = (b"[Tcl Error] [line 12]:invalid command name \"sx_bogus\"\r\n"
              b"   *** Tcl script failed ... ***\r\n")
 KEPT_RECORDS = (b"srp_extract", b"srp_measures", b"title", b"trace", b"x", b"error")
 WINDOW_XNAMES = (b"TIME", b"time", b"HERTZ", b"frequency")    # WaveView gave the x unit s or Hz for these
+# extract.tcl also gives no window to a file with a frequency that goes down in a trace. No
+# canned file has one: test_waveview_e2e.TestWindow.test_frequency_out_of_order checks it.
 
 
 def sliced(lines, signals):
