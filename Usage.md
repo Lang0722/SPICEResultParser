@@ -3,7 +3,9 @@
 SPICEResultParser reads these files:
 
 - HSPICE DC, AC and transient result files (`*.swX`, `*.acX`, `*.trX`) in the 9601 and
-  2001 binary formats and the `post=2` ASCII format
+  2001 binary formats and the `post=2` ASCII format. We examined files from the 2011,
+  2013, 2020 and 2021 releases. [hSpice_output.md](hSpice_output.md) gives the header
+  columns that they share.
 - HSPICE measure files (`*.mtX`, `*.msX`, `*.maX`)
 - Nutmeg rawfiles (ngspice / SPICE3 `.raw`)
 
@@ -233,9 +235,10 @@ example, the reader replaces both `.` and `:` with `_`. The reader keeps one tra
 column and appends `#<column index>` to the repeats, for example `v_a_b` and `v_a_b#2`.
 A `RuntimeWarning` names each sanitized name that repeats.
 
-In AC files each variable becomes two traces (`v_vo_Mag` and `v_vo_Phase`). Thus you
+In AC files each complex variable becomes two traces (`v_vo_Mag` and `v_vo_Phase`). Thus you
 cannot select the sanitized base name `v_vo` on its own. To select both, pass the raw
-name `v(vo)` or a glob such as `v_vo*`. If you give `v_vo`, the error tells you so.
+name `v(vo)` or a glob such as `v_vo*`. If you give `v_vo`, the error tells you so. A probe output, such as `vdb(vo)` from
+`.probe ac vdb(vo)`, is real. It stays one trace, `vdb_vo`.
 
 If a name matches no trace exactly, the reader tries it again and ignores case, because
 SPICE names are not case-sensitive: `V(VO)` and `TIME` select `v(vo)` and `time`. An
@@ -262,7 +265,8 @@ extract("run.ac0", ["v_vo_Phase"])                 # one half: both stored parts
 ```
 
 `read_header`, `read_traces`, `list_traces` and `extract` all take it. Files without
-complex data ignore it. Phase is `atan2(im, re)` in degrees, wrapped to (-180, 180].
+complex data ignore it. Probe outputs (`vm`, `vdb`, `vp` and others) are real, so it does
+not change them. Phase is `atan2(im, re)` in degrees, wrapped to (-180, 180].
 
 ## Measure files
 

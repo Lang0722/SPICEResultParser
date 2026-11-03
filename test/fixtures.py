@@ -12,20 +12,46 @@ import numpy as np
 _ENDIAN_HEAD = b"\x04\x00\x00\x00\x31\x00\x00\x00\x04\x00\x00\x00"
 _COPYRIGHT = " fixture.sp   01/01/2026   00:00:00 Copyright (c) 2026 Fixture. All Rights Reserved. "
 
+# Copyright notices as HSPICE releases write them into the header (see hspice_header_text).
+NOTICE_2020 = " Copyright (c) 1986 - 2020 by Synopsys, Inc. All Rights Reserved."
+NOTICE_2011 = " Copyright (C) 2011 Synopsys, Inc. All Rights Reserved."
+NOTICE_2013 = " " * 49 + "erved."         # H-2013.03 (win64) blanks all of its notice but this
 
-def header_text(version, raw_names, type_codes, nsweepparam, sweep_count):
-    """Header block text. raw_names includes sweep parameter names at the end."""
-    nvars = len(raw_names) - nsweepparam
-    counts = f"{nvars:04d}{0:04d}{nsweepparam:04d}"
+
+def _lead(version, nvars, nprobe, nsweepparam):
+    counts = f"{nvars - nprobe:04d}{nprobe:04d}{nsweepparam:04d}"
     if version == "9601":
-        lead = counts + "0000" + "9601" + "    *"
-    elif version == "2001":
-        lead = counts + "00000000" + "2001" + "*"
-    else:
-        raise ValueError(f"unsupported version {version!r}")
+        return counts + "0000" + "9601" + "    "
+    if version == "2001":
+        return counts + "00000000" + "2001"
+    raise ValueError(f"unsupported version {version!r}")
+
+
+def header_text(version, raw_names, type_codes, nsweepparam, sweep_count, nprobe=0):
+    """Header block text in a free layout (fields separated by single spaces, not in
+    HSPICE's columns). raw_names includes sweep parameter names at the end; the last
+    nprobe variables are probe outputs (real in an AC file)."""
+    nvars = len(raw_names) - nsweepparam
+    lead = _lead(version, nvars, nprobe, nsweepparam) + "*"
     body = (f"{sweep_count} " + " ".join(str(t) for t in type_codes) + " "
             + " ".join(raw_names) + " $&%#    ")
     return lead + _COPYRIGHT + body
+
+
+def hspice_header_text(version, raw_names, type_codes, nsweepparam, sweep_count, nprobe=0,
+                       title="* fixture.sp", date="01/01/2026", time="00:00:00", notice=NOTICE_2020):
+    """Header block text in the columns HSPICE writes (2011 to 2021 files, 9601 and 2001):
+    counts and version in 0-23, title 24-87, date 88-103, time 104-111, notice 112-176, the
+    sweep count right-aligned in 177-187, blanks to 255, then three blanks, one 8-column
+    field per type code and five blanks, then the names, the sweep parameter names and the
+    terminator in 16-column fields. Columns are bytes."""
+    nvars = len(raw_names) - nsweepparam
+    text = (_lead(version, nvars, nprobe, nsweepparam).encode() + title.encode().ljust(64)
+            + date.encode().ljust(16) + time.encode().ljust(8) + notice.encode().ljust(65)
+            + f"{sweep_count:11d}".encode() + b" " * 68
+            + b"   " + b"".join(f"{t:8d}".encode() for t in type_codes) + b"     "
+            + b"".join(n.encode().ljust(16) for n in list(raw_names) + ["$&%#"]))
+    return text[:-8]                     # the terminator's field is 8 columns: "$&%#" and four blanks
 
 
 def _block(payload: bytes) -> bytes:
@@ -34,20 +60,30 @@ def _block(payload: bytes) -> bytes:
 
 
 def write_binary(path, version, raw_names, type_codes, sweeps, block_bytes=8192,
-                 final_sentinel=True, drop_tail=0):
+                 final_sentinel=True, drop_tail=0, nprobe=0, layout="free", announce=None, **header):
     """Write a binary result file.
 
     sweeps: list of (param_values, data); data has shape (npoints, ncols) where
-    ncols is the reader's column count (for AC: 1 + 2 * dependent variables).
+    ncols is the reader's column count (for AC: 1 + 2 * complex variables + nprobe).
     final_sentinel=False omits the last sweep's 1e30 terminator; drop_tail removes
     that many trailing values from the stream (to leave a partial point).
     block_bytes: payload size per block, or a sequence of sizes cycled through
     (to build files with non-uniform blocks).
+    nprobe: how many of the variables (the last ones) are probe outputs.
+    layout: "free" (header_text) or "hspice" (hspice_header_text, which takes the
+    title, date, time and notice in `header`).
+    announce: the sweep count the header gives, when it is not the number of sweeps written.
     Returns the flat value stream that was written.
     """
     dtype = np.dtype("<f4") if version == "9601" else np.dtype("<f8")
     nsweepparam = len(sweeps[0][0])
-    text = header_text(version, raw_names, type_codes, nsweepparam, len(sweeps) if nsweepparam else 0)
+    count = announce if announce is not None else len(sweeps) if nsweepparam else 0
+    if layout == "hspice":
+        text = hspice_header_text(version, raw_names, type_codes, nsweepparam, count, nprobe, **header)
+    elif layout == "free" and not header:
+        text = header_text(version, raw_names, type_codes, nsweepparam, count, nprobe).encode("utf-8")
+    else:
+        raise ValueError(f"layout {layout!r} with {sorted(header)}")
     parts = []
     for i, (params, data) in enumerate(sweeps):
         parts.append(np.asarray(params, dtype=dtype))
@@ -62,7 +98,7 @@ def write_binary(path, version, raw_names, type_codes, sweeps, block_bytes=8192,
     if any(s <= 0 for s in sizes):
         raise ValueError("block_bytes entries must be positive")
     with open(path, "wb") as f:
-        f.write(_block(text.encode("utf-8")))
+        f.write(_block(text))
         offset = 0
         k = 0
         while offset < len(raw):
@@ -85,15 +121,28 @@ def fortran(v: float) -> str:
     return ("-" if v < 0 else "0") + digits[1:] + f"E{exp:+03d}"
 
 
-def write_ascii(path, raw_names, type_codes, sweeps, per_line=5):
-    """Write a post=2 ASCII result file (fixed-width 13-character fields, 5 per line)."""
+def write_ascii(path, raw_names, type_codes, sweeps, per_line=5, nprobe=0, layout="free", **header):
+    """Write a post=2 ASCII result file (fixed-width 13-character fields, 5 per line).
+
+    layout="hspice" writes the header as HSPICE does: the columns of hspice_header_text
+    (version "2001"), padded to a multiple of 80 and wrapped every 80 columns."""
     nsweepparam = len(sweeps[0][0])
     nvars = len(raw_names) - nsweepparam
-    with open(path, "w") as f:
-        f.write(f"{nvars:4d}{0:4d}{nsweepparam:4d}    ascii * fixture.sp\n")
-        f.write("01/01/2026 00:00:00 Copyright (c) 2026 Fixture. All Rights Reserved.\n")
-        f.write(f"  {len(sweeps) if nsweepparam else 0}\n")
-        f.write(" ".join(str(t) for t in type_codes) + " " + " ".join(raw_names) + " $&%#\n")
+    count = len(sweeps) if nsweepparam else 0
+    if layout == "hspice":
+        text = hspice_header_text("2001", raw_names, type_codes, nsweepparam, count, nprobe, **header)
+        text = text.decode("utf-8").rstrip(" ")
+        text = text.ljust(-(-len(text) // 80) * 80)
+        with open(path, "w") as f:
+            f.writelines(text[i:i + 80] + "\n" for i in range(0, len(text), 80))
+    elif layout != "free" or header:
+        raise ValueError(f"layout {layout!r} with {sorted(header)}")
+    with open(path, "a" if layout == "hspice" else "w") as f:
+        if layout == "free":
+            f.write(f"{nvars - nprobe:4d}{nprobe:4d}{nsweepparam:4d}    ascii * fixture.sp\n")
+            f.write("01/01/2026 00:00:00 Copyright (c) 2026 Fixture. All Rights Reserved.\n")
+            f.write(f"  {count}\n")
+            f.write(" ".join(str(t) for t in type_codes) + " " + " ".join(raw_names) + " $&%#\n")
         for params, data in sweeps:
             values = list(params) + np.asarray(data, dtype=np.float64).ravel().tolist() + [1e30]
             fields = [fortran(v) for v in values]

@@ -508,7 +508,9 @@ class TestBinaryRead(unittest.TestCase):
         c = reader._Collector(header, list(range(7)), None, capacity=8)
         sweep0 = [1000.0] + list(range(14)) + [90.0, 91.0, 92.0] + [1e30]
         sweep1 = [2000.0] + [float(v) for v in range(100, 107)] + [1e30]
-        c.feed(np.array(sweep0 + sweep1, dtype=np.float64))
+        with self.assertWarnsRegex(RuntimeWarning, "sweep 0 ends with 3 values that do not make a whole "
+                                                   "point of 7; they are dropped"):
+            c.feed(np.array(sweep0 + sweep1, dtype=np.float64))
         self.assertFalse(c.finish())
         self.assertEqual([a.size for a in c.data[0]], [2, 1])
         np.testing.assert_array_equal(np.stack([c.data[k][1] for k in range(7)], axis=1)[0],

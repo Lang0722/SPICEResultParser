@@ -120,7 +120,9 @@ The `extract` parameters work as follows:
 The reader supports these files:
 
 - binary 9601 and 2001 files and `post=2` ASCII files, including multi-sweep and AC
-  results
+  results, from the HSPICE releases that we examined: 2011, 2013, 2020 and 2021. The
+  reader takes the sweep count from its fixed column in the header. Thus it does not need
+  the copyright notice, which H-2013.03 leaves out.
 - Nutmeg rawfiles (ngspice / SPICE3 `.raw`) in binary and ASCII form
 
 The reader can read a file while the simulator writes it. The reader then reads the file
@@ -128,7 +130,9 @@ up to its last complete point and sets the `truncated` flag.
 
 HSPICE stores AC values as (real, imaginary) pairs. `ac_format` converts each pair to
 magnitude and phase in degrees (the default), or to dB and phase. It can also keep the
-real and imaginary parts. It works the same way for HSPICE and Nutmeg files.
+real and imaginary parts. It works the same way for HSPICE and Nutmeg files. A probe
+output such as `vdb(out)` or `vp(out)` (from `.probe` or `.print`) is a real value. It
+stays one trace.
 
 ### MCP server for agents
 

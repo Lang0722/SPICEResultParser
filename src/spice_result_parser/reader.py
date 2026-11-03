@@ -39,16 +39,17 @@ class Header:
     analysis: str           # "tr" | "sw" | "ac" (Nutmeg adds "op", "noise", "other")
     ncols: int              # values per point in the data stream
     nsweepparam: int
-    sweep_count_hint: int   # token after "Reserved."; informational only
+    sweep_count_hint: int   # sweeps the header announces (0 when it does not say)
     x_name: str             # sanitized name of column 0
     names: List[str]        # sanitized name per data column
     raw_names: List[str]    # variable names as written in the file
-    col_raw_names: List[str]  # raw name per data column (AC repeats each dependent name twice)
+    col_raw_names: List[str]  # raw name per data column (AC repeats each complex name twice)
     type_codes: List[int]
     sweep_params: List[str]
     plot_names: List[str] = field(default_factory=list)   # Nutmeg: Plotname of every plot; HSPICE: []
     plot: int = 0                                         # Nutmeg: index of the plot described here
     ac_format: str = "magphase"                           # what each complex variable's two columns hold
+    ncomplex: int = 0       # complex variables: columns 1 .. 2*ncomplex hold their pairs, in order
 
     @property
     def dtype(self) -> np.dtype:
@@ -200,21 +201,26 @@ def _build_header(path: str, is_bin: bool, version: str, nauto: int, nprobe: int
     if from_ext is not None and from_ext != analysis:
         raise ValueError(f"{path}: extension says {from_ext!r} but header type code says {analysis!r}")
     x_name = parse_var_name(raw_names[0])
-    if analysis == "ac":
-        names = [x_name]
-        col_raw = [raw_names[0]]
-        for raw in raw_names[1:]:
+    # In an AC file the variables of the first count (after the frequency) are complex: a
+    # (real, imaginary) pair per point. Those of the second count are the probe outputs
+    # (vm, vdb, vp ... of .probe and .print), one real value each.
+    ncomplex = max(0, nauto - 1) if analysis == "ac" else 0
+    names = [x_name]
+    col_raw = [raw_names[0]]
+    for k, raw in enumerate(raw_names[1:], 1):
+        if k <= ncomplex:
             names += ac_names(parse_var_name(raw), ac_format)
             col_raw += [raw, raw]
-    else:
-        names = [parse_var_name(r) for r in raw_names]
-        col_raw = list(raw_names)
+        else:
+            names.append(parse_var_name(raw))
+            col_raw.append(raw)
     names = _uniquify(path, names)
     return Header(
         path=path, is_binary=is_bin, version=version, analysis=analysis, ncols=len(names),
         nsweepparam=nsweepparam, sweep_count_hint=sweep_count, x_name=x_name, names=names,
         raw_names=raw_names, col_raw_names=col_raw, type_codes=type_codes,
         sweep_params=[parse_var_name(p) for p in sweep_params_raw], ac_format=ac_format,
+        ncomplex=ncomplex,
     )
 
 
@@ -284,23 +290,50 @@ def _read_binary_header(f, path: str, ac_format: str = "magphase") -> Header:
     version = text[20:24].strip() or text[16:20].strip()
     if version not in ("9601", "2001"):
         raise ValueError(f"{path}: unsupported post_version {version!r}; only 9601 and 2001 are supported")
-    # The copyright notice ends with "Reserved." and the sweep count follows it. The title
-    # before it is free text that may say "Reserved." too: take the first one followed by
-    # an integer.
-    marker, tokens = -1, []
-    while True:
-        marker = text.find("Reserved.", marker + 1)
-        if marker < 0:
-            raise ValueError(f"{path}: header has no copyright marker")
-        tokens = text[marker + len("Reserved."):].split()
-        if tokens and tokens[0].lstrip("+-").isdigit():
-            break
+    tokens = _sweep_count_and_variables(path, payload, text)
     if tokens and tokens[-1] == _TERMINATOR:
         tokens = tokens[:-1]
     if not tokens:
         raise ValueError(f"{path}: header has no variable list")
     return _build_header(path, True, version, nauto, nprobe, nsweepparam, int(tokens[0]), tokens[1:],
                          ac_format)
+
+
+# HSPICE writes its header in fixed columns: the counts and the version in 0-23, the title
+# in 24-87, date and time in 88-111, the copyright notice in 112-176, and the sweep count
+# right-aligned in 177-187. The variable list (type codes, names, sweep parameters) starts
+# after column 255. Every release seen (2011, 2013, 2020 and 2021, in 9601 and 2001) keeps
+# these columns. Only the notice changes: H-2013.03 blanks all of it but "erved.", so
+# searching it for "Reserved." fails.
+_SWEEP_COUNT_END = 188
+_VARIABLES_START = 256
+
+
+def _sweep_count_and_variables(path: str, payload: bytes, text: str) -> List[str]:
+    """The header's sweep count and the tokens after it: type codes, names, sweep
+    parameter names (and the terminator).
+
+    The columns are bytes, so they are read from the payload: a title in UTF-8 can hold
+    more bytes than characters. A header that does not keep the columns (another writer)
+    is read the way the old parser read every header: the notice ends with "Reserved."
+    and the sweep count follows it.
+    """
+    count = payload[:_SWEEP_COUNT_END].split()[-1:]
+    if (count and count[0].isdigit() and payload[_SWEEP_COUNT_END - 1:_SWEEP_COUNT_END].isdigit()
+            and len(payload) > _VARIABLES_START and not payload[_SWEEP_COUNT_END:_VARIABLES_START].strip()):
+        names = payload[_SWEEP_COUNT_END:].decode("utf-8", errors="replace")
+        return [count[0].decode()] + names.split()
+    # The title before the notice is free text that may say "Reserved." too: take the
+    # first one followed by an integer.
+    marker = -1
+    while True:
+        marker = text.find("Reserved.", marker + 1)
+        if marker < 0:
+            raise ValueError(f"{path}: header has no sweep count: it is not in columns 177-187, and no "
+                             f"copyright notice ending in 'Reserved.' precedes it")
+        tokens = text[marker + len("Reserved."):].split()
+        if tokens and tokens[0].lstrip("+-").isdigit():
+            return tokens
 
 
 def _read_ascii_header(f, path: str, ac_format: str = "magphase") -> Header:
@@ -667,6 +700,9 @@ class _Collector:
         start = 0
         for s in np.flatnonzero(arr == self.sentinel):
             self._segment(arr[start:s])
+            if self.carry.size:     # a simulator writes whole points: the column count is wrong, or a value was 1e30
+                warnings.warn(f"{self.h.path}: sweep {self.sweep_idx} ends with {self.carry.size} values that "
+                              f"do not make a whole point of {self.h.ncols}; they are dropped", RuntimeWarning)
             self._end_sweep()
             start = s + 1
         self._segment(arr[start:])
@@ -761,16 +797,17 @@ class _Collector:
 
 
 def _ac_values(header: Header, rows: np.ndarray) -> np.ndarray:
-    """rows of an HSPICE AC file with each variable's stored (real, imaginary) columns
-    turned into its two ac_format columns, as _convert_ac does; other rows unchanged."""
-    if header.analysis != "ac" or header.ac_format == "realimag" or rows.shape[1] < 3:
+    """rows of an HSPICE AC file with each complex variable's stored (real, imaginary)
+    columns turned into its two ac_format columns, as _convert_ac does; the frequency and
+    the real probe columns unchanged."""
+    end = 2 * header.ncomplex + 1                   # columns 1 .. end-1 hold the pairs
+    if header.ac_format == "realimag" or end < 3:
         return rows
-    re = np.ascontiguousarray(rows[:, 1::2])        # contiguous, as _convert_ac's columns are
-    im = np.ascontiguousarray(rows[:, 2::2])
-    out = np.empty_like(rows)
-    out[:, 0] = rows[:, 0]
-    out[:, 1::2] = ac_part(re, im, header.ac_format, second=False)
-    out[:, 2::2] = ac_part(re, im, header.ac_format, second=True)
+    re = np.ascontiguousarray(rows[:, 1:end:2])     # contiguous, as _convert_ac's columns are
+    im = np.ascontiguousarray(rows[:, 2:end:2])
+    out = rows.copy()
+    out[:, 1:end:2] = ac_part(re, im, header.ac_format, second=False)
+    out[:, 2:end:2] = ac_part(re, im, header.ac_format, second=True)
     return out
 
 
@@ -837,26 +874,30 @@ def _feed_bulk_frames(f, header: Header, collector: _Collector, block_payload: i
             return index
 
 
+def _is_complex_column(header: Header, c: int) -> bool:
+    return 1 <= c <= 2 * header.ncomplex
+
+
 def _stored_columns(header: Header, cols: Sequence[int]) -> List[int]:
     """Columns to read from the file for the selected ones. An HSPICE AC file stores each
     complex variable as (real, imaginary) in columns 2k-1, 2k; any other format than
     'realimag' needs both to compute either of its two columns."""
-    if header.analysis != "ac" or header.ac_format == "realimag":
+    if header.ac_format == "realimag":
         return list(cols)
     stored = set(cols)
     for c in cols:
-        if c:
+        if _is_complex_column(header, c):
             stored.add(c + 1 if c % 2 else c - 1)
     return sorted(stored)
 
 
 def _convert_ac(header: Header, cols: Sequence[int], data: dict) -> dict:
     """Turn the stored (real, imaginary) columns into the ac_format columns selected."""
-    if header.analysis != "ac" or header.ac_format == "realimag":
+    if header.ac_format == "realimag":
         return {c: data[c] for c in cols}
     out = {}
     for c in cols:
-        if c == 0:
+        if not _is_complex_column(header, c):         # the frequency, or a real probe output
             out[c] = data[c]
             continue
         re_col = c if c % 2 else c - 1

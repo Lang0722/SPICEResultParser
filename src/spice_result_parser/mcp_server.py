@@ -489,7 +489,8 @@ def list_traces(
       then says so.
 
     AC traces are listed as <name>_Mag and <name>_Phase; v(out) selects the pair in
-    extract. For a measure file (.mt#, .ms#, .ma#) use read_measures instead.
+    extract. A probe output such as vdb(out) or vp(out) is one real trace. For a measure
+    file (.mt#, .ms#, .ma#) use read_measures instead.
     """
     info = _json_result(api.list_traces(path, plot, ac_format, names, header_only=header_only))
     values = info.get("sweep_values")

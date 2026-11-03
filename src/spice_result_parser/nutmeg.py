@@ -240,6 +240,7 @@ def _build_header(path: str, p: _Plot, plot_names: List[str], ac_format: str) ->
         ncols=len(names), nsweepparam=0, sweep_count_hint=nsweeps if nsweeps > 1 else 0,
         x_name=x_name, names=names, raw_names=list(p.raw_names), col_raw_names=col_raw,
         type_codes=[], sweep_params=[], plot_names=list(plot_names), plot=p.index, ac_format=ac_format,
+        ncomplex=len(p.raw_names) - 1 if p.is_complex else 0,
     )
 
 
