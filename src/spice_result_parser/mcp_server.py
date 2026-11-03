@@ -580,10 +580,10 @@ def list_traces(
         description=_AC_FORMAT_HELP + " Names and ranges follow it, as extract returns them.")] = "magphase",
     header_only: Annotated[Optional[bool], Field(
         description="None (default): read the data when that is fast, a file of at most 1 GB (WaveView: "
-                    "at most 2 M values, and one trace when each signal has its own x points); else only "
-                    "the header, and a note says so. True: only the header, instant on any file, without "
-                    "x_range, points, sweep_values, truncated and ranges; sweeps is then the count the "
-                    "header announces. False: read the data, whatever its size.")] = None,
+                    "at most 200 traces and 2 M values, and one trace when each signal has its own x "
+                    "points); else only the header, and a note says so. True: only the header, instant on "
+                    "any file, without x_range, points, sweep_values, truncated and ranges; sweeps is then "
+                    "the count the header announces. False: read the data, whatever its size.")] = None,
     engine: Annotated[Engine, ENGINE_FIELD] = None,
 ) -> dict:
     """List what a simulation result file holds, with the extents to set extract's
@@ -678,9 +678,9 @@ def extract(
     ac_format: Annotated[Literal[tuple(AC_FORMATS)], Field(description=_AC_FORMAT_HELP)] = "magphase",
     engine: Annotated[Engine, ENGINE_FIELD] = None,
     allow_large: Annotated[bool, Field(
-        description="True reads a large file: over 1 GB, or through WaveView over 2 M values of the "
-                    "selected traces. Default False: extract then fails before it reads, and says "
-                    "what the read costs (its time, and the memory without xrange). list_traces "
+        description="True reads a large file: over 1 GB, or through WaveView over 200 traces or 2 M "
+                    "values. Default False: extract then fails and says why, before the read for a file "
+                    "over 1 GB or over 200 traces, and when WaveView reaches 2 M values. list_traces "
                     "says so first. The result of a large read gives the time that it took.")] = False,
 ):
     """Read traces from an HSPICE result file or a Nutmeg rawfile. Call list_traces
@@ -728,8 +728,12 @@ def extract(
         if cost.large and not allow_large:
             raise ValueError(_large_read(cost, output, xrange is not None))
         start = time.perf_counter()
-        ts = api.extract(path, names, sweeps, "arrays", downsample if output in ("csv", "npz") else None,
-                         xrange=xrange, plot=plot, ac_format=ac_format, engine=engine)
+        try:
+            ts = api.extract(path, names, sweeps, "arrays", downsample if output in ("csv", "npz") else None,
+                             xrange=xrange, plot=plot, ac_format=ac_format, engine=engine,
+                             max_values=None if allow_large else api.WAVEVIEW_SCAN_MAX_VALUES)
+        except waveview.ValueLimitError as exc:
+            raise ValueError(_value_limit(exc)) from None
         took = time.perf_counter() - start         # png draws every point's envelope; text and summary reduce
     note = _large_took(cost, took) if cost.large else None
     if output == "text":
@@ -767,10 +771,10 @@ def _large_read(cost: api.ReadCost, output: str, windowed: bool) -> str:
     """The error of extract before a large read without allow_large=True: what the read costs."""
     traces = f"{cost.traces} selected trace{'s' if cost.traces != 1 else ''}"
     if cost.engine == "waveview":
-        return (f"extract did not run WaveView: for the {traces} it would write {cost.values:,} values, more than "
-                f"the {api.WAVEVIEW_SCAN_MAX_VALUES:,} that extract takes without allow_large=True. That takes "
-                f"{api.read_time(cost)} and about {api._size(cost.memory)} of memory, for any xrange (it applies "
-                f"after the read). Pass allow_large=True to read them, or select fewer traces")
+        return (f"extract did not run WaveView's export: the {traces} are more than the {api.WAVEVIEW_MAX_TRACES} "
+                f"that extract takes without allow_large=True. WaveView loads each signal on its first use, about "
+                f"0.1 s and 1.5 MB per signal of an FSDB. Select fewer traces (list_traces counts them by name in "
+                f"groups), or pass allow_large=True")
     then = " Then text and summary reduce each point that they keep." if output in ("text", "summary") else ""
     memory = (f"With this xrange, memory holds only the window of x and the {traces}" if windowed else
               f"Without xrange, x and the {traces} take about {api._size(cost.memory)} of memory; with xrange, "
@@ -781,10 +785,18 @@ def _large_read(cost: api.ReadCost, output: str, windowed: bool) -> str:
             f"{api.read_time(cost)}.{then} {memory}. Pass allow_large=True to read it")
 
 
+def _value_limit(exc: waveview.ValueLimitError) -> str:
+    """The error of extract when WaveView stopped at the value limit: where, and what takes fewer values."""
+    where = "before its first point" if exc.x is None else f"at {exc.x_name} = {exc.x:.6g}"
+    return (f"extract stopped WaveView at the limit of {exc.limit:,} values, in sweep {exc.trace} {where}: without "
+            f"allow_large=True, extract takes at most {exc.limit:,} values from WaveView. A narrower xrange or "
+            f"fewer traces take fewer values. allow_large=True reads them all")
+
+
 def _large_took(cost: api.ReadCost, took: float) -> str:
     """The note of a large read: how long it took, as every later read of the file takes it again."""
     if cost.engine == "waveview":
-        return f"WaveView took {api._duration(took)} to write the {cost.values:,} values of these traces"
+        return f"WaveView took {api._duration(took)} for these {cost.traces} traces"
     return (f"this read took {api._duration(took)}: each extract reads all {api._size(cost.bytes)} of the "
             f"file again, for any names, sweeps and xrange")
 

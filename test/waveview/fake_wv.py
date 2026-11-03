@@ -17,6 +17,9 @@ not: the npoints records (see with_counts). They come from the canned listing of
 same file, which holds WaveView's real -npoints values. It also applies SRP_MAX_VALUES
 as the script does (see limited).
 
+The canned listings come from list_traces.tcl before it stopped asking for -npoints: the
+fake serves their signal records without that fourth field, as the script writes them.
+
 SRP_FAKE_WV selects a failure: "no_done" (the script stops on a Tcl error; exit code 1),
 "silent" (no output file at all), "sleep" (never finishes), "launcher" (never finishes,
 in a child process that holds the console pipe, as when wv is a launcher script; its
@@ -139,6 +142,9 @@ def main(argv) -> int:
         return 0
     with open(stem + ".txt", "rb") as f:
         lines = f.readlines()
+    if script == "list_traces":         # the count of the old script (see the docstring)
+        lines = [b"\t".join(line.rstrip(b"\r\n").split(b"\t")[:3]) + b"\r\n" if line.startswith(b"signal\t")
+                 else line for line in lines]
     signals = None
     if "SRP_SIGNALS" in os.environ and script in ("extract", "read_measures"):
         with open(os.environ["SRP_SIGNALS"], "rb") as f:

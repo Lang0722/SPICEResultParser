@@ -14,10 +14,11 @@
 #   sweep   <value> ...     one per trace: the value of each parameter, in the
 #                           order of the param records (%g, 6 significant
 #                           digits); none when not swept
-#   signal  <name> <real|complex> <npoints>
-#                           npoints: WaveView's point count of the signal; in a
-#                           swept file it holds one more point per sweep
+#   signal  <name> <real|complex>
 #   srp_done
+# The listing asks for no point count (-npoints): the first query of the data of
+# a signal loads it, about 0.1 s and 1.5 MB per signal of an FSDB. extract.tcl
+# writes the counts of the signals that it reads.
 # A file that WaveView cannot open gives "error<TAB>cannot open <path>".
 # sx_open_sim_file_read splits its argument as a Tcl list, so the path goes in
 # as one list element: [list] for most paths, in quotes when it has a brace
@@ -82,8 +83,7 @@ if {$f == ""} {
         emit sweep [join $c "\t"]
     }
     foreach s $sigs {
-        emit signal [clean [sx_get_name $s]] [sx_signal_attribute $s -datatype] \
-            [sx_signal_attribute $s -npoints]
+        emit signal [clean [sx_get_name $s]] [sx_signal_attribute $s -datatype]
     }
 }
 emit srp_done

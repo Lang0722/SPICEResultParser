@@ -337,7 +337,6 @@ class _Listing:
                                                 # part: None real, 0/1 the first/second column of a complex one
     first: str = ""                             # WaveView name of the first signal (extract.tcl's x when no
                                                 # signal is selected)
-    npoints: Dict[str, int] = field(default_factory=dict)   # WaveView name -> -npoints (one more per sweep)
     incomplete: bool = False                    # WaveView's console says the file is not complete
     binary: bool = False                        # an HSPICE binary file: WaveView drops a partial sweep
     nutmeg: bool = False
@@ -429,26 +428,22 @@ def _listing(path: str, plot, ac_format: str) -> Tuple[Header, _Listing]:
     return listed
 
 
-def scan_cost(path, plot: int = 0, ac_format: str = "magphase", names=None) -> Tuple[int, int, bool]:
-    """(signals, values, shared_x) of scan(path, plot, ac_format, names), from WaveView's
-    listing: the signals that extract.tcl writes, the values that it writes for them (x
-    and each signal, by their -npoints; a complex point has two), and whether the signals
-    of the file share their x points (else extract.tcl stops at a second signal)."""
+def scan_cost(path, plot: int = 0, ac_format: str = "magphase", names=None) -> Tuple[int, bool]:
+    """(signals, shared_x) of scan(path, plot, ac_format, names), from WaveView's listing:
+    the signals that extract.tcl writes (a complex signal is one), and whether the signals
+    of the file share their x points (else extract.tcl stops at a second signal). The
+    listing has no point counts: the values come out only in the export, which stops at
+    max_values (see read_traces)."""
     header, listing = _listing(path, plot, ac_format)
-    signals: Dict[str, int] = {}                # WaveView name -> values per point (a complex point: 2)
-    for c in resolve_columns(header, names)[1:]:
-        wv_name, part = listing.columns[c]
-        signals[wv_name] = 1 if part is None else 2
-    values = listing.npoints.get(next(iter(signals), listing.first), 0)
-    values += sum(listing.npoints.get(name, 0) * width for name, width in signals.items())
-    return len(signals), values, listing.shared_x
+    signals = {listing.columns[c][0] for c in resolve_columns(header, names)[1:]}
+    return len(signals), listing.shared_x
 
 
 def _list(path: str, plot, ac_format: str) -> Tuple[Header, _Listing]:
     path = os.fspath(path)
     check_ac_format(ac_format)
     _check_input(path, plot)
-    title, xname, params, conditions, signals, npoints = "", "", [], [], [], {}
+    title, xname, params, conditions, signals = "", "", [], [], []
     text, end, console = _run("list_traces.tcl", path)
     for record in _records(text[:end], "list_traces.tcl", "srp_listing"):
         key, value = record[0], record[1] if len(record) > 1 else ""
@@ -462,8 +457,6 @@ def _list(path: str, plot, ac_format: str) -> Tuple[Header, _Listing]:
             conditions.append(record[1:])
         elif key == "signal":
             signals.append((value, record[2] if len(record) > 2 else "real"))
-            if len(record) > 3 and record[3].isdigit():
-                npoints[value] = int(record[3])
     seen = set()
     for wv_name, _ in signals:
         if wv_name in seen:     # extract.tcl addresses signals by name: both columns would get one signal
@@ -528,7 +521,7 @@ def _list(path: str, plot, ac_format: str) -> Tuple[Header, _Listing]:
         ac_format=ac_format, ncomplex=ncomplex,
     )
     return header, _Listing(params=params, conditions=conditions, columns=columns, first=signals[0][0],
-                            npoints=npoints, incomplete=incomplete,
+                            incomplete=incomplete,
                             binary=not is_nut and reader._is_binary(path), nutmeg=is_nut,
                             shared_x=is_nut or _shared_x(path), nsplit=nsplit, nut_points=nut_points,
                             nut_complete=nut_complete, dtypes=dtypes, declared=declared)

@@ -30,7 +30,10 @@ def readers(engine: Optional[str] = None):
 
 SCAN_MAX_BYTES = 1_000_000_000      # a larger file is large: list_traces reads only its header by default, and the
                                     # MCP extract reads it only with allow_large=True
-WAVEVIEW_SCAN_MAX_VALUES = 2_000_000    # through WaveView, more values for the selected traces are large
+WAVEVIEW_MAX_TRACES = 200          # through WaveView, more selected traces are large: WaveView loads each signal
+                                   # on its first use, about 0.1 s and 1.5 MB per signal of an FSDB
+WAVEVIEW_SCAN_MAX_VALUES = 2_000_000    # through WaveView, list_traces and the MCP extract stop the export at this
+                                        # many values by default (see waveview.read_traces, max_values)
 
 # Bytes per second of a pass over the data, measured with the file in the page cache: (the
 # scan of list_traces, read_traces of one trace). A disk can be slower: the slow estimate
@@ -38,24 +41,25 @@ WAVEVIEW_SCAN_MAX_VALUES = 2_000_000    # through WaveView, more values for the 
 PASS_RATES = {"9601": (600e6, 1.5e9), "2013": (330e6, 0.9e9), "2001": (1e9, 2e9), "ascii": (120e6, 120e6),
               "nutmeg": (1.5e9, 3e9), "nutmeg ascii": (75e6, 75e6)}
 DISK_RATE = 200e6
-WAVEVIEW_RATE = 250_000             # values that WaveView writes per second: 1 M in about 4 s on the test VM
 _VALUE_BYTES = {"ascii": 13.2, "nutmeg ascii": 24.0}  # bytes of one value in a text file, about
-_WAVEVIEW_VALUE_MEMORY = 33         # bytes per value through WaveView: its text, then a float64
 
 
 @dataclasses.dataclass
 class ReadCost:
     """What a read of the data costs, from the header (WaveView: its listing) alone. The
-    Python engine reads the whole file for any names, sweeps and xrange; the WaveView engine
-    writes every point of the selected signals, for any xrange."""
+    Python engine reads the whole file for any names, sweeps and xrange. The WaveView engine
+    gives the selected traces and large only: its listing has no point counts, so the count
+    of values is known only in the export, which stops at a limit (waveview.read_traces,
+    max_values)."""
     engine: str
     bytes: int                      # size of the file
     points: int                     # points in the file, about (from its size); 0 for WaveView
     traces: int                     # selected traces
-    values: int                     # WaveView: the values that it writes for them, x included; 0 for Python
-    memory: int                     # bytes that x and the selected traces take without xrange, about
-    seconds: Tuple[float, float]    # how long the read takes, about: the file in memory, the file on a disk
-    large: bool                     # over SCAN_MAX_BYTES (WaveView: over WAVEVIEW_SCAN_MAX_VALUES)
+    values: int                     # 0 (no engine counts them before the read)
+    memory: int                     # bytes that x and the selected traces take without xrange, about; 0 for WaveView
+    seconds: Tuple[float, float]    # how long the read takes, about: the file in memory, the file on a disk; 0
+                                    # for WaveView
+    large: bool                     # over SCAN_MAX_BYTES (WaveView: over WAVEVIEW_MAX_TRACES traces)
 
 
 def read_cost(path, plot: int = 0, ac_format: str = "magphase", names=None, engine: Optional[str] = None,
@@ -71,10 +75,8 @@ def read_cost(path, plot: int = 0, ac_format: str = "magphase", names=None, engi
 def _cost(path, header, cols: List[int], plot, ac_format: str, scan: bool) -> ReadCost:
     size = os.path.getsize(path)
     if header.version == "waveview":
-        _, values, _ = waveview.scan_cost(path, plot, ac_format, [header.names[c] for c in cols[1:]])
-        seconds = values / WAVEVIEW_RATE
-        return ReadCost("waveview", size, 0, len(cols) - 1, values, values * _WAVEVIEW_VALUE_MEMORY,
-                        (seconds, seconds), values > WAVEVIEW_SCAN_MAX_VALUES)
+        traces = len(cols) - 1
+        return ReadCost("waveview", size, 0, traces, 0, 0, (0.0, 0.0), traces > WAVEVIEW_MAX_TRACES)
     kind = header.version + ("" if header.is_binary or header.version != "nutmeg" else " ascii")
     points = int(size / (header.stream_width * _VALUE_BYTES.get(kind, header.dtype.itemsize)))
     memory = points * sum(header.column_dtype(c).itemsize for c in cols)
@@ -94,8 +96,6 @@ def _duration(seconds: float) -> str:
 def read_time(cost: ReadCost) -> str:
     """How long the read of cost takes, in words: 'about 1 to 8 min (...)'."""
     fast, slow = (_duration(s) for s in cost.seconds)
-    if cost.engine == "waveview":
-        return f"about {fast} (at the {WAVEVIEW_RATE:,} values per second of the test VM)"
     if fast == slow:
         return f"about {fast}"
     if fast.split()[1] == slow.split()[1]:
@@ -123,8 +123,9 @@ def list_traces(path, plot: int = 0, ac_format: str = "magphase", names=None,
     header alone, which is instant on any file: it leaves out x_range, points,
     sweep_values, truncated and ranges, and sweeps is then the count the header
     announces. header_only=None (the default) reads the data when that is fast: a file
-    of at most SCAN_MAX_BYTES, and through WaveView at most WAVEVIEW_SCAN_MAX_VALUES
-    values. Else it reads the header alone, and a note says why and how to read the data.
+    of at most SCAN_MAX_BYTES, and through WaveView at most WAVEVIEW_MAX_TRACES traces and
+    WAVEVIEW_SCAN_MAX_VALUES values (the export stops at that limit). Else it reads the
+    header alone, and a note says why and how to read the data.
 
     names narrows traces and ranges, as extract's names do (names, raw names, globs).
     trace_count is the number of traces that it selects. max_traces lists at most that
@@ -142,6 +143,7 @@ def list_traces(path, plot: int = 0, ac_format: str = "magphase", names=None,
         max_traces = _count(max_traces, "max_traces")
     read_head, _, scan_plot = readers(engine)
     through_wv = waveview.resolve_engine(engine) == "waveview"
+    default = header_only is None
     with waveview.listing_memo():           # WaveView lists the file once for the header, the cost and the scan
         h = read_head(path, plot, ac_format)
         cols = resolve_columns(h, names)[1:]
@@ -157,7 +159,18 @@ def list_traces(path, plot: int = 0, ac_format: str = "magphase", names=None,
         elif header_only is None:
             header_only = False
         if not header_only:
-            s = scan_plot(path, plot, ac_format, names if len(shown) == len(cols) else [h.names[c] for c in shown])
+            selected = names if len(shown) == len(cols) else [h.names[c] for c in shown]
+            try:
+                if through_wv:
+                    s = scan_plot(path, plot, ac_format, selected,
+                                  max_values=WAVEVIEW_SCAN_MAX_VALUES if default else None)
+                else:
+                    s = scan_plot(path, plot, ac_format, selected)
+            except waveview.ValueLimitError:
+                notes.append(f"list_traces read only the WaveView listing: the ranges of these {len(shown)} traces "
+                             f"take more than the {WAVEVIEW_SCAN_MAX_VALUES:,} values that it reads by default "
+                             f"(header_only=False reads them all, and names with fewer traces takes fewer)")
+                header_only = True
     result = {"path": h.path, "format": h.version, "analysis": h.analysis, "plot": h.plot,
               "plots": h.plot_names, "x": h.x_name}
     if header_only:
@@ -202,7 +215,7 @@ def _size(n: int) -> str:
 def _own_x(path, header, cols: List[int], plot, ac_format: str) -> Optional[str]:
     """Why list_traces does not range these traces through WaveView: a file whose signals have
     their own x points (extract.tcl stops at the second signal); None to range them."""
-    signals, _, shared_x = waveview.scan_cost(path, plot, ac_format, [header.names[c] for c in cols])
+    signals, shared_x = waveview.scan_cost(path, plot, ac_format, [header.names[c] for c in cols])
     if signals > 1 and not shared_x:
         return ("list_traces read only the WaveView listing: in this file each signal has its own x points, "
                 "and WaveView ranges one signal at a time (names with one trace)")
@@ -213,10 +226,10 @@ def _large_note(cost: ReadCost, skipped: bool) -> str:
     """list_traces' note on a large read (see ReadCost.large): what it costs, and with
     skipped (header_only=None) that list_traces did not make it and how to."""
     if cost.engine == "waveview":
-        facts = (f"the ranges of these {cost.traces} traces take {cost.values:,} values from WaveView, more than "
-                 f"the {WAVEVIEW_SCAN_MAX_VALUES:,} that list_traces reads by default, {read_time(cost)}")
-        return (f"list_traces read only the WaveView listing: {facts}; header_only=False reads them, and names "
-                f"with fewer traces takes fewer") if skipped else facts
+        if skipped:
+            return (f"list_traces read only the WaveView listing: it ranges at most {WAVEVIEW_MAX_TRACES} traces by "
+                    f"default, and {cost.traces} are selected (header_only=False ranges them all)")
+        return f"list_traces ranges at most {WAVEVIEW_MAX_TRACES} traces by default, and {cost.traces} are selected"
     facts = (f"the file has {_size(cost.bytes)}, about {_amount(cost.points)} points, more than the "
              f"{_size(SCAN_MAX_BYTES)} that list_traces reads by default: a pass over the data goes through all "
              f"of it for any names, sweeps and xrange, {read_time(cost)}")

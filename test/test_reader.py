@@ -1365,8 +1365,6 @@ class TestApi(unittest.TestCase):
         self.assertEqual(api.read_time(cost((13, 13))), "about 13 s")
         self.assertEqual(api.read_time(cost((0.2, 0.4))), "about 1 s")
         self.assertEqual(api.read_time(cost((9000, 9000))), "about 2.5 h")
-        self.assertEqual(api.read_time(cost((200, 200), "waveview")),
-                         "about 3 min (at the 250,000 values per second of the test VM)")
         self.assertEqual([api._amount(n) for n in (3200, 2_500_000, 1_250_000_000)], ["3200", "2.5e6", "1.25e9"])
 
     def test_list_traces_and_summary_share_their_keys(self):
@@ -2428,7 +2426,8 @@ class TestMcp(unittest.TestCase):
         for text in (tool.description, header_only):                # the limits that the tool states
             self.assertIn(f"over {api._size(api.SCAN_MAX_BYTES)}" if text is tool.description
                           else f"at most {api._size(api.SCAN_MAX_BYTES)}", text)
-        self.assertIn(f"at most {api.WAVEVIEW_SCAN_MAX_VALUES / 1e6:g} M values", header_only)
+        self.assertIn(f"at most {api.WAVEVIEW_MAX_TRACES} traces and {api.WAVEVIEW_SCAN_MAX_VALUES / 1e6:g} M values",
+                      header_only)
         with mock.patch.object(api, "SCAN_MAX_BYTES", 1000):
             out = self.m.list_traces(str(HERE / "test_9601.tr0"))
             self.assertNotIn("ranges", out)
@@ -2485,7 +2484,8 @@ class TestMcp(unittest.TestCase):
         self.assertIn("the read still goes through the whole file", props["xrange"]["description"])
         self.assertNotIn("cheap", props["xrange"]["description"])
         self.assertIn(f"over {api._size(api.SCAN_MAX_BYTES)}", props["allow_large"]["description"])
-        self.assertIn(f"over {api.WAVEVIEW_SCAN_MAX_VALUES / 1e6:g} M values", props["allow_large"]["description"])
+        self.assertIn(f"over {api.WAVEVIEW_MAX_TRACES} traces or {api.WAVEVIEW_SCAN_MAX_VALUES / 1e6:g} M values",
+                      props["allow_large"]["description"])
 
     def test_list_traces_documents_its_cut_result(self):
         names = ["TIME"] + [f"v(x{c}.n{i}" for c in range(3) for i in range(50)]
