@@ -13,8 +13,9 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-_DTYPE = {"9601": np.dtype("<f4"), "2001": np.dtype("<f8"), "ascii": np.dtype("<f8"),
+_DTYPE = {"9601": np.dtype("<f4"), "2001": np.dtype("<f8"), "2013": np.dtype("<f4"), "ascii": np.dtype("<f8"),
           "nutmeg": np.dtype("<f8"), "waveview": np.dtype("<f8")}
+_MIXED = "2013"                 # post_version 2013: x float64, every other value float32 (see _feed_words)
 _ANALYSIS_BY_TYPE_CODE = {1: "tr", 2: "ac", 3: "sw"}
 _TERMINATOR = "$&%#"
 _FRAME_OVERHEAD = 20            # 16-byte block head + 4-byte block tail
@@ -35,7 +36,7 @@ AC_FORMATS = {"magphase": ("Mag", "Phase"), "db": ("dB", "Phase"), "realimag": (
 class Header:
     path: str
     is_binary: bool
-    version: str            # "9601" | "2001" | "ascii" | "nutmeg" | "waveview" (read by waveview.py)
+    version: str            # "9601" | "2001" | "2013" | "ascii" | "nutmeg" | "waveview" (read by waveview.py)
     analysis: str           # "tr" | "sw" | "ac" (Nutmeg adds "op", "noise", "other")
     ncols: int              # values per point in the data stream
     nsweepparam: int
@@ -53,7 +54,21 @@ class Header:
 
     @property
     def dtype(self) -> np.dtype:
+        """dtype of the values, of x too except in a post_version 2013 file (see x_dtype)."""
         return _DTYPE[self.version]
+
+    @property
+    def x_dtype(self) -> np.dtype:
+        """dtype of column 0: float64 in a post_version 2013 file, else dtype."""
+        return np.dtype("<f8") if self.version == _MIXED else self.dtype
+
+    def column_dtype(self, c: int) -> np.dtype:
+        return self.x_dtype if c == 0 else self.dtype
+
+    @property
+    def stream_width(self) -> int:
+        """Values of dtype that one point takes in the data stream: x takes two in 2013."""
+        return self.ncols + (self.version == _MIXED)
 
     @property
     def sentinel(self):
@@ -292,9 +307,10 @@ def _read_binary_header(f, path: str, ac_format: str = "magphase") -> Header:
         raise _not_a_result_file(path) from None
     if cut and cut[0][0] != "tail":
         raise incomplete
+    # 9601 writes its version in columns 16-19; 2001 and 2013 add a count and write it in 20-23.
     version = text[20:24].strip() or text[16:20].strip()
-    if version not in ("9601", "2001"):
-        raise ValueError(f"{path}: unsupported post_version {version!r}; only 9601 and 2001 are supported")
+    if (version, bool(text[20:24].strip())) not in (("9601", False), ("2001", True), ("2013", True)):
+        raise ValueError(f"{path}: unsupported post_version {version!r}; 9601, 2001 and 2013 are supported")
     payload = _header_continuation(f, path, payload)
     tokens = _sweep_count_and_variables(path, payload, payload.decode("utf-8", errors="replace"))
     if _TERMINATOR in tokens:
@@ -697,6 +713,7 @@ class _Collector:
     Values are consumed per segment (between sentinels, after the sweep-parameter
     prefix); `carry` holds the values of an incomplete trailing point until the next
     segment completes it, and an incomplete point at a sentinel or at EOF is dropped.
+    A post_version 2013 stream mixes float64 and float32 values: _feed_words reads it.
     """
 
     def __init__(self, header: Header, cols: Sequence[int], sweeps: Optional[Iterable[int]],
@@ -707,7 +724,7 @@ class _Collector:
         self.xrange = xrange                    # closed x window; rows outside are never stored
         self.sweeps = sweep_set(sweeps)
         self.capacity = max(1, int(capacity))
-        self.buf = {c: np.empty(self.capacity, header.dtype) for c in self.cols}
+        self.buf = {c: np.empty(self.capacity, header.column_dtype(c)) for c in self.cols}
         self.fill = 0                           # kept points written so far, across all kept sweeps
         self.sweep_start = 0                    # value of fill when the current sweep began
         self.carry = np.empty(0, header.dtype)  # values of an incomplete trailing point
@@ -718,13 +735,19 @@ class _Collector:
         self.sweep_indices: List[int] = []
         self.spans: List[Tuple[int, int]] = []  # (start, stop) in the buffers, one per kept sweep
         self.data = {c: [] for c in self.cols}
-        self.span = _XSpan(header.dtype)        # every point of every sweep, before any selection
+        self.span = _XSpan(header.x_dtype)      # every point of every sweep, before any selection
         self.cut = False                        # the file ended inside a block or a field
+        self.words = np.empty(0, header.dtype)  # 2013: the words of an incomplete point or terminator
+        if header.version == _MIXED:            # a point: x as float64 (two words), a float32 per other column
+            self._record = np.dtype([("x", "<f8"), ("y", "<f4", (header.ncols - 1,))])
 
     def _keep(self) -> bool:
         return self.sweeps is None or self.sweep_idx in self.sweeps
 
     def feed(self, arr: np.ndarray) -> None:
+        if self.h.version == _MIXED:
+            self._feed_words(arr)
+            return
         if arr.size:
             hi = arr.max()
             if hi == hi and hi < self.sentinel:     # no NaN present and nothing reaches the sentinel
@@ -739,6 +762,47 @@ class _Collector:
             self._end_sweep()
             start = s + 1
         self._segment(arr[start:])
+
+    def _feed_words(self, words: np.ndarray) -> None:
+        """A post_version 2013 stream, as 4-byte words (float32). A sweep starts with its
+        nsweepparam parameter values (float32); a point is x as float64 (two words), then a
+        float32 per other column; a float64 1e30 in the place of an x ends the sweep. Whole
+        points are read in one numpy pass per sweep; the words of a point or a terminator
+        that the chunk cuts wait in self.words for the next chunk."""
+        if self.words.size:
+            words = np.concatenate([self.words, words])
+        width = self.h.stream_width
+        pos, n = 0, words.size
+        while pos < n:
+            need = self.h.nsweepparam - len(self.params)
+            if need > 0:
+                take = min(need, n - pos)
+                self.params.extend(float(v) for v in words[pos:pos + take])
+                pos += take
+                continue
+            count = (n - pos) // width
+            points = words[pos:pos + count * width].view(self._record)
+            ends = np.flatnonzero(points["x"] == 1e30)
+            if ends.size:
+                count = int(ends[0])
+            self._write_points(points[:count])
+            pos += count * width
+            self.pos += count * width
+            rest = words[pos:pos + 2]
+            if rest.size == 2 and rest.view("<f8")[0] == 1e30:
+                pos += 2
+                self._end_sweep()
+                continue
+            break                                   # an incomplete point: it waits for the next chunk
+        self.words = words[pos:].copy()             # copy: do not pin the source block
+
+    def _write_points(self, points: np.ndarray) -> None:
+        """2013 points (x float64, the rest float32) as float64 rows: both convert exactly."""
+        if points.size:
+            rows = np.empty((points.size, self.h.ncols), np.float64)
+            rows[:, 0] = points["x"]
+            rows[:, 1:] = points["y"]
+            self._write_rows(rows)
 
     def _segment(self, seg: np.ndarray) -> None:
         need = self.h.nsweepparam - len(self.params)
@@ -784,7 +848,7 @@ class _Collector:
     def _grow(self, needed: int) -> None:
         new_capacity = max(needed, 2 * self.capacity)
         for c in self.cols:
-            grown = np.empty(new_capacity, self.h.dtype)
+            grown = np.empty(new_capacity, self.h.column_dtype(c))
             grown[:self.fill] = self.buf[c][:self.fill]
             self.buf[c] = grown             # nothing references the old array: sweeps are spans, not views
         self.capacity = new_capacity
@@ -805,7 +869,7 @@ class _Collector:
         """Close the stream; True when the file is truncated: it ends inside a sweep, a block
         or a field, or holds fewer sweeps than its header announces (the simulator is still
         writing it, or was stopped)."""
-        partial = self.pos > 0 or bool(self.params)
+        partial = self.pos > 0 or bool(self.params) or bool(self.words.size)
         if partial:
             warnings.warn(
                 f"{self.h.path}: file ended before the sweep terminator; the last sweep is partial",
@@ -856,7 +920,8 @@ class _RangeCollector(_Collector):
 
     def _write_rows(self, rows: np.ndarray) -> None:
         self.span.add(rows[:, 0])
-        lo, hi = nan_min_max(_ac_values(self.h, rows), axis=0)
+        values = rows.astype(self.h.dtype, copy=False)     # 2013 rows come as float64; AC parts in the file's dtype
+        lo, hi = nan_min_max(_ac_values(self.h, values), axis=0)
         self.lo, self.hi = np.fmin(self.lo, lo), np.fmax(self.hi, hi)
         self.fill += rows.shape[0]              # nothing is stored; the spans count the points
 
@@ -998,7 +1063,8 @@ def _data_capacity(f, header: Header) -> int:
         except ValueError:                          # reading the data will say what is wrong
             width = None
         return _ascii_capacity(file_size, header.ncols, width)
-    return _binary_capacity(file_size, f.tell(), _peek_block_payload(f), header.ncols, header.dtype.itemsize)
+    return _binary_capacity(file_size, f.tell(), _peek_block_payload(f), header.stream_width,
+                            header.dtype.itemsize)
 
 
 def _feed_data(f, path: str, header: Header, collector: _Collector) -> None:

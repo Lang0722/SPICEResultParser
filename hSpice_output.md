@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This document describes the 9601 and 2001 binary formats for hSpice .ac*, .sw*, and .tr* output files. This document is a companion to SPICEResultParser (originally hspiceParser). SPICEResultParser is a Python package that parses the 9601 and 2001 versions of the hSpice binary or ASCII output files.
+This document describes the 9601, 2001 and 2013 binary formats for hSpice .ac*, .sw*, and .tr* output files. This document is a companion to SPICEResultParser (originally hspiceParser). SPICEResultParser is a Python package that parses the 9601 and 2001 versions of the hSpice binary or ASCII output files.
 
 There are other hSpice parsers (eg: [Matlab hSpice ToolBox](https://www.cppsim.com/download_hspice_tools.html)). There are also other documents that describe the hSpice binary output (eg: [Gaw Data File Formats](https://www.rvq.fr/linux/gawfmt.php)). But we wanted to make both another parser and another description of the
 binary output format of hSpice. To read why we made this document, see <link to other document>.
@@ -122,6 +122,7 @@ The data blocks follow the header block and contain the actual simulation result
 
 - **9601 format:** Each value is a 4-byte (single-precision) float.
 - **2001 format:** Each value is an 8-byte (double-precision) float.
+- **2013 format:** The x value of each point (`TIME`, `HERTZ` or the swept source) is an 8-byte float. Every other value is a 4-byte float. See [The 2013 format](#the-2013-format) below.
 
 **Key points about the data blocks:**
 
@@ -131,6 +132,7 @@ The data blocks follow the header block and contain the actual simulation result
 - A special *termination value* marks the end of a sweep:
 	- For 9601: `1.0000000150474662e+30`
 	- For 2001: `1e+30`
+	- For 2013: `1e+30` as an 8-byte float, in the place of an x value
 	- This value is present even if there are no sweeps.
 - A single sweep may span multiple data blocks. hSpice writes these blocks one directly after the other. The logical data stream continues across block boundaries.
 - In an AC file (`.ac*`), each variable of the first count after the frequency is complex. Each such variable takes two values per point, its *real* part then its *imaginary* part: `HERTZ_0, re v(vo)_0, im v(vo)_0, ...`.
@@ -173,6 +175,27 @@ $&%#
 > TIME_value, v_0_value, v_vo_value, v_vs_value, i_vs_value, TIME_value, v_0_value, v_vo_value, v_vs_value, i_vs_value, TIME_value...
 
 
+
+
+## The 2013 format
+
+HSPICE P-2019 writes this format by default (`.option post=1` without `post_version`). Write it explicitly with `.option post_version=2013`. The header is the header of the 2001 format, with `2013` in columns 20-23.
+
+The data stream differs from the 9601 and 2001 streams. The values do not all have the same size:
+
+- Each sweep starts with its sweep parameter values, one 4-byte float each.
+- Each point is the x value as an 8-byte float, then each other value as a 4-byte float. In an AC file, a complex variable takes two 4-byte floats (real, then imaginary), and a probe output takes one.
+- The termination value `1e+30` is an 8-byte float in the place of an x value.
+
+**Example (2 variables, 1 sweep parameter, 2 points, 1 sweep):**
+
+```
+PARAM (4 bytes), TIME_0 (8), v(a)_0 (4), TIME_1 (8), v(a)_1 (4), 1e30 (8)
+```
+
+The blocks cut this stream at any 4-byte boundary, also between the two halves of an x value. Join the data sections of the blocks before you read the values. Thus the 2013 format keeps the time step and the frequency in double precision, and the signal values in single precision.
+
+SPICEResultParser checked this layout with files from HSPICE P-2019.06: each value of a signal is equal to the value in the 9601 file of the same netlist, and each x value rounds to the 9601 x value.
 
 ---
 

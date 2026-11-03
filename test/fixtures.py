@@ -26,8 +26,8 @@ def _lead(version, nvars, nprobe, nsweepparam):
     counts = f"{nvars - nprobe:04d}{nprobe:04d}{nsweepparam:04d}"
     if version == "9601":
         return counts + "0000" + "9601" + "    "
-    if version == "2001":
-        return counts + "00000000" + "2001"
+    if version in ("2001", "2013"):
+        return counts + "00000000" + version
     raise ValueError(f"unsupported version {version!r}")
 
 
@@ -69,6 +69,22 @@ def data_table(raw_names, nsweepparam):
     return names, nsweepparam + 1
 
 
+def stream_2013(sweeps, final_sentinel=True) -> np.ndarray:
+    """A post_version 2013 data stream as 4-byte words (float32 view): each sweep's
+    parameters as float32, then per point x as float64 (two words) and every other value
+    as float32, then a float64 1e30 in the place of an x (HSPICE P-2019.06 writes this)."""
+    words = []
+    for i, (params, data) in enumerate(sweeps):
+        words.append(np.asarray(params, "<f4"))
+        data = np.asarray(data, np.float64).reshape(len(data), -1)
+        points = np.empty(len(data), [("x", "<f8"), ("y", "<f4", (data.shape[1] - 1,))])
+        points["x"], points["y"] = data[:, 0], data[:, 1:]
+        words.append(points.view("<f4").ravel())
+        if final_sentinel or i < len(sweeps) - 1:
+            words.append(np.array([1e30], "<f8").view("<f4"))
+    return np.concatenate(words)
+
+
 def _block(payload: bytes) -> bytes:
     size = struct.pack("<i", len(payload))
     return _ENDIAN_HEAD + size + payload + size
@@ -82,7 +98,8 @@ def write_binary(path, version, raw_names, type_codes, sweeps, block_bytes=8192,
     sweeps: list of (param_values, data); data has shape (npoints, ncols) where
     ncols is the reader's column count (for AC: 1 + 2 * complex variables + nprobe).
     final_sentinel=False omits the last sweep's 1e30 terminator; drop_tail removes
-    that many trailing values from the stream (to leave a partial point).
+    that many trailing values from the stream (to leave a partial point); in a 2013 file
+    it removes 4-byte words, so 1 cuts an x in half.
     block_bytes: payload size per block, or a sequence of sizes cycled through
     (to build files with non-uniform blocks).
     nprobe: how many of the variables (the last ones) are probe outputs.
@@ -103,13 +120,16 @@ def write_binary(path, version, raw_names, type_codes, sweeps, block_bytes=8192,
         text = header_text(version, raw_names, type_codes, header_params, count, nprobe).encode("utf-8")
     else:
         raise ValueError(f"layout {layout!r} with {sorted(header)}")
-    parts = []
-    for i, (params, data) in enumerate(sweeps):
-        parts.append(np.asarray(params, dtype=dtype))
-        parts.append(np.ascontiguousarray(data, dtype=dtype).ravel())
-        if final_sentinel or i < len(sweeps) - 1:
-            parts.append(np.array([1e30], dtype=dtype))
-    stream = np.concatenate(parts)
+    if version == "2013":
+        stream = stream_2013(sweeps, final_sentinel)
+    else:
+        parts = []
+        for i, (params, data) in enumerate(sweeps):
+            parts.append(np.asarray(params, dtype=dtype))
+            parts.append(np.ascontiguousarray(data, dtype=dtype).ravel())
+            if final_sentinel or i < len(sweeps) - 1:
+                parts.append(np.array([1e30], dtype=dtype))
+        stream = np.concatenate(parts)
     if drop_tail:
         stream = stream[:len(stream) - drop_tail]
     raw = stream.tobytes()

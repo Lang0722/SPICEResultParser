@@ -4,7 +4,7 @@ test/waveview/fake_wv.py stands in for WaveView on any OS: it serves real output
 the Tcl scripts, recorded on WaveView O-2018.09-SP2 (Windows 11, CRLF line ends), from
 test/waveview/canned/. The HSPICE files in test/waveview/ come from HSPICE P-2019.06
 running the .sp netlists beside them: rc/two/single/names2 are binary post_version 2013
-(the Python reader rejects them), rc9/two9/odd/dc2/names2_9/big9 binary 9601, rca/twoa/deep
+(float64 x, float32 values), rc9/two9/odd/dc2/names2_9/big9 binary 9601, rca/twoa/deep
 ASCII, post3 an HSPICE post=3 file, and d1.mt0/mc.mt0 measure files. ng_dc.raw comes from
 ngspice-47; dims.raw, dupnut.raw, nutinf.raw, nutbig.raw and latin1.raw are written by hand.
 The canned outputs of cut files (cut_*, trunc_*) come from copies cut as the tests cut
@@ -341,9 +341,13 @@ class TestListTraces(FakeWaveView):
         self.assertEqual(api.list_traces(WV / "names2_9.tr0", engine="waveview")["traces"], want)
         ts = waveview.read_traces(WV / "names2_9.tr0", ["xt.pw", "par(rval"])
         self.assertEqual(ts.selected, ["TIME", "xt_pw", "par_rval"])
-        # Without the header (post_version 2013): a named probe keeps WaveView's name, and an
-        # unnamed par('rval') cannot be told from rval=par(...).
-        got = api.list_traces(WV / "names2.tr0", engine="waveview")["traces"]
+        # names2.tr0 is the post_version 2013 twin: the Python reader reads its header too.
+        self.assertEqual(api.list_traces(WV / "names2.tr0")["traces"], want)
+        self.assertEqual(api.list_traces(WV / "names2.tr0", engine="waveview")["traces"], want)
+        # Without the header (the Python reader fails): a named probe keeps WaveView's name, and
+        # an unnamed par('rval') cannot be told from rval=par(...).
+        with mock.patch.object(waveview.reader, "read_header", side_effect=ValueError("no header")):
+            got = api.list_traces(WV / "names2.tr0", engine="waveview")["traces"]
         self.assertEqual(got, ["v_top", "v_xt_x2_deep", "p_xt_pw", "i_xt_io", "my$x", "q[0]", "dv$", "rval", "temper",
                                "par_v", "v_in"])
 
@@ -401,8 +405,12 @@ class TestListTraces(FakeWaveView):
                              api.list_traces(WV / "named3_9.tr0")["traces"])
 
     def test_post_version_2013_sweep(self):
-        with self.assertRaisesRegex(ValueError, "unsupported post_version '2013'"):
-            read_header(WV / "rc.tr0")
+        # Both engines read post_version 2013 files, and list them alike.
+        for name in ("rc.tr0", "rc.ac0", "two.tr0"):
+            want = api.list_traces(WV / name)
+            got = api.list_traces(WV / name, engine="waveview")
+            self.assertEqual((want.pop("format"), got.pop("format")), ("2013", "waveview"))
+            self.assertEqual(got, want, name)
         got = api.list_traces(WV / "rc.tr0", engine="waveview")
         self.assertEqual(got["traces"], ["v_0", "v_in", "v_out", "i_vin"])
         self.assertEqual((got["analysis"], got["x"]), ("tr", "TIME"))
@@ -562,7 +570,8 @@ class TestReadTraces(FakeWaveView):
         # A swept file cut inside sweep 0: WaveView lists the parameter, and no sweep.
         for name, source, warning in (("cut_rc9.tr0", "rc9.tr0", "declares 3 sweeps and WaveView reads 0: the file is "
                                                                  "probably truncated, and WaveView drops its partial"),
-                                      ("cut_rc.tr0", "rc.tr0", ": WaveView reads no complete sweep: the file")):
+                                      ("cut_rc.tr0", "rc.tr0", "declares 3 sweeps and WaveView reads 0: the file is "
+                                                               "probably truncated, and WaveView drops its partial")):
             with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / name
                 path.write_bytes((WV / source).read_bytes()[:1200])
@@ -728,8 +737,13 @@ class TestReadTraces(FakeWaveView):
         self.assertEqual(ts.sweep_values, [[1000.0], [2000.0], [4000.0]])
         self.assertEqual(ts.sweep_indices, [0, 1, 2])
         self.assertEqual([a.size for a in ts.data["TIME"]], [86, 74, 66])
-        # rca.tr0 is the same netlist written as ASCII (7 digits), which the Python reader reads.
-        self.assert_same_traces(ts, read_traces(WV / "rca.tr0"), rtol=1e-6, atol=1e-12)
+        # The Python engine reads the same file: float64 x, float32 values, all equal.
+        self.assert_same_traces(ts, read_traces(WV / "rc.tr0"))
+        # rca.tr0 is the same netlist written as ASCII (7 digits).
+        ascii_ts = read_traces(WV / "rca.tr0")
+        for name in ts.selected:
+            for got, want in zip(ts.data[name], ascii_ts.data[name]):
+                np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-12, err_msg=name)
 
     def test_sweeps_filter(self):
         ts = waveview.read_traces(WV / "rc.tr0", ["v(out"], sweeps=[2, 0])
@@ -762,12 +776,11 @@ class TestReadTraces(FakeWaveView):
     def test_complex_and_real_signals_in_one_ac_file(self):
         ts = waveview.read_traces(WV / "rc.ac0", ["v(out)", "vdb(out)"], ac_format="db")
         self.assertEqual(ts.selected, ["HERTZ", "v_out_dB", "v_out_Phase", "vdb_out"])
-        for i in range(2):         # HSPICE's own vdb(out) agrees to about 3e-7 dB
-            np.testing.assert_allclose(ts.data["v_out_dB"][i], ts.data["vdb_out"][i], atol=1e-6)
-        # No Python reference: HSPICE writes vdb(out) as one real value per point, and the
-        # Python reader takes every AC variable for a complex pair, so its columns of
-        # rca.ac0 shift (reported, not fixed here).
+        for i in range(2):         # HSPICE's own vdb(out): the dB of the float32 parts, in float32, is 8e-6 off
+            np.testing.assert_allclose(ts.data["v_out_dB"][i], ts.data["vdb_out"][i], atol=1e-5)
         self.assertEqual([a.size for a in ts.data["HERTZ"]], [51, 51])
+        # The Python engine reads vdb(out) as one real value per point too, and gets the same values.
+        self.assert_same_traces(ts, read_traces(WV / "rc.ac0", ["v(out)", "vdb(out)"], ac_format="db"))
 
     def test_xrange_bounds_of_a_9601_file(self):
         # The Python engine compares float32 x with the bounds in float32: 0.006 rounds up

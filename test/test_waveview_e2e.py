@@ -9,9 +9,9 @@ VM with prlctl. The VM sees only the Mac home directory, so the temporary files 
 directory under it (SRP_E2E_TMP, default ~/.cache/srp_e2e). On a machine with WaveView,
 set SRP_WAVEVIEW to the wv binary instead.
 
-The tests compare both engines on every file the Python reader can read, and check that
-the WaveView engine reads the HSPICE post_version 2013 files, which the Python reader
-rejects. Known differences are asserted as such, so that a change on either side shows.
+The tests compare both engines on every file the Python reader can read, the HSPICE
+post_version 2013 files among them. Known differences are asserted as such, so that a
+change on either side shows.
 """
 import os
 import shutil
@@ -83,22 +83,24 @@ MEASURES = (HERE / "test.mt0", WV / "rc.mt0", WV / "rc.ma0", WV / "rc.ms0", WV /
 
 
 class Base(unittest.TestCase):
-    def assert_values(self, got, want, rtol, atol=0.0, msg=""):
+    def assert_values(self, got, want, rtol, atol=0.0, msg="", dtype=True):
+        """dtype: both engines give the file's dtype (float32 values in 9601 and 2013)."""
+        if dtype:
+            self.assertEqual(got.dtype, np.asarray(want).dtype, msg)
         want = np.asarray(want, dtype=np.float64)
-        self.assertEqual(got.dtype, np.float64, msg)
         if rtol or atol:
             np.testing.assert_allclose(got, want, rtol=rtol, atol=atol, err_msg=msg)
         else:
             np.testing.assert_array_equal(got, want, err_msg=msg)
 
-    def assert_same(self, got, want, rtol, atol=0.0, names=None):
+    def assert_same(self, got, want, rtol, atol=0.0, names=None, dtype=True):
         names = names or dict(zip(got.selected, want.selected))
         self.assertEqual(got.sweep_indices, want.sweep_indices)
         for g, w in names.items():
             self.assertEqual(len(got.data[g]), len(want.data[w]), g)
             for i, (a, b) in enumerate(zip(got.data[g], want.data[w])):
                 self.assertEqual(a.size, b.size, f"{g} sweep {i}")
-                self.assert_values(a, b, rtol, atol, f"{g} sweep {i}")
+                self.assert_values(a, b, rtol, atol, f"{g} sweep {i}", dtype)
 
 
 class TestParity(Base):
@@ -111,6 +113,12 @@ class TestParity(Base):
                 want_list.pop("format")
                 if path.suffix == ".raw":                      # WaveView opens plot 0 only
                     self.assertEqual(got_list.pop("plots"), want_list.pop("plots")[:1])
+                for key in ("x_range", "ranges"):              # bounds of values that can differ by rtol
+                    got_b, want_b = got_list.pop(key), want_list.pop(key)
+                    pairs = got_b.items() if key == "ranges" else [(key, got_b)]
+                    for name, bounds in pairs:
+                        want_bounds = want_b[name] if key == "ranges" else want_b
+                        np.testing.assert_allclose(bounds, want_bounds, rtol=rtol, err_msg=f"{path.name} {name}")
                 self.assertEqual(got_list, want_list)
                 got, want = waveview.read_traces(path), read_traces(path)
                 self.assertEqual((got.selected, got.sweep_values), (want.selected, want.sweep_values))
@@ -156,11 +164,14 @@ class TestParity(Base):
                 self.assert_same(got, want, 0.0)
 
     def test_names_without_the_header(self):
-        # names2.tr0 is the post_version 2013 twin of names2_9.tr0: no header for the Python
-        # reader. Named expressions get the file's names; named probes keep WaveView's names, and
-        # an unnamed par('rval') cannot be told from rval=par(...).
-        got = api.list_traces(WV / "names2.tr0", engine="waveview")["traces"]
+        # names2.tr0 is the post_version 2013 twin of names2_9.tr0. With its header, the names
+        # are those of the file. Without it (the Python reader fails), named expressions get the
+        # file's names; named probes keep WaveView's names, and an unnamed par('rval') cannot be
+        # told from rval=par(...).
         twin = api.list_traces(WV / "names2_9.tr0")["traces"]
+        self.assertEqual(api.list_traces(WV / "names2.tr0", engine="waveview")["traces"], twin)
+        with mock.patch.object(waveview.reader, "read_header", side_effect=ValueError("no header")):
+            got = api.list_traces(WV / "names2.tr0", engine="waveview")["traces"]
         self.assertEqual(got[4:7], twin[4:7])                       # my$x q[0] dv$
         self.assertEqual(got[:4], ["v_top", "v_xt_x2_deep", "p_xt_pw", "i_xt_io"])
         self.assertEqual(got[7:9], ["rval", "temper"])
@@ -197,56 +208,60 @@ class TestParity(Base):
         self.assert_same(got, want, 1e-15, names=dict(zip(got.selected, want.selected)))
 
     def test_data_sweep_parameters(self):
-        # The Python reader takes the .data table name (pts) for a sweep parameter: three
-        # parameters [1000, 1e-09, 0] and shifted values. WaveView: rval, cval.
-        for path in (WV / "two9.tr0", WV / "twoa.tr0"):
+        # A .data sweep names its table (pts) before its columns, with no value for it: both
+        # engines give rval, cval (WaveView's values have 6 digits).
+        for path, rtol in ((WV / "two9.tr0", 0.0), (WV / "twoa.tr0", 1e-15)):
             with self.subTest(path.name):
-                self.assertEqual(api.list_traces(path)["sweep_params"], ["pts", "rval", "cval"])
+                self.assertEqual(api.list_traces(path)["sweep_params"], ["rval", "cval"])
                 got = waveview.read_traces(path, ["v(x1.mid"])
+                want = read_traces(path, ["v(x1.mid"])
                 self.assertEqual(got.header.sweep_params, ["rval", "cval"])
                 self.assertEqual(got.sweep_values, [[1000.0, 1e-9], [2000.0, 1e-9], [2000.0, 2e-9]])
-                np.testing.assert_allclose(read_traces(path, ["v(x1.mid"]).sweep_values[0], [1000.0, 1e-9, 0.0],
-                                           rtol=1e-7)
+                np.testing.assert_allclose(want.sweep_values, got.sweep_values, rtol=1e-6)
                 self.assertEqual([a.size for a in got.data["TIME"]], [46, 46, 46])
+                self.assert_same(got, want, rtol)
 
     def test_noise_columns(self):
-        # WaveView lists outnoise as noise(outnoise). The Python reader takes these real
-        # columns for complex pairs (the known AC real-column error), but its names are right.
+        # WaveView lists outnoise as noise(outnoise); both engines read it as one real trace.
         got = waveview.read_traces(WV / "noi.ac0", ["outnoise", "innoise"])
         self.assertEqual(got.selected, ["HERTZ", "outnoise", "innoise"])
         self.assertEqual(read_traces(WV / "noi.ac0").header.raw_names[-2:], ["outnoise", "innoise"])
         np.testing.assert_allclose(got.data["outnoise"][0][:3], 1.6465e-17, rtol=1e-4)    # 4kTR, 1 kOhm
+        self.assert_same(got, read_traces(WV / "noi.ac0", ["outnoise", "innoise"]), 0.0)
 
     def test_analysis_of_an_ac_file_without_its_extension(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "acreal.bin"
             shutil.copy(WV / "acreal_9.ac0", path)
-            self.assertEqual(api.list_traces(path, engine="waveview")["analysis"], "ac")
+            self.assertEqual(api.list_traces(path, engine="waveview", header_only=True)["analysis"], "ac")
 
     def test_real_probe_in_an_ac_file(self):
-        # vdb(out) is one real value per point. The Python reader takes it for a complex
-        # pair, so its columns shift; WaveView lists it as one real trace.
-        for path in (WV / "rc9.ac0", WV / "rca.ac0"):
+        # vdb(out) is one real value per point: both engines read it as one real trace.
+        for path, rtol in ((WV / "rc9.ac0", 0.0), (WV / "rca.ac0", 1e-15)):
             with self.subTest(path.name):
-                self.assertIn("vdb_out_Mag", api.list_traces(path)["traces"])
-                self.assertEqual(read_traces(path).data["HERTZ"][0][1], 0.0)    # a shifted column
+                self.assertIn("vdb_out", api.list_traces(path)["traces"])
                 got = waveview.read_traces(path, ["v(out)", "vdb(out)"], ac_format="db")
+                want = read_traces(path, ["v(out)", "vdb(out)"], ac_format="db")
                 self.assertEqual(got.selected, ["HERTZ", "v_out_dB", "v_out_Phase", "vdb_out"])
                 for i in range(2):
                     self.assertEqual(got.data["HERTZ"][i].size, 51)
                     np.testing.assert_allclose(got.data["v_out_dB"][i], got.data["vdb_out"][i], atol=2e-5)
+                self.assert_same(got, want, rtol, names={"HERTZ": "HERTZ", "vdb_out": "vdb_out"})
 
 
 class TestPostVersion2013(Base):
-    def test_python_rejects_and_waveview_reads(self):
+    def test_both_engines_read_them(self):
+        # float64 x and float32 values in both engines; WaveView's AC values round to the stored ones
         for name in POST_2013:
             with self.subTest(name):
-                with self.assertRaisesRegex(ValueError, "unsupported post_version '2013'"):
-                    api.list_traces(WV / name)
-                listing = api.list_traces(WV / name, engine="waveview")
-                ts = waveview.read_traces(WV / name)
-                self.assertEqual(ts.selected[1:], listing["traces"])
-                self.assertTrue(all(a.size > 0 for a in ts.data[ts.selected[0]]))
+                want_list = api.list_traces(WV / name)
+                got_list = api.list_traces(WV / name, engine="waveview")
+                self.assertEqual((want_list.pop("format"), got_list.pop("format")), ("2013", "waveview"))
+                self.assertEqual(got_list, want_list)
+                got, want = waveview.read_traces(WV / name), read_traces(WV / name)
+                self.assertEqual(got.selected, want.selected)
+                np.testing.assert_allclose(got.sweep_values, want.sweep_values, rtol=1e-6)   # WaveView: 6 digits
+                self.assert_same(got, want, 0.0)
 
     def test_same_values_as_the_ascii_twin(self):
         # rca.* is the same netlist with post=2 (ASCII, 7 digits), read by both engines.
@@ -255,7 +270,7 @@ class TestPostVersion2013(Base):
                 got = waveview.read_traces(WV / binary)
                 want = read_traces(WV / ascii_)
                 self.assertEqual((got.selected, got.sweep_values), (want.selected, want.sweep_values))
-                self.assert_same(got, want, 1e-6, 1e-12)
+                self.assert_same(got, want, 1e-6, 1e-12, dtype=False)     # float32 values, float64 ASCII
         for binary, other in (("rc.ac0", "rca.ac0"), ("two.tr0", "twoa.tr0")):
             with self.subTest(binary):
                 got = waveview.read_traces(WV / binary)
@@ -267,7 +282,7 @@ class TestPostVersion2013(Base):
         from spice_result_parser import mcp_server
 
         text = mcp_server.extract(str(WV / "rc.tr0"), ["v(out)"], engine="waveview")
-        self.assertTrue(text.startswith("transient | x: TIME | 226 points in 3 sweeps"), text)
+        self.assertTrue(text.startswith("transient | x: TIME in [0, 2e-05] | 226 points in 3 sweeps"), text)
         self.assertIn("| engine: waveview", text.splitlines()[0])
         self.assertIn("-- sweep 2: rval=4000 --", text)
 

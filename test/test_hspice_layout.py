@@ -295,6 +295,131 @@ class TestDataSweeps(unittest.TestCase):
             np.testing.assert_allclose(ts.data["v_out"][1], x * 2e3, rtol=1e-6)
 
 
+class TestPostVersion2013(unittest.TestCase):
+    """post_version 2013, the default of HSPICE P-2019: each point is x as float64, then
+    every other value as float32; a sweep starts with its parameters as float32, and a
+    float64 1e30 in the place of an x ends it."""
+
+    TWINS = (("rc.tr0", "rc9.tr0"), ("rc.ac0", "rc9.ac0"), ("rc.sw0", "rc9.sw0"), ("two.tr0", "two9.tr0"),
+             ("names2.tr0", "names2_9.tr0"))     # HSPICE P-2019.06: one netlist, post_version 2013 and 9601
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_real_files_match_their_9601_twins(self):
+        for name, twin in self.TWINS:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                ts = read_traces(HERE / "waveview" / name, ac_format="realimag")
+            ref = read_traces(HERE / "waveview" / twin, ac_format="realimag")
+            self.assertEqual((ts.header.version, ts.selected, ts.truncated), ("2013", ref.selected, False), name)
+            self.assertEqual(ts.sweep_values, ref.sweep_values, name)
+            x = ts.header.x_name
+            for i, (got, want) in enumerate(zip(ts.data[x], ref.data[x])):
+                self.assertEqual(got.dtype, np.float64)
+                np.testing.assert_allclose(got, want, rtol=1e-7, err_msg=name)     # 9601 rounds x to float32
+            for trace in ts.selected[1:]:
+                for got, want in zip(ts.data[trace], ref.data[trace]):
+                    self.assertEqual(got.dtype, np.float32)
+                    np.testing.assert_array_equal(got, want, err_msg=f"{name} {trace}")   # the same float32 values
+        info = api.list_traces(HERE / "waveview" / "single.ac0")
+        self.assertEqual((info["format"], info["analysis"], info["points"]), ("2013", "ac", 21))
+
+    def test_the_fixture_writes_what_hspice_writes(self):
+        ts = read_traces(HERE / "waveview" / "rc.tr0")
+        sweeps = [(v, np.column_stack([ts.data[n][i] for n in ts.selected])) for i, v in enumerate(ts.sweep_values)]
+        raw = (HERE / "waveview" / "rc.tr0").read_bytes()
+        stream, pos = b"", 20 + struct.unpack("<i", raw[12:16])[0]
+        while pos < len(raw):
+            size = struct.unpack("<i", raw[pos + 12:pos + 16])[0]
+            stream, pos = stream + raw[pos + 16:pos + 16 + size], pos + 20 + size
+        self.assertEqual(fixtures.stream_2013(sweeps).tobytes(), stream)
+
+    def write(self, name, sweeps, names=("TIME", "v(a", "i(b"), codes=(1, 1, 8), **kw):
+        """A 2013 file; names without sweep parameters get p0, p1 ... for them."""
+        path = self.dir / name
+        names = list(names)
+        if len(names) == len(codes):
+            names += [f"p{k}" for k in range(len(sweeps[0][0]))]
+        fixtures.write_binary(path, "2013", names, list(codes), sweeps, layout="hspice", **kw)
+        return path
+
+    def test_x_keeps_its_float64_values(self):
+        t = 1e-3 + np.arange(50) * 1e-15                    # steps that float32 cannot hold
+        data = np.column_stack([t, np.sin(np.arange(50.0)), np.cos(np.arange(50.0))])
+        ts = read_traces(self.write("fine.tr0", [([], data)]))
+        np.testing.assert_array_equal(ts.data["TIME"][0], t)
+        self.assertEqual(len(np.unique(ts.data["TIME"][0])), 50)
+        np.testing.assert_array_equal(ts.data["v_a"][0], data[:, 1].astype(np.float32))
+        window = read_traces(self.dir / "fine.tr0", xrange=(t[10], t[20]))     # compared in float64
+        np.testing.assert_array_equal(window.data["TIME"][0], t[10:21])
+
+    def test_points_split_over_blocks(self):
+        rng = np.random.default_rng(5)
+        sweeps = [([float(k)], np.column_stack([np.linspace(0, 1, 37), rng.normal(size=(37, 2))])) for k in range(3)]
+        want = read_traces(self.write("one.tr0", sweeps))
+        # blocks that cut x in half, cut a parameter from its sweep, and cut the terminator
+        for sizes in (24, [12, 20, 4, 36], [6 * 4 + 2 * 4] * 3 + [4], 4):
+            got = read_traces(self.write(f"split{sizes}.tr0", sweeps, block_bytes=sizes))
+            self.assertEqual((got.sweep_values, got.truncated), (want.sweep_values, False), sizes)
+            for name in want.selected:
+                for a, b in zip(got.data[name], want.data[name]):
+                    np.testing.assert_array_equal(a, b, err_msg=f"{sizes} {name}")
+
+    def test_a_file_cut_anywhere(self):
+        data = np.column_stack([np.linspace(0, 1, 9), np.arange(9.0), -np.arange(9.0)])
+        sweeps = [([1.0], data), ([2.0], data)]
+        # words cut from the end: half the terminator, all of it, a value of the last point,
+        # every point of sweep 1, its parameter too (the file then ends after sweep 0)
+        for drop, points, values, warning in ((1, [9, 9], [[1.0], [2.0]], "partial"),
+                                              (2, [9, 9], [[1.0], [2.0]], "partial"),
+                                              (3, [9, 8], [[1.0], [2.0]], "partial"),
+                                              (2 + 4 * 9, [9, 0], [[1.0], [2.0]], "partial"),
+                                              (2 + 4 * 9 + 1, [9], [[1.0]], "announces 2 sweeps, the file holds 1")):
+            with self.subTest(drop=drop):
+                path = self.write("cut.tr0", sweeps, drop_tail=drop)
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    ts = read_traces(path)
+                    info = api.list_traces(path)
+                self.assertTrue(ts.truncated and info["truncated"])
+                self.assertTrue(any(warning in str(w.message) for w in caught), [str(w.message) for w in caught])
+                self.assertEqual([a.size for a in ts.data["TIME"]], points)
+                self.assertEqual((ts.sweep_values, info["points"]), (values, sum(points)))
+                np.testing.assert_array_equal(ts.data["v_a"][0], data[:, 1])
+
+    def test_sweeps_data_tables_and_ac_probes(self):
+        x = np.logspace(3, 8, 11)
+        z = (1 + 1j) / (1 + 1j * x / 1e6)
+        columns = [x, z.real, z.imag, 20 * np.log10(np.abs(z))]
+        sweeps = [([r, c], np.column_stack(columns)) for r, c in ((1e3, 1e-9), (2e3, 2e-9))]
+        path = self.write("ac.ac0", sweeps, names=("HERTZ", "v(out", "vdb(out", "rval", "cval"), codes=(2, 1, 6),
+                          nprobe=1)
+        ts = read_traces(path, ac_format="db")
+        self.assertEqual(ts.selected, ["HERTZ", "v_out_dB", "v_out_Phase", "vdb_out"])
+        self.assertEqual((ts.header.sweep_params, ts.sweep_values[1]), (["rval", "cval"], [2000.0, float(np.float32(2e-9))]))
+        np.testing.assert_array_equal(ts.data["HERTZ"][1], x)
+        np.testing.assert_allclose(ts.data["v_out_dB"][0], ts.data["vdb_out"][0], atol=1e-5)
+        info = api.list_traces(path, ac_format="db")
+        db = np.concatenate(ts.data["v_out_dB"])          # float32: list_traces gives the short form
+        self.assertEqual(info["ranges"]["v_out_dB"], [float(str(db.min())), float(str(db.max()))])
+
+    def test_json_and_text(self):
+        from spice_result_parser import mcp_server
+        t = np.array([0.0, 1e-9, 1.000000001e-9, 2e-9])
+        path = self.write("j.tr0", [([], np.column_stack([t, [0.1, 0.2, 0.3, 0.4], [1, 2, 3, 4]]))])
+        summary = api.extract(path, ["v(a"], output="summary", tolerance=0)
+        stats = summary["stats"]["v_a"][0]
+        self.assertEqual((stats["min"], stats["max"]), (0.1, 0.4))           # float32 values, kept short
+        self.assertEqual(stats["x"], [0.0, 1e-9, 1.000000001e-9, 2e-9])      # x in float64
+        text = mcp_server.format_text(api.extract(path, ["v(a"], output="arrays"), tolerance=0)
+        self.assertIn("1.000000001e-09", text)                                # x printed with the digits it needs
+
+
 class TestStrayValues(unittest.TestCase):
     def test_a_wrong_column_count_is_reported(self):
         # 7 values per point under a header that declares 5: the values before the

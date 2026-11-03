@@ -119,10 +119,11 @@ The `extract` parameters work as follows:
 
 The reader supports these files:
 
-- binary 9601 and 2001 files and `post=2` ASCII files, including multi-sweep and AC
-  results, from the HSPICE releases that we examined: 2011, 2013, 2019, 2020 and
-  2021. The reader takes the sweep count from its fixed column in the header. Thus it
-  does not need the copyright notice, which H-2013.03 leaves out.
+- binary 9601, 2001 and 2013 files (`post_version` 2013 is the default of HSPICE P-2019)
+  and `post=2` ASCII files, including multi-sweep and AC results, from the HSPICE
+  releases that we examined: 2011, H-2013.03, 2019, 2020 and 2021. The reader takes the
+  sweep count from its fixed column in the header. Thus it does not need the copyright
+  notice, which H-2013.03 leaves out.
 - Nutmeg rawfiles (ngspice / SPICE3 `.raw`) in binary and ASCII form
 
 The reader can read a file while the simulator writes it. The reader then reads the file
@@ -137,8 +138,7 @@ stays one trace.
 ### WaveView engine
 
 A second reader runs Synopsys Custom WaveView in batch mode. Use it when the Python
-reader cannot read a file (for example HSPICE `post_version` 2013, the default of HSPICE
-P-2019), or to check a result. It returns the same objects, so every output works the
+reader cannot read a file (for example an HSPICE `post=3` file), or to check a result. It returns the same objects, so every output works the
 same way.
 
 ```python

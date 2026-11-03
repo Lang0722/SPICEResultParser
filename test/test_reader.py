@@ -87,8 +87,12 @@ class TestHeader(unittest.TestCase):
     def test_unsupported_version(self):
         with tempfile.TemporaryDirectory() as tmp:
             bad = Path(tmp) / "future.tr0"
-            data = (HERE / "test_9601.tr0").read_bytes().replace(b"9601    *", b"2013    *", 1)
+            data = (HERE / "test_9601.tr0").read_bytes().replace(b"9601    *", b"9007    *", 1)
             bad.write_bytes(data)
+            with self.assertRaisesRegex(ValueError, "unsupported post_version '9007'; 9601, 2001 and 2013"):
+                read_header(bad)
+            # 2013 is written where 2001 is (columns 20-23), never where 9601 is
+            bad.write_bytes((HERE / "test_9601.tr0").read_bytes().replace(b"9601    *", b"2013    *", 1))
             with self.assertRaisesRegex(ValueError, "unsupported post_version '2013'"):
                 read_header(bad)
 

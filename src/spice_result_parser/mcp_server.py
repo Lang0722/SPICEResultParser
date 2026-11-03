@@ -465,7 +465,7 @@ def _json_result(result: dict, ts=None) -> dict:
 ENGINE_FIELD = Field(
     description="Reader: \"python\" (this package's parser) or \"waveview\" (Synopsys WaveView "
                 "in batch mode; needs wv, see SRP_WAVEVIEW). Use \"waveview\" when the Python "
-                "reader fails on a file (HSPICE post_version 2013, for example) or to check a "
+                "reader fails on a file (an HSPICE post=3 file, for example) or to check a "
                 "result. \"waveview\" reads only plot 0 of a Nutmeg rawfile (plots then holds one "
                 "name), reads every point before it applies xrange, and reports format "
                 "\"waveview\". None: the SRP_ENGINE environment variable, else \"python\".")
@@ -475,7 +475,7 @@ Engine = Optional[Literal[waveview.ENGINES]]
 @_tool(read_only=True)
 @_tool_errors
 def list_traces(
-    path: Annotated[str, Field(description="Result file: HSPICE .tr#/.sw#/.ac# (binary 9601/2001 "
+    path: Annotated[str, Field(description="Result file: HSPICE .tr#/.sw#/.ac# (binary 9601/2001/2013 "
                                            "or ASCII) or a Nutmeg .raw (binary or ASCII). " + _PATH_HELP)],
     names: Annotated[Optional[Union[str, List[str]]], Field(
         description="Traces to list, as extract selects them: " + _NAMES_HELP + " None lists every "

@@ -2,8 +2,8 @@
 
 SPICEResultParser reads these files:
 
-- HSPICE DC, AC and transient result files (`*.swX`, `*.acX`, `*.trX`) in the 9601 and
-  2001 binary formats and the `post=2` ASCII format. We examined files from the 2011,
+- HSPICE DC, AC and transient result files (`*.swX`, `*.acX`, `*.trX`) in the 9601, 2001
+  and 2013 binary formats and the `post=2` ASCII format. We examined files from the 2011,
   2013, 2019, 2020 and 2021 releases. [hSpice_output.md](hSpice_output.md) gives the header
   columns that they share.
 - HSPICE measure files (`*.mtX`, `*.msX`, `*.maX`)
@@ -364,9 +364,8 @@ The reader does not support these files:
 
 The package has two readers. The default reader is the Python parser in this package.
 The second reader runs Synopsys Custom WaveView in batch mode (`wv -ace_no_gui`). Use it
-when the Python parser cannot read a file, for example an HSPICE `post_version` 2013
-binary, which is the default output of HSPICE P-2019. Use it also to check a result that
-you doubt. Both readers return the same `Header`, `TraceSet` and `MeasureSet`, so every
+when the Python parser cannot read a file, for example an HSPICE `post=3` file. Use it
+also to check a result that you doubt. Both readers return the same `Header`, `TraceSet` and `MeasureSet`, so every
 output (`text`, `summary`, `arrays`, `csv`, `npz`, `png`) works the same way.
 
 `list_traces`, `extract` and `read_measures` take an `engine` argument, and so do the
@@ -466,11 +465,11 @@ The WaveView engine is different from the Python engine in these ways:
     `vo`, and WaveView lists `v(vo)`. For `xt.vo=v(xt.n1)`, the file has `xt.vo`, and
     WaveView lists `xt.v(vo)`. For an unnamed `par('rval')`, the file has `par(rval`,
     and WaveView lists `par(rval)`, as for a named `rval=par(...)`.
-- Without the header (HSPICE `post_version` 2013), a named probe keeps WaveView's name:
-  `v_vo`, `v_xt_vo`, `i_io`, `p_pw`, `vdb_vodb`. Named `par`, `deriv` and `integ`
-  expressions get the file's names, also with `$ # [ ] < >` in them (`my$x`, `q[0]`).
-  So do the `.noise` columns `outnoise` and `innoise`. An unnamed `par('rval')` comes out
-  as `rval`.
+- Without the header (when the Python reader cannot read it), a named probe keeps
+  WaveView's name: `v_vo`, `v_xt_vo`, `i_io`, `p_pw`, `vdb_vodb`. Named `par`, `deriv`
+  and `integ` expressions get the file's names, also with `$ # [ ] < >` in them (`my$x`,
+  `q[0]`). So do the `.noise` columns `outnoise` and `innoise`. An unnamed `par('rval')`
+  comes out as `rval`.
 - A probe in a subcircuit (`.probe tran inner=v(n1)` in a `.subckt`) keeps WaveView's
   name, also with the header: `v_xt_inner`, where the Python engine gives `1_inner`.
 - WaveView prints `waveform file '...' not complete` on its console for a truncated file.
@@ -522,7 +521,6 @@ The WaveView engine is different from the Python engine in these ways:
 
 The Python reader has these known errors. The WaveView engine does not have them:
 
-- It rejects HSPICE `post_version` 2013 binaries.
 - In a Monte Carlo measure file, the lines that start with `$` (`$OPTION ...`) come
   before `.TITLE`. The Python reader takes them for the title and the names, and it
   reads 0 rows, with only a `RuntimeWarning`.

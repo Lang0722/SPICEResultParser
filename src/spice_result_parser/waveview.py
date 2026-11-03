@@ -1,7 +1,7 @@
 """WaveView engine: read result files through Synopsys Custom WaveView in batch mode.
 
 A second reader beside reader.py, nutmeg.py and measure.py, for a file the Python
-parser cannot read (HSPICE post_version 2013, for example) or a result in doubt. It
+parser cannot read (an HSPICE post=3 file, for example) or a result in doubt. It
 runs one of the Tcl scripts in tcl/ with `wv -ace_no_gui`, reads the text file the
 script writes, and builds the same Header, TraceSet and MeasureSet, so api.py and
 mcp_server.py treat both engines alike.
@@ -13,15 +13,16 @@ srp_done is a failure.
 
 Differences from the Python engine: every point of the selected signals is read
 into memory, and xrange is applied after the read (scan, for list_traces, reads them
-too); only plot 0 of a Nutmeg rawfile; arrays are float64 unless the header shows a
-9601 file (float32, as the Python engine gives them); a measure file has no `alter#`
-column; a truncated binary HSPICE file loses its partial sweep. Names follow the
-Python engine (see raw_name). What WaveView does not report comes from the file header, through
-reader.py and nutmeg.py when they can read it: the Nutmeg x name, Dimensions and point
-count, the float32 x of a 9601 file, the analysis and sweep count of an HSPICE header,
-and the names of named probes and expressions (vo=v(out): the file has vo, WaveView
-lists v(vo)). Without that header (post_version 2013) a named probe keeps WaveView's
-name. WaveView shows a truncated file on its console ("waveform file ... not complete").
+too); only plot 0 of a Nutmeg rawfile; arrays are float64 unless the header gives the
+file's dtypes (9601: float32; 2013: float64 x and float32 values, as the Python engine
+gives them); a measure file has no `alter#` column; a truncated binary HSPICE file
+loses its partial sweep. Names follow the Python engine (see raw_name). What WaveView
+does not report comes from the file header, through reader.py and nutmeg.py when they
+can read it: the Nutmeg x name, Dimensions and point count, the dtypes of an HSPICE
+file, the analysis and sweep count of an HSPICE header, and the names of named probes
+and expressions (vo=v(out): the file has vo, WaveView lists v(vo)). Without that header
+(the Python reader fails on it) a named probe keeps WaveView's name. WaveView shows a
+truncated file on its console ("waveform file ... not complete").
 """
 from __future__ import annotations
 
@@ -322,7 +323,8 @@ class _Listing:
     nut_points: int = 0                         # Nutmeg: points of plot 0 in its header (0: not known)
     nut_complete: Optional[int] = None          # Nutmeg, a file that is not complete: the complete points of
                                                 # plot 0, as nutmeg.py counts them (None: not known)
-    float32: bool = False                       # HSPICE 9601: the file stores x as float32
+    dtypes: Optional[Tuple[np.dtype, np.dtype]] = None   # HSPICE: the dtypes the file stores x and the
+                                                # other values in (9601: float32; 2013: float64 x, float32)
     declared: int = 0                           # sweeps the HSPICE header declares (0: not swept or not known)
 
     @property
@@ -366,7 +368,7 @@ def _nutmeg_plot0(path: str) -> Optional[nutmeg._Plot]:
 
 
 def _hspice_header(path: str) -> Optional[Header]:
-    """The header as reader.py reads it; None when it cannot (post_version 2013, for example).
+    """The header as reader.py reads it; None when it cannot (an HSPICE post=3 file, for example).
     Its warnings pass: a warnings filter is not safe in threads."""
     try:
         return reader.read_header(path)
@@ -405,7 +407,7 @@ def _listing(path: str, plot, ac_format: str) -> Tuple[Header, _Listing]:
                             f"waveform file)")
     is_nut = nutmeg.is_nutmeg(path)
     incomplete = bool(_INCOMPLETE.search(console))
-    nsplit, nut_points, nut_complete, float32, declared, own = 1, 0, None, False, 0, None
+    nsplit, nut_points, nut_complete, dtypes, declared, own = 1, 0, None, None, 0, None
     if is_nut:
         plot0 = _nutmeg_plot0(path)
         if plot0 is not None:
@@ -417,7 +419,7 @@ def _listing(path: str, plot, ac_format: str) -> Tuple[Header, _Listing]:
     else:
         own = _hspice_header(path)
         if own is not None:
-            float32 = own.dtype == np.float32
+            dtypes = (own.x_dtype, own.dtype)
             declared = own.sweep_count_hint
         if not xname:                           # WaveView gives no x name for a post=3 file
             xname = {"tr": "TIME", "ac": "HERTZ"}.get(_analysis_from_extension(path), "x")
@@ -461,7 +463,7 @@ def _listing(path: str, plot, ac_format: str) -> Tuple[Header, _Listing]:
                             npoints=npoints, incomplete=incomplete,
                             binary=not is_nut and reader._is_binary(path), nutmeg=is_nut,
                             shared_x=is_nut or _shared_x(path), nsplit=nsplit, nut_points=nut_points,
-                            nut_complete=nut_complete, float32=float32, declared=declared)
+                            nut_complete=nut_complete, dtypes=dtypes, declared=declared)
 
 
 def read_header(path, plot: int = 0, ac_format: str = "magphase") -> Header:
@@ -640,17 +642,18 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
         if len(traces) < listing.nsplit:
             check_sweeps(path, wanted, len(traces), True)
     sweep_values = [_condition_values(c, listing.params, path) for c in listing.conditions] or [[] for _ in traces]
-    if listing.float32:
-        # A 9601 file stores float32: its arrays are float32, as the Python engine gives them.
-        # WaveView prints each value at 17 digits, so the cast is exact (its AC values of a
-        # 9601 file can differ from the stored ones in the last float32 digit).
-        traces = [(x.astype(np.float32), {name: v.astype(np.float32) for name, v in ys.items()})
+    x_dtype, value_dtype = listing.dtypes or (np.dtype(np.float64), np.dtype(np.float64))
+    if listing.dtypes is not None:
+        # The arrays get the dtypes of the file, as the Python engine gives them: float32 in
+        # 9601, and float32 values beside a float64 x in 2013. WaveView prints each value at
+        # 17 digits, so the cast is exact (its AC values round to the stored ones).
+        traces = [(x.astype(x_dtype), {name: v.astype(value_dtype) for name, v in ys.items()})
                   for x, ys in traces]
-    span = _XSpan(np.dtype(np.float32) if listing.float32 else np.dtype(np.float64))
+    span = _XSpan(x_dtype)
     for x, _ in traces:                     # the whole plot, before sweeps and xrange select
         span.add(x)
     window = xrange
-    if xrange is not None and listing.float32:
+    if xrange is not None and x_dtype == np.float32:
         with np.errstate(over="ignore"):    # as the Python engine compares: float32 x with float32 bounds
             window = (float(np.float32(xrange[0])), float(np.float32(xrange[1])))
     data: Dict[str, list] = {header.names[c]: [] for c in cols}
