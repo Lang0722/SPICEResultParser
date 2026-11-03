@@ -18,9 +18,31 @@ VM. The results are in `docs/superpowers/specs/2026-11-03-waveview-windowed-extr
 The owner skipped the e2e baseline: each WaveView start on the VM took 29 s, so the suite
 would take more than 95 minutes. Tasks 4 and 5 are replaced by
 `docs/superpowers/plans/2026-11-03-waveview-windowed-extract.md`. The owner approved
-it, and it is done on this branch. On the VM, `TestWindow.test_window_past_the_end_and_half_infinite`
-passed, and a windowed export of `rc.ac0` wrote 48 value lines in place of 204. The
-other e2e tests of the plan (about 40 minutes) wait for the owner.
+it, and it is done on this branch. A windowed export of `rc.ac0` on the VM wrote 48 value
+lines in place of 204.
+
+**Status, 2026-11-04:** the unit suite has 559 tests: OK, 1 skipped. These e2e tests of
+the plan passed on the VM:
+
+- `TestWindow`, all 7 tests.
+- `TestParity.test_listing_and_values`, all 18 files.
+- `TestParity.test_xrange_bounds_of_a_9601_file` and `TestParity.test_selection_sweeps_and_xrange`.
+- `TestFailures.test_scan_that_stops_early`.
+
+Six of the `TestWindow` tests ran before commit `b104c0c`, which adds a check for a
+frequency that goes down. Of the six, only `test_window_past_the_end_and_half_infinite`
+reads an AC file, so the check runs only in it. After `b104c0c`, `test_frequency_out_of_order`
+showed that `rc.ac0` still gets the window, but it compared no values of that window. A run
+of `test_window_past_the_end_and_half_infinite` (about 2 minutes) compares them.
+
+On 2026-11-04 the owner chose not to run `TestFailures.test_truncated_files`. It is the
+only e2e test of a file that is not complete, and it takes about 20 minutes:
+
+    SRP_E2E_WAVEVIEW=1 PYTHONPATH=src:test timeout 1800 python3 -m unittest -v \
+      test_waveview_e2e.TestFailures.test_truncated_files
+
+One run of all the e2e tests of the plan takes more than 45 minutes, because each parity
+file takes about 4 WaveView starts.
 
 ## What the owner wants
 
