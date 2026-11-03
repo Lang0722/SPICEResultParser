@@ -122,6 +122,7 @@ TEXT_ENVELOPE_SLICES = 100  # slices of an envelope table, when downsample does 
 TEXT_MAX_CONSTANTS = 20 # traces named on the "constant:" line
 MAX_RUNS = 32           # split a sweep on x restarts only up to this many runs
 MCP_MAX_RANGES = 100    # traces whose [min, max] one JSON result lists; names= narrows to others
+MCP_MAX_TRACES = MCP_MAX_RANGES  # trace names one list_traces result lists; its groups count all
 MCP_MAX_SWEEP_VALUES = 100  # sweeps whose parameter values list_traces lists
 MCP_MAX_SERIES = 200    # (trace, sweep) series one summary may describe: about 30k characters
 
@@ -527,7 +528,8 @@ def format_measures(ms, rows: int = 20, engine: str = "python") -> str:
     return "\n".join(lines)
 
 
-_NAMES_HELP = ("trace names (v_out), raw SPICE names (v(out)) or globs (v_*); case is ignored "
+_NAMES_HELP = ("trace names (v_out), raw SPICE names (v(out)) or globs on either (v_*, "
+               "v(xtop.x1.*; * and ? are the wildcards, brackets match themselves); case is ignored "
                "when nothing matches exactly. For AC, v(out) selects both columns of the pair. An "
                "unknown name fails with near names and the available traces.")
 _PATH_HELP = "Prefer an absolute path: a relative one resolves against the server's working directory."
@@ -569,32 +571,36 @@ def list_traces(
     path: Annotated[str, Field(description="Result file: HSPICE .tr#/.sw#/.ac# (binary 9601/2001/2013 "
                                            "or ASCII) or a Nutmeg .raw (binary or ASCII). " + _PATH_HELP)],
     names: Annotated[Optional[Union[str, List[str]]], Field(
-        description="Traces to list, as extract selects them: " + _NAMES_HELP + " None lists every "
-                    "trace.")] = None,
+        description="Traces to list, as extract selects them: " + _NAMES_HELP + " A key of groups "
+                    "lists the traces of that group. None lists every trace.")] = None,
     plot: Annotated[int, Number, Field(description="Nutmeg only: which plot of the rawfile to describe, "
                                            "0-based (see \"plots\"). Must be 0 for HSPICE files.")] = 0,
     ac_format: Annotated[Literal[tuple(AC_FORMATS)], Field(
         description=_AC_FORMAT_HELP + " Names and ranges follow it, as extract returns them.")] = "magphase",
-    header_only: Annotated[bool, Field(
-        description="True reads only the header: instant on any file size, but without "
-                    "x_range, points, sweep_values, truncated and ranges, and sweeps is the "
-                    "count the header announces. Default False reads the data once.")] = False,
+    header_only: Annotated[Optional[bool], Field(
+        description="None (default): read the data when that is fast, a file of at most 1 GB (WaveView: "
+                    "at most 2 M values, and one trace when each signal has its own x points); else only "
+                    "the header, and a note says so. True: only the header, instant on any file, without "
+                    "x_range, points, sweep_values, truncated and ranges; sweeps is then the count the "
+                    "header announces. False: read the data, whatever its size.")] = None,
     engine: Annotated[Engine, ENGINE_FIELD] = None,
 ) -> dict:
     """List what a simulation result file holds, with the extents to set extract's
-    parameters from. Call this first. It reads the whole file once and keeps none of it.
+    parameters from. Call this first. It reads the data once and keeps none of it; of a
+    file over 1 GB it reads only the header (see header_only).
 
     Result fields:
-    - path, format ("9601", "2001", "ascii", "nutmeg" or "waveview"); analysis: "tr"
-      transient, "sw" dc sweep, "ac"; Nutmeg adds "op", "noise", "other"
+    - path, format ("9601", "2001", "2013", "ascii", "nutmeg" or "waveview"); analysis:
+      "tr" transient, "sw" dc sweep, "ac"; Nutmeg adds "op", "noise", "other"
     - plot, plots: the plot described and the names of all plots (Nutmeg; HSPICE: 0, [])
     - x: the x variable (TIME, HERTZ, the swept source); x_range: its [min, max], for xrange
     - points: total points; sweeps: their count (extract's sweeps takes 0 to sweeps-1);
-      sweep_params, sweep_values: each sweep's parameter values (HSPICE; Nutmeg: none)
+      sweep_params, sweep_values: the parameter values of each sweep (at most 100)
     - truncated: the simulation had not finished writing the file
-    - traces: every other trace name; ranges: each trace's [min, max], NaN skipped
-      (null: no value, or infinite). At most 100 ranges and 100 sweep_values: a "note"
-      then says so.
+    - trace_count: the traces selected; traces: their names, at most 100; ranges: each
+      one's [min, max], NaN skipped (null: no value, or infinite)
+    - groups: when traces is cut, all traces counted by name, as {"v(xtop.x3.*": 300}
+    - note: what was cut or not read, and how to get it
     - engine: the reader used
 
     AC traces are listed as <name>_Mag and <name>_Phase; v(out) selects the pair in
@@ -602,8 +608,8 @@ def list_traces(
     file (.mt#, .ms#, .ma#) use read_measures instead.
     """
     engine = waveview.resolve_engine(engine)
-    info = _json_result({**api.list_traces(path, plot, ac_format, names, header_only=header_only, engine=engine),
-                         "engine": engine})
+    info = _json_result({**api.list_traces(path, plot, ac_format, names, header_only=header_only, engine=engine,
+                                           max_traces=MCP_MAX_TRACES), "engine": engine})
     values = info.get("sweep_values")
     if values is not None and len(values) > MCP_MAX_SWEEP_VALUES:
         info["sweep_values"] = values[:MCP_MAX_SWEEP_VALUES]

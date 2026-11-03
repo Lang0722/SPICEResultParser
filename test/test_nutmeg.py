@@ -862,7 +862,7 @@ class TestApi(unittest.TestCase):
         info = api.list_traces(BIN, plot=1, header_only=True)
         self.assertEqual(info, {
             "path": str(BIN), "format": "nutmeg", "analysis": "ac", "plot": 1, "plots": PLOT_NAMES,
-            "x": "frequency", "sweeps": 1, "sweep_params": [],
+            "x": "frequency", "sweeps": 1, "sweep_params": [], "trace_count": 6,
             "traces": ["v_in_Mag", "v_in_Phase", "v_out_Mag", "v_out_Phase",
                        "i_v1_Mag", "i_v1_Phase"],
         })

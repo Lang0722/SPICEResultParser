@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from . import reduce, waveview
+from . import reader, reduce, waveview
 from .reader import TraceSet, nan_min_max, read_header, read_traces, resolve_columns, scan, validate_range
 from .reduce import check_tolerance
 
@@ -27,43 +27,115 @@ def readers(engine: Optional[str] = None):
     return read_header, read_traces, scan
 
 
+SCAN_MAX_BYTES = 1_000_000_000      # list_traces reads the data of a file up to this size by default: a pass
+                                    # takes about 2 s at the 630 MB/s of a 9601 file (ASCII: about 10 s)
+WAVEVIEW_SCAN_MAX_VALUES = 2_000_000    # and through WaveView up to this many values: about 8 s on the test VM
+
+
 def list_traces(path, plot: int = 0, ac_format: str = "magphase", names=None,
-                header_only: bool = False, engine: Optional[str] = None) -> dict:
+                header_only: Optional[bool] = None, engine: Optional[str] = None,
+                max_traces: Optional[int] = None) -> dict:
     """What a result file holds, with the extents to choose extract's parameters from.
 
     Keys, in order: path, format, analysis, plot, plots, x, x_range, points, sweeps,
-    sweep_params, sweep_values, truncated, traces, ranges. x_range, points and the
-    per-trace ranges ([min, max], NaN skipped; null when there is no value) cover the
-    whole plot, every sweep.
+    sweep_params, sweep_values, truncated, trace_count, groups, traces, ranges, note.
+    x_range, points and the per-trace ranges ([min, max], NaN skipped; null when there
+    is no value) cover the whole plot, every sweep.
 
     They come from one streaming pass over the data (reader.scan): it holds no trace in
-    memory but reads the whole file. header_only=True reads the header alone, which is
-    instant on any file: it leaves out x_range, points, sweep_values, truncated and
-    ranges, and sweeps is then the count the header announces.
+    memory but reads the whole file, whatever names selects. header_only=True reads the
+    header alone, which is instant on any file: it leaves out x_range, points,
+    sweep_values, truncated and ranges, and sweeps is then the count the header
+    announces. header_only=None (the default) reads the data when that is fast: a file
+    of at most SCAN_MAX_BYTES, and through WaveView at most WAVEVIEW_SCAN_MAX_VALUES
+    values. Else it reads the header alone, and a note says why and how to read the data.
 
     names narrows traces and ranges, as extract's names do (names, raw names, globs).
+    trace_count is the number of traces that it selects. max_traces lists at most that
+    many of them in traces (and ranges): groups then counts all of them by name prefix
+    (reader.name_groups, in at most max_traces and GROUPS_MAX keys), as requests for
+    names, and a note says so.
+
     plot selects one plot of a Nutmeg rawfile; plots lists every plot in it (HSPICE: []).
     ac_format names the columns of complex (AC) variables, and is what they are ranged in.
     engine selects the reader, as in extract. The WaveView engine reports format
-    "waveview"; it has no streaming pass, so it reads every point of the selected traces
+    "waveview"; it has no streaming pass, so it reads every point of the listed traces
     into memory to range them (header_only=True runs only WaveView's listing).
     """
+    if max_traces is not None:
+        max_traces = _count(max_traces, "max_traces")
     read_head, _, scan_plot = readers(engine)
-    if header_only:
+    through_wv = waveview.resolve_engine(engine) == "waveview"
+    with waveview.listing_memo():           # WaveView lists the file once for the header, the cost and the scan
         h = read_head(path, plot, ac_format)
-        traces = [h.names[c] for c in resolve_columns(h, names) if c]
-        return {"path": h.path, "format": h.version, "analysis": h.analysis, "plot": h.plot,
-                "plots": h.plot_names, "x": h.x_name, "sweeps": max(1, h.sweep_count_hint),
-                "sweep_params": h.sweep_params, "traces": traces}
-    s = scan_plot(path, plot, ac_format, names)
-    h = s.header
-    return {
-        "path": h.path, "format": h.version, "analysis": h.analysis, "plot": h.plot,
-        "plots": h.plot_names, "x": h.x_name, "x_range": _json_range(s.x_range), "points": s.points,
-        "sweeps": len(s.sweep_points), "sweep_params": h.sweep_params,
-        "sweep_values": _json_sweep_values(s.sweep_values, h.dtype), "truncated": s.truncated,
-        "traces": list(s.ranges), "ranges": {name: _json_range(b) for name, b in s.ranges.items()},
-    }
+        cols = resolve_columns(h, names)[1:]
+        shown = cols if max_traces is None else cols[:max_traces]
+        notes = []
+        if header_only is None:
+            why = _why_header_only(path, h, shown, through_wv, plot, ac_format)
+            header_only = why is not None
+            notes += [why] if why else []
+        if not header_only:
+            s = scan_plot(path, plot, ac_format, names if len(shown) == len(cols) else [h.names[c] for c in shown])
+    result = {"path": h.path, "format": h.version, "analysis": h.analysis, "plot": h.plot,
+              "plots": h.plot_names, "x": h.x_name}
+    if header_only:
+        result.update(sweeps=max(1, h.sweep_count_hint), sweep_params=h.sweep_params)
+    else:
+        result.update(x_range=_json_range(s.x_range), points=s.points, sweeps=len(s.sweep_points),
+                      sweep_params=h.sweep_params, sweep_values=_json_sweep_values(s.sweep_values, h.dtype),
+                      truncated=s.truncated)
+    result["trace_count"] = len(cols)
+    if len(shown) < len(cols):
+        result["groups"] = reader.name_groups([h.col_raw_names[c] for c in cols], min(reader.GROUPS_MAX, len(shown)))
+        notes.append(f"traces lists the first {len(shown)} of {len(cols)} traces, and groups counts them all by "
+                     f"name: pass a key of groups as names (to list_traces or extract) for its traces")
+    result["traces"] = [h.names[c] for c in shown]
+    if not header_only:
+        result["ranges"] = {name: _json_range(b) for name, b in s.ranges.items()}
+    if notes:
+        result["note"] = "; ".join(notes)
+    return result
+
+
+def _count(value, name: str) -> int:
+    """value as an int of at least 1, else a ValueError that names the parameter."""
+    try:
+        if isinstance(value, bool):
+            raise TypeError
+        value = operator.index(value)
+    except TypeError:
+        raise ValueError(f"{name} must be an integer, not {value!r}") from None
+    if value < 1:
+        raise ValueError(f"{name} must be at least 1")
+    return value
+
+
+def _size(n: int) -> str:
+    for unit, scale in (("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):
+        if n >= scale:
+            return f"{n / scale:.3g} {unit}"
+    return f"{n} bytes"
+
+
+def _why_header_only(path, header, cols: List[int], through_wv: bool, plot, ac_format: str) -> Optional[str]:
+    """Why list_traces reads only the header by default (see list_traces), or None to read the data."""
+    if through_wv:
+        signals, values, shared_x = waveview.scan_cost(path, plot, ac_format, [header.names[c] for c in cols])
+        if signals > 1 and not shared_x:
+            return ("list_traces read only the WaveView listing: in this file each signal has its own x points, "
+                    "and WaveView ranges one signal at a time (names with one trace)")
+        if values > WAVEVIEW_SCAN_MAX_VALUES:
+            return (f"list_traces read only the WaveView listing: the ranges of these {len(cols)} traces take "
+                    f"{values:,} values from WaveView, more than the {WAVEVIEW_SCAN_MAX_VALUES:,} that it reads by "
+                    f"default; header_only=False reads them, and names with fewer traces takes fewer")
+        return None
+    size = os.path.getsize(path)
+    if size > SCAN_MAX_BYTES:
+        return (f"list_traces read only the header: the file has {_size(size)}, more than the {_size(SCAN_MAX_BYTES)} "
+                f"that it reads by default; header_only=False reads it all for x_range, points, sweep_values, "
+                f"truncated and ranges (names does not make that read shorter)")
+    return None
 
 
 def value_eps(ts: TraceSet) -> float:

@@ -1,11 +1,15 @@
 """Streaming, column-selecting reader for HSPICE binary and ASCII result files."""
 from __future__ import annotations
 
+import bisect
+import collections
 import difflib
-import fnmatch
+import functools
+import itertools
 import math
 import operator
 import os
+import re
 import struct
 import warnings
 from dataclasses import dataclass, field
@@ -605,70 +609,295 @@ def name_list(names, kind: str) -> List[str]:
     return items
 
 
-def _lookup_ignoring_case(req: str, names: Sequence[str], raw_names: Sequence[str]) -> List[int]:
-    """Columns that request req selects when case is ignored: an exact name, a raw name
-    with or without its closing paren, then a glob on names."""
-    req, names, raw_names = req.lower(), [n.lower() for n in names], [r.lower() for r in raw_names]
-    hits = [i for i, n in enumerate(names) if n == req] or [i for i, r in enumerate(raw_names) if r == req]
-    if not hits and req.endswith(")"):
-        hits = [i for i, r in enumerate(raw_names) if r == req[:-1]]
-    if not hits:
-        hits = [i for i, n in enumerate(names) if fnmatch.fnmatchcase(n, req)]
-    return hits
+_WILDCARD = re.compile(r"[*?]")
+_RAW_ONLY = re.compile(r"[(.:]")      # characters that only raw names hold
+_BOUNDARY = re.compile(r"[(.:/]")       # where a name branches: after its function (v(, i1() and at each level of
+                                        # its hierarchy (x1.x2.n1; LTspice writes x1:n1, some tools x1/n1)
+GROUPS_MAX = 50                         # groups that name_groups gives by default
+
+
+def _closed(name: str) -> str:
+    """name with the closing parens that it lacks: HSPICE writes v(out, a Nutmeg file v(out)."""
+    missing = name.count("(") - name.count(")")
+    return name + ")" * missing if missing > 0 else name
+
+
+def _pattern(glob: str) -> str:
+    return "".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in glob)
+
+
+@functools.lru_cache(maxsize=256)
+def _glob(glob: str):
+    """The fullmatch of a trace glob on sanitized names: * matches any characters, ? one
+    character, and every other character itself. There are no [...] classes, as fnmatch
+    has: names often hold brackets, such as the bus bit v(d[3]) or the array x1[0].n1."""
+    return re.compile(_pattern(glob), re.DOTALL).fullmatch
+
+
+@functools.lru_cache(maxsize=256)
+def _raw_glob(glob: str):
+    """The fullmatch of a trace glob on raw names, as _glob, with or without the closing
+    parens: v(x1.* and v(x1.*) both find v(x1.n1 (HSPICE) and v(x1.n1) (Nutmeg)."""
+    return re.compile(_pattern(glob.rstrip(")")) + r"\)*", re.DOTALL).fullmatch
+
+
+class _Lookup:
+    """The columns that a request selects (see resolve_columns), in names and raw names as
+    given (the caller folds their case). The tables are built on first use: a header can
+    name a million columns."""
+
+    def __init__(self, names: Sequence[str], raw_names: Sequence[str]):
+        self.names, self.raw_names = names, raw_names
+        self._tables: Dict[str, Tuple[Dict[str, int], Dict[str, List[int]]]] = {}
+
+    def _find(self, kind: str, key: str) -> List[int]:
+        """The columns whose name (kind "name") or raw name ("raw") is key."""
+        if kind not in self._tables:
+            keys = self.names if kind == "name" else self.raw_names
+            first = dict(zip(reversed(keys), range(len(keys) - 1, -1, -1)))     # each key's first column
+            more: Dict[str, List[int]] = {}
+            if len(first) < len(keys):                                          # AC repeats each complex name
+                for i, k in enumerate(keys):
+                    if first[k] != i:
+                        more.setdefault(k, []).append(i)
+            self._tables[kind] = first, more
+        first, more = self._tables[kind]
+        return [first[key], *more.get(key, ())] if key in first else []
+
+    def select(self, req: str) -> List[int]:
+        hits = self._find("name", req) or self._find("raw", req)
+        if not hits:
+            hits = self._find("raw", req[:-1]) if req.endswith(")") else self._find("raw", req + ")")
+        if hits or not _WILDCARD.search(req):
+            return hits
+        hits = []
+        if not _RAW_ONLY.search(req):           # a sanitized name has no ( . or :
+            match = _glob(req)
+            hits = [i for i, n in enumerate(self.names) if match(n)]
+        if not hits:
+            match = _raw_glob(req)
+            hits = [i for i, r in enumerate(self.raw_names) if match(r)]
+        return hits
+
+
+def _branch(name: str, start: int) -> str:
+    """The part of name from `start` to the end of its level: up to and with the next
+    _BOUNDARY character (x1. in v(x1.n1 from 2), else the rest of the name (a leaf)."""
+    end = _BOUNDARY.search(name, start)
+    return name[start:end.end()] if end else name[start:]
+
+
+def _group_key(prefix: str, branch: str) -> str:
+    """A request for the names of a branch: a glob for a level (v(x1.*), the name for a leaf."""
+    return prefix + branch + ("*" if branch[-1:] in "(.:/" else "")
+
+
+def name_groups(raw_names: Sequence[str], limit: int = GROUPS_MAX) -> Dict[str, int]:
+    """Counts of names by prefix: {v(xtop.xcore0.*: 300, v(xtop.xcore1.*: 300, v(out: 1}.
+
+    At most `limit` keys (at least 2), in the order of the names. Together they select
+    every name once. Each key is a request that resolve_columns takes: a glob selects the
+    names that start with its prefix, and a raw name itself. For AC a count is of columns,
+    as raw_names repeats each complex name.
+
+    The names split where they branch: at a level of their hierarchy (after v( or i1(,
+    then after x1., x1.x2.: see _BOUNDARY), below the part that they all share. Then the
+    largest groups split again, all groups of the same count together, while the limit
+    allows: v(* becomes v(xtop.xcore0.* to v(xtop.xcore9.* and v(out. A level of more
+    branches than the limit allows splits by characters instead (an instance array:
+    v(xtop.xbit1* holds xbit1., xbit10. to xbit19. and so on). A group whose names have
+    no level below its own splits only when it is the only group (a flat list of names).
+    """
+    limit = max(2, limit)
+    counts = collections.Counter(raw_names)     # in the order of the names
+    if not counts:
+        return {}
+    unique = list(counts)
+    by_rank = sorted(range(len(unique)), key=unique.__getitem__)
+    ranked = [unique[i] for i in by_rank]
+    totals = [0, *itertools.accumulate(counts[name] for name in ranked)]
+
+    def starting(text: str, lo: int, hi: int) -> int:
+        """The end of the names in ranked[lo:hi] that start with text (they come first there)."""
+        return bisect.bisect_right(ranked, text + "\U0010ffff", lo, hi)
+
+    def level(lo: int, hi: int) -> int:
+        """Where the level of ranked[lo:hi] starts: after the last _BOUNDARY of the start that
+        its names share."""
+        stem = os.path.commonprefix([ranked[lo], ranked[hi - 1]])
+        return max((m.end() for m in _BOUNDARY.finditer(stem)), default=0)
+
+    def by_level(lo: int, hi: int, room: int) -> Optional[List[Tuple[int, int]]]:
+        """The branches of ranked[lo:hi] at its level; None when there are more than room."""
+        cut = level(lo, hi)
+        parts, i = [], lo
+        while i < hi:
+            if len(parts) == room:
+                return None
+            branch = _branch(ranked[i], cut)
+            j = starting(ranked[i][:cut] + branch, i, hi) if branch[-1:] in "(.:/" else i + 1
+            parts.append((i, j))
+            i = j
+        return parts
+
+    def by_character(lo: int, hi: int) -> List[Tuple[int, int]]:
+        """ranked[lo:hi] split by the character after the start that its names share."""
+        stem = os.path.commonprefix([ranked[lo], ranked[hi - 1]])
+        parts, i = [], lo
+        if ranked[i] == stem:                   # the name that the others extend
+            parts.append((i, i + 1))
+            i += 1
+        while i < hi:
+            j = starting(stem + ranked[i][len(stem)], i, hi)
+            parts.append((i, j))
+            i = j
+        return parts
+
+    def nested(lo: int, hi: int, cut: int) -> bool:
+        """Whether a name of ranked[lo:hi] has a level below `cut`."""
+        return any(_BOUNDARY.search(ranked[i], cut) for i in range(lo, hi))
+
+    groups = [(0, len(ranked))]
+    while True:
+        size = {g: totals[g[1]] - totals[g[0]] for g in groups if g[1] - g[0] > 1}
+        if not size:
+            break
+        top = max(size.values())
+        tied = [g for g in groups if size.get(g) == top]
+        if len(groups) > 1 and not all(nested(*g, level(*g)) for g in tied):
+            break                               # names without levels below: the group says enough
+        room = limit - (len(groups) - len(tied))
+        new: List[Tuple[int, int]] = []
+        for g in tied:
+            parts = by_level(*g, room - len(new))
+            if parts is None:
+                break
+            new += parts
+        else:
+            groups = [g for g in groups if g not in tied] + new
+            continue
+        new = []
+        for g in tied:
+            new += by_character(*g)
+            if len(new) > room:
+                break
+        if len(new) > room:
+            break
+        groups = [g for g in groups if g not in tied] + new
+    keyed = [(min(by_rank[lo:hi]), _range_key(ranked, lo, hi, starting), totals[hi] - totals[lo])
+             for lo, hi in groups]
+    return {key: n for _, key, n in sorted(keyed)}
+
+
+def _range_key(ranked: List[str], lo: int, hi: int, starting) -> str:
+    """The request for the names ranked[lo:hi], which are all the names with some prefix:
+    the name itself for one, else the shortest glob that selects just them, cut at a level
+    when it can be (v(xtop.xbit0.* rather than v(xtop.xbit0.n*)."""
+    if hi - lo == 1:
+        return ranked[lo]
+    stem = os.path.commonprefix([ranked[lo], ranked[hi - 1]])
+    cut = max((m.end() for m in _BOUNDARY.finditer(stem)), default=0)
+    level = stem[:cut]
+    if bisect.bisect_left(ranked, level, 0, lo) == lo and starting(level, hi, len(ranked)) == hi:
+        return level + "*"
+    return stem + "*"
+
+
+def _near_branches(req: str, raw_names: Sequence[str]) -> List[str]:
+    """For a request in the file's form, such as v(xtop.xcor3.*: the branches near it at the
+    deepest level of the request that the file has ([v(xtop.xcore3.*]). Case is ignored.
+    [] for a request without levels, such as a sanitized name."""
+    literal = _WILDCARD.split(req, 1)[0].lower()
+    cuts = [m.end() for m in _BOUNDARY.finditer(literal)]
+    if not cuts:
+        return []
+    lowered = [r.lower() for r in raw_names]
+    under: List[int] = []
+    for cut in reversed([0] + cuts):
+        level = literal[:cut]
+        under = [i for i, r in enumerate(lowered) if r.startswith(level)]
+        if under:
+            break
+    wanted = _branch(literal, cut)
+    if not wanted:
+        return []
+    near: Dict[str, str] = {}
+    for i in under:
+        branch = _branch(lowered[i], cut)
+        if branch not in near:
+            near[branch] = _group_key(raw_names[i][:cut], raw_names[i][cut:cut + len(branch)])
+    return [near[b] for b in _closest(wanted, list(near))]
+
+
+def _closest(word: str, candidates: List[str], n: int = 3, cutoff: float = 0.6) -> List[str]:
+    """The candidates closest to word, as difflib.get_close_matches scores them: at most n,
+    in the order of candidates, and none much farther than the best (xcore3. for xcor3.,
+    not also xcore9.)."""
+    matcher = difflib.SequenceMatcher()
+    matcher.set_seq2(word)
+    scores = []
+    for candidate in candidates:
+        matcher.set_seq1(candidate)
+        if matcher.real_quick_ratio() >= cutoff and matcher.quick_ratio() >= cutoff:
+            scores.append(matcher.ratio())
+        else:
+            scores.append(0.0)
+    best = max(scores, default=0.0)
+    return [c for c, score in zip(candidates, scores) if score >= max(cutoff, best - 0.05)][:n]
 
 
 def _unknown_trace(req: str, header: Header) -> str:
     """The error for a trace request that matches nothing: what was probably meant, then
-    the traces there are."""
+    the traces there are (and their name_groups, when there are many)."""
     names = header.names
     lower = {n.lower(): n for n in reversed(names)}
     key = parse_var_name(req.replace(")", "")).lower()
     message = f"unknown trace {req!r}."
     first, second = (f"{key}_{s}".lower() for s in AC_FORMATS[header.ac_format])
+    near = []
     if first in lower and second in lower:
-        raw = header.col_raw_names[names.index(lower[first])]
-        raw += ")" if raw.count("(") > raw.count(")") else ""
+        raw = _closed(header.col_raw_names[names.index(lower[first])])
         message = (f"unknown trace {req!r}: complex traces are split in two, {lower[first]} and "
                    f"{lower[second]}; {raw!r} or {key + '*'!r} selects both.")
     else:
-        close = set(difflib.get_close_matches(key, list(lower), n=5, cutoff=0.6))
-        if close:
-            near = ", ".join(n for n in names if n.lower() in close)       # in file order
-            message = f"unknown trace {req!r}; did you mean {near}?"
+        near = _near_branches(req, header.col_raw_names)
+        if not near:
+            close = set(difflib.get_close_matches(key, list(lower), n=5, cutoff=0.6))
+            near = [n for n in names if n.lower() in close]        # in file order
+        if near:
+            message = f"unknown trace {req!r}; did you mean {', '.join(near)}?"
     shown = ", ".join(names[:20])
     if len(names) > 20:
-        shown += f", ... and {len(names) - 20} more"
+        groups = name_groups(header.col_raw_names[1:], 20)
+        shown += (f", ... and {len(names) - 20} more. By name: "
+                  + ", ".join(f"{k} ({n})" for k, n in groups.items()))
     return f"{message} Available traces: {shown}"
 
 
 def resolve_columns(header: Header, names) -> List[int]:
     """Column indices to keep, sorted, always including column 0.
 
-    Each entry of names matches, in order of preference: an exact sanitized name
-    (v_vo), a raw name with optional closing paren (v(vo) or v(vo, which for AC
-    selects both _Mag and _Phase; HSPICE raw names have no closing paren, Nutmeg's
-    do), or an fnmatch glob on sanitized names (v_*). An entry that matches nothing
-    is tried again ignoring case, as SPICE itself does (V(OUT) finds v(out)); one that
-    still matches nothing raises a ValueError that suggests near names.
+    Each entry of names matches, in order of preference: an exact sanitized name (v_vo),
+    a raw name with or without its closing paren (v(vo) or v(vo, which for AC selects
+    both _Mag and _Phase; HSPICE raw names have no closing paren, Nutmeg's do), a glob on
+    sanitized names (v_*), then a glob on raw names (v(xtop.xcore3.*, with or without the
+    closing paren). A glob has two wildcards: * (any characters) and ? (one character).
+    Brackets are no wildcards: v(d[*] finds the bus bits v(d[0] and v(d[1]. An entry that
+    matches nothing is tried again ignoring case, as SPICE itself does (V(OUT) finds
+    v(out)); one that still matches nothing raises a ValueError that suggests near names.
     """
     if names is None:
         return list(range(header.ncols))
     names = name_list(names, "trace")
-    by_name: Dict[str, List[int]] = {}
-    for i, n in enumerate(header.names):
-        by_name.setdefault(n, []).append(i)
-    by_raw: Dict[str, List[int]] = {}
-    for i, raw in enumerate(header.col_raw_names):
-        by_raw.setdefault(raw, []).append(i)
+    exact = _Lookup(header.names, header.col_raw_names)
+    folded: Optional[_Lookup] = None
     chosen = {0}
     for req in names:
-        hits = by_name.get(req) or by_raw.get(req)
-        if not hits and req.endswith(")"):
-            hits = by_raw.get(req[:-1])
+        hits = exact.select(req)
         if not hits:
-            hits = [i for i, n in enumerate(header.names) if fnmatch.fnmatchcase(n, req)]
-        if not hits:
-            hits = _lookup_ignoring_case(req, header.names, header.col_raw_names)
+            if folded is None:
+                folded = _Lookup([n.lower() for n in header.names], [r.lower() for r in header.col_raw_names])
+            hits = folded.select(req.lower())
         if not hits:
             raise ValueError(_unknown_trace(req, header))
         chosen.update(hits)

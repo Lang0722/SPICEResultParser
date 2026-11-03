@@ -724,6 +724,58 @@ class TestSelection(unittest.TestCase):
         ts = read_traces(HERE / "test_9601.ac0", ["v(vo)"])
         self.assertEqual(ts.selected, ["HERTZ", "v_vo_Mag", "v_vo_Phase"])
 
+    def write(self, name, raw_names):
+        path = self.dir / name
+        data = np.arange(3.0 * len(raw_names)).reshape(3, -1)
+        fixtures.write_binary(path, "2001", raw_names, [1] * len(raw_names), [([], data)])
+        return path
+
+    def test_raw_globs_keep_to_their_level(self):
+        # "." and "_" both sanitize to "_": a glob on raw names keeps to its level, one on
+        # sanitized names does not.
+        path = self.write("levels.tr0", ["TIME", "v(x1.a.n1", "v(x1.a.n2", "v(x1.a_b.n1", "i(x1.a.m1", "v(x2.a.n1"])
+        def selected(req):
+            return read_traces(path, [req]).selected[1:]
+        for req in ("v(x1.a.*", "v(x1.a.*)", "V(X1.A.*"):                  # paren or not; case folded
+            self.assertEqual(selected(req), ["v_x1_a_n1", "v_x1_a_n2"], req)
+        self.assertEqual(selected("v_x1_a_*"), ["v_x1_a_n1", "v_x1_a_n2", "v_x1_a_b_n1"])
+        self.assertEqual(selected("*(x1.a.*"), ["v_x1_a_n1", "v_x1_a_n2", "i_x1_a_m1"])
+        self.assertEqual(selected("v(x?.a.n1"), ["v_x1_a_n1", "v_x2_a_n1"])
+
+    def test_brackets_in_a_glob_match_themselves(self):
+        # Bus bits: fnmatch would read [*] as a class that holds "*".
+        path = self.write("bus.tr0", ["TIME", "v(d[0]", "v(d[1]", "v(d0", "v(x[2].n1"])
+        def selected(req):
+            return read_traces(path, [req]).selected[1:]
+        self.assertEqual(selected("v(d[*]"), ["v_d[0]", "v_d[1]"])
+        self.assertEqual(selected("v_d[?]"), ["v_d[0]", "v_d[1]"])
+        self.assertEqual(selected("v(d[1])"), ["v_d[1]"])
+        self.assertEqual(selected("v(x[2].*"), ["v_x[2]_n1"])
+
+    def test_nutmeg_names_with_or_without_the_closing_paren(self):
+        # HSPICE writes v(out and Nutmeg v(out): either form finds both, in a glob too.
+        nutmeg = HERE / "nutmeg_rc_bin.raw"
+        for req in ("v(out", "v(out)", "V(OUT"):
+            self.assertEqual(read_traces(nutmeg, [req]).selected, ["time", "v_out"], req)
+        for req in ("v(*", "v(*)"):
+            self.assertEqual(read_traces(nutmeg, [req]).selected, ["time", "v_in", "v_out"], req)
+
+    def test_an_unknown_level_suggests_the_near_branch(self):
+        names = ["TIME"] + [f"v(xtop.xcore{c}.n{i}" for c in range(3) for i in range(10)] + ["v(out"]
+        path = self.write("chip.tr0", names)
+        with self.assertRaisesRegex(ValueError, r"^unknown trace 'v\(xtop\.xcor1\.\*'; did you mean "
+                                                r"v\(xtop\.xcore1\.\*\? Available"):
+            read_traces(path, ["v(xtop.xcor1.*"])
+        with self.assertRaisesRegex(ValueError, r"did you mean v\(xtop\.xcore2\.n7\? "):
+            read_traces(path, ["V(XTOP.XCORE2.N77"])                     # the case of the file
+        with self.assertRaisesRegex(ValueError, r"did you mean v\(xtop\.\*\? "):
+            read_traces(path, ["v(xtopp.xcore1.*"])
+        # After the first 20 traces of a larger file, the error counts them all by name.
+        with self.assertRaisesRegex(ValueError, r"\.\.\. and 12 more\. By name: v\(xtop\.xcore0\.\* \(10\), "
+                                                r"v\(xtop\.xcore1\.\* \(10\), v\(xtop\.xcore2\.\* \(10\), "
+                                                r"v\(out \(1\)$"):
+            read_traces(path, ["nope"])
+
 
     def test_memory_stays_near_selected_size(self):
         rng = np.random.default_rng(6)
@@ -746,6 +798,109 @@ class TestSelection(unittest.TestCase):
         self.assertLess(peak, selected_bytes + 3 * chunk_bytes + 1_000_000, f"peak {peak} bytes")
         self.assertEqual(ts.selected, ["TIME", "v_7"])
         np.testing.assert_array_equal(ts.data["v_7"][0], expected)
+
+class TestNameGroups(unittest.TestCase):
+    """reader.name_groups: counts of names by prefix, as requests that select them."""
+
+    @staticmethod
+    def header(raw_names, ac=False):
+        """A header whose traces have these raw names (ac: two columns each), x first."""
+        names, col_raw = ["x"], ["x"]
+        for raw in raw_names:
+            base = reader.parse_var_name(raw.replace(")", ""))
+            names += reader.ac_names(base, "magphase") if ac else [base]
+            col_raw += [raw, raw] if ac else [raw]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)             # names that sanitize alike
+            names = reader._uniquify("test", names)
+        return reader.Header(path="test", is_binary=True, version="2001", analysis="ac" if ac else "tr",
+                             ncols=len(names), nsweepparam=0, sweep_count_hint=0, x_name="x", names=names,
+                             raw_names=["x", *raw_names], col_raw_names=col_raw, type_codes=[], sweep_params=[],
+                             ncomplex=len(raw_names) if ac else 0)
+
+    def assert_partition(self, raw_names, limit=reader.GROUPS_MAX, ac=False):
+        """Each key selects its count of columns, and the keys select every column once."""
+        header = self.header(raw_names, ac)
+        groups = reader.name_groups(header.col_raw_names[1:], limit)
+        self.assertLessEqual(len(groups), max(2, limit))
+        seen = set()
+        for key, count in groups.items():
+            cols = set(reader.resolve_columns(header, key)[1:])
+            self.assertEqual(len(cols), count, key)
+            self.assertFalse(cols & seen, key)
+            seen |= cols
+        self.assertEqual(seen, set(range(1, header.ncols)))
+        return groups
+
+    def test_the_keys_select_every_name_once(self):
+        cores = [f"v(xtop.xcore{c}.n{i}" for c in range(10) for i in range(30)] + ["v(out", "i(vdd"]
+        functions = [f"{f}(xtop.x{c}.m{i}" for f in ("v", "i1", "i2", "p", "vdb") for c in range(4) for i in range(8)]
+        cases = {
+            "cores": cores,
+            "functions": functions,
+            "flat": [f"v(n{i}" for i in range(500)],
+            "array": [f"v(xtop.xbit{i}.n{j}" for i in range(200) for j in range(3)] + ["v(xtop.xctl.en"],
+            "bare": ["vo", "xt.vo", "outnoise", "top.u1.clk", "top.u1.d", "top/u2/d", "top/u2/q"]
+                    + [f"top.u3.s{i}" for i in range(60)],
+            "ltspice": [f"V(xu{u}:n{i:03d}" for u in range(5) for i in range(20)] + ["I(R1", "V(n002"],
+            "bus": [f"v(d[{i}]" for i in range(100)] + [f"v(x[{k}].n1" for k in range(4)],
+            "nutmeg": [f"v(x{k}.n{i})" for k in range(6) for i in range(12)] + ["i(v1)"],
+            "cases": ["v(a", "V(B", "v(c.d", "V(C.E"],
+        }
+        for name, raw in cases.items():
+            for limit in (2, 10, 50):
+                with self.subTest(name, limit=limit):
+                    self.assert_partition(raw, limit)
+        with self.subTest("ac"):
+            groups = self.assert_partition(cores, ac=True)
+            self.assertEqual(groups["v(xtop.xcore0.*"], 60)            # a count is of columns
+
+    def test_the_groups_follow_the_hierarchy(self):
+        # Below the part that all names share (v(xtop.), the largest groups split while
+        # the limit allows.
+        cores = [f"v(xtop.xcore{c}.n{i}" for c in range(10) for i in range(300)] + ["v(out", "i(vdd"]
+        self.assertEqual(reader.name_groups(cores), {**{f"v(xtop.xcore{c}.*": 300 for c in range(10)},
+                                                      "v(out": 1, "i(vdd": 1})
+        self.assertEqual(reader.name_groups(cores, 10), {"v(xtop.*": 3000, "v(out": 1, "i(vdd": 1})
+        # A group of names without levels below it does not split into names.
+        small = [f"v(xtop.xcore{c}.n{i}" for c in range(2) for i in range(3)] + [f"i(m{i}" for i in range(4)]
+        self.assertEqual(reader.name_groups(small), {"v(xtop.xcore0.*": 3, "v(xtop.xcore1.*": 3, "i(*": 4})
+
+    def test_groups_of_one_count_split_together(self):
+        # Three like cores stay three groups: splitting one by characters and not the
+        # others would hide that they are alike.
+        cores = [f"v(xtop.xcore{c}.n{i}" for c in range(3) for i in range(300)] + ["v(out"]
+        self.assertEqual(reader.name_groups(cores), {"v(xtop.xcore0.*": 300, "v(xtop.xcore1.*": 300,
+                                                      "v(xtop.xcore2.*": 300, "v(out": 1})
+
+    def test_a_wide_level_splits_by_characters(self):
+        # 1000 instances do not fit: their names split by characters, a level when it can.
+        array = [f"v(xtop.xbit{i}.n{j}" for i in range(1000) for j in range(6)] + ["v(xtop.xctl.en"]
+        groups = reader.name_groups(array)
+        self.assertEqual(list(groups)[:3], ["v(xtop.xbit0.*", "v(xtop.xbit1*", "v(xtop.xbit2*"])
+        self.assertEqual((groups["v(xtop.xbit0.*"], groups["v(xtop.xbit1*"]), (6, 666))
+        inner = reader.name_groups([n for n in array if n.startswith("v(xtop.xbit1")])
+        self.assertEqual(list(inner)[:3], ["v(xtop.xbit1.*", "v(xtop.xbit10*", "v(xtop.xbit11*"])
+        # A flat list is the only group, so it splits by characters too.
+        flat = reader.name_groups([f"v(n{i}" for i in range(3000)])
+        self.assertEqual(list(flat.items())[:3], [("v(n0", 1), ("v(n1*", 1111), ("v(n2*", 1111)])
+        # A wide level of leaves beside other groups does not.
+        leaves = [f"v(xtop.n{i}" for i in range(300)] + ["i(vdd"]
+        self.assertEqual(reader.name_groups(leaves), {"v(xtop.*": 300, "i(vdd": 1})
+
+    def test_the_groups_keep_the_order_of_the_names(self):
+        raw = ["v(zz.n1", "v(aa.n1", "v(zz.n2", "v(mm.n1", "v(aa.n2", "v(mm.n2"]
+        self.assertEqual(reader.name_groups(raw), {"v(zz.*": 2, "v(aa.*": 2, "v(mm.*": 2})
+        self.assertEqual(reader.name_groups([]), {})
+        self.assertEqual(reader.name_groups(["v(a"]), {"v(a": 1})
+
+    def test_groups_are_fast_for_many_names(self):
+        raw = [f"v(xtop.xcore{c}.xblk{c % 7}.n{i}" for c in range(100) for i in range(2000)]
+        start = time.perf_counter()
+        groups = reader.name_groups(raw)
+        self.assertLess(time.perf_counter() - start, 2.0)
+        self.assertEqual(sum(groups.values()), len(raw))
+
 
 AC_NAMES = ["HERTZ", "v(a", "i(b"]
 AC_CODES = [2, 1, 8]
@@ -1064,7 +1219,7 @@ class TestApi(unittest.TestCase):
         self.assertEqual(info, {
             "path": str(HERE / "test_9601.tr0"), "format": "9601", "analysis": "tr", "plot": 0, "plots": [],
             "x": "TIME", "x_range": [0.0, 0.01], "points": 2605, "sweeps": 1, "sweep_params": [],
-            "sweep_values": [[]], "truncated": False, "traces": ["v_0", "v_vo", "v_vs", "i_vs"],
+            "sweep_values": [[]], "truncated": False, "trace_count": 4, "traces": ["v_0", "v_vo", "v_vs", "i_vs"],
             "ranges": {"v_0": [0.0, 0.0], "v_vo": [0.0, 1.8477405e-05], "v_vs": [0.0, 5.0],
                        "i_vs": [-0.005, 1.8477404e-08]},
         })
@@ -1082,7 +1237,7 @@ class TestApi(unittest.TestCase):
     def test_list_traces_header_only(self):
         info = api.list_traces(self.path, header_only=True)
         self.assertEqual(list(info), ["path", "format", "analysis", "plot", "plots", "x", "sweeps",
-                                      "sweep_params", "traces"])
+                                      "sweep_params", "trace_count", "traces"])
         self.assertEqual(info["sweeps"], 3)                                 # what the header announces
         self.assertEqual(api.list_traces(HERE / "test_9601.tr0", header_only=True)["sweeps"], 1)
         with mock.patch.object(api, "scan", side_effect=AssertionError("data read")):
@@ -1102,6 +1257,75 @@ class TestApi(unittest.TestCase):
         with mock.patch.object(nutmeg, "_read_data", side_effect=AssertionError("data read")):
             with self.assertRaisesRegex(ValueError, "did you mean v_out"):
                 api.list_traces(HERE / "nutmeg_rc_bin.raw", names=["v_outt"])
+
+    def chip(self):
+        """A transient file of three cores of 40 nodes and v(out: 121 traces."""
+        names = ["TIME"] + [f"v(xtop.xcore{c}.n{i}" for c in range(3) for i in range(40)] + ["v(out"]
+        data = np.random.default_rng(8).uniform(-1, 1, (6, len(names)))
+        data[:, 0] = np.arange(6) * 1e-9
+        path = self.dir / "chip.tr0"
+        fixtures.write_binary(path, "2001", names, [1] * len(names), [([], data)])
+        return path
+
+    def test_list_traces_lists_at_most_max_traces(self):
+        path = self.chip()
+        whole = api.list_traces(path)
+        self.assertNotIn("groups", whole)                               # no limit: every name, no groups
+        info = api.list_traces(path, max_traces=50)
+        self.assertEqual(list(info), ["path", "format", "analysis", "plot", "plots", "x", "x_range", "points",
+                                      "sweeps", "sweep_params", "sweep_values", "truncated", "trace_count",
+                                      "groups", "traces", "ranges", "note"])
+        self.assertEqual(info["trace_count"], 121)
+        self.assertEqual(info["traces"], whole["traces"][:50])
+        self.assertEqual(info["ranges"], {name: whole["ranges"][name] for name in info["traces"]})
+        self.assertEqual(info["groups"], {"v(xtop.xcore0.*": 40, "v(xtop.xcore1.*": 40, "v(xtop.xcore2.*": 40,
+                                          "v(out": 1})
+        self.assertEqual(info["note"], "traces lists the first 50 of 121 traces, and groups counts them all by "
+                                       "name: pass a key of groups as names (to list_traces or extract) for its "
+                                       "traces")
+        head = api.list_traces(path, max_traces=50, header_only=True)
+        self.assertEqual((head["groups"], head["traces"]), (info["groups"], info["traces"]))
+        self.assertEqual(api.list_traces(path, max_traces=121), {**whole, "trace_count": 121})
+        for bad in (0, -1, True, 2.5, "10"):
+            with self.assertRaisesRegex(ValueError, "max_traces must be"):
+                api.list_traces(path, max_traces=bad)
+
+    def test_an_agent_walks_from_the_whole_file_to_one_block(self):
+        # Each call lists at most 20 names: the groups lead to the names wanted, and every
+        # key selects in extract the traces that list_traces counts.
+        path = self.chip()
+        info = api.list_traces(path, max_traces=20)
+        key = "v(xtop.xcore1.*"
+        self.assertEqual(info["groups"][key], 40)
+        block = api.list_traces(path, names=key, max_traces=20)
+        self.assertEqual(block["trace_count"], 40)
+        self.assertEqual(block["groups"], {"v(xtop.xcore1.n0": 1, "v(xtop.xcore1.n1*": 11, "v(xtop.xcore1.n2*": 11,
+                                           "v(xtop.xcore1.n3*": 11, **{f"v(xtop.xcore1.n{i}": 1 for i in range(4, 10)}})
+        for sub, count in block["groups"].items():
+            listed = api.list_traces(path, names=sub, max_traces=20)
+            self.assertEqual((listed["trace_count"], len(listed["traces"])), (count, count), sub)
+            self.assertNotIn("groups", listed)
+            self.assertEqual(api.extract(path, sub, output="summary")["traces"], listed["traces"], sub)
+        ts = api.extract(path, "v(xtop.xcore1.n1*")
+        self.assertEqual(ts.selected[1:3], ["v_xtop_xcore1_n1", "v_xtop_xcore1_n10"])
+
+    def test_list_traces_reads_only_the_header_of_a_large_file(self):
+        size = self.path.stat().st_size
+        with mock.patch.object(api, "SCAN_MAX_BYTES", 1000), \
+                mock.patch.object(api, "scan", side_effect=AssertionError("data read")):
+            info = api.list_traces(self.path)
+        self.assertEqual(list(info), ["path", "format", "analysis", "plot", "plots", "x", "sweeps",
+                                      "sweep_params", "trace_count", "traces", "note"])
+        self.assertEqual(info["note"], f"list_traces read only the header: the file has {api._size(size)}, more "
+                                       f"than the 1 kB that it reads by default; header_only=False reads it all "
+                                       f"for x_range, points, sweep_values, truncated and ranges (names does not "
+                                       f"make that read shorter)")
+        with mock.patch.object(api, "SCAN_MAX_BYTES", 1000):
+            self.assertIn("ranges", api.list_traces(self.path, header_only=False))      # asked for: read it all
+            self.assertNotIn("note", api.list_traces(self.path, header_only=True))
+        self.assertIn("ranges", api.list_traces(self.path))                              # small: read
+        self.assertEqual([api._size(n) for n in (999, 1000, 1_500_000, 10 ** 11)],
+                         ["999 bytes", "1 kB", "1.5 MB", "100 GB"])
 
     def test_list_traces_and_summary_share_their_keys(self):
         info = api.list_traces(self.path)
@@ -2139,9 +2363,12 @@ class TestMcp(unittest.TestCase):
         path = self.dir / "wide.tr0"
         fixtures.write_binary(path, "2001", names, [1] * len(names), [([], data)])
         out = self.m.list_traces(str(path))
-        self.assertEqual(len(out["traces"]), 150)                       # every name is still listed
-        self.assertEqual(list(out["ranges"]), out["traces"][:self.m.MCP_MAX_RANGES])
-        self.assertIn(f"first {self.m.MCP_MAX_RANGES} of 150 traces", out["note"])
+        self.assertEqual((out["trace_count"], len(out["traces"])), (150, self.m.MCP_MAX_TRACES))
+        self.assertEqual(list(out["ranges"]), out["traces"])            # the ranges of the names listed
+        self.assertEqual(sum(out["groups"].values()), 150)              # the groups count every trace
+        self.assertEqual(out["note"], f"traces lists the first {self.m.MCP_MAX_TRACES} of 150 traces, and groups "
+                                      f"counts them all by name: pass a key of groups as names (to list_traces "
+                                      f"or extract) for its traces")
         self.assertNotIn("note", self.m.list_traces(str(path), names=["v_n149"]))
         summary = self.m.extract(str(path), output="summary")
         self.assertEqual(len(summary["ranges"]), self.m.MCP_MAX_RANGES)
@@ -2152,6 +2379,30 @@ class TestMcp(unittest.TestCase):
         self.assertIn(f"the tables below show the first {self.m.TEXT_MAX_TRACES} of 150 traces", text)
         heading = [line.split() for line in text.splitlines() if line.lstrip().startswith("TIME")]
         self.assertEqual(heading, [["TIME"] + out["traces"][:self.m.TEXT_MAX_TRACES]])   # x and 16 traces
+
+    def test_list_traces_tool_reads_only_the_header_of_a_large_file(self):
+        tool = self.tools()["list_traces"]
+        header_only = self.schema(tool)["properties"]["header_only"]["description"]
+        for text in (tool.description, header_only):                # the limits that the tool states
+            self.assertIn(f"over {api._size(api.SCAN_MAX_BYTES)}" if text is tool.description
+                          else f"at most {api._size(api.SCAN_MAX_BYTES)}", text)
+        self.assertIn(f"at most {api.WAVEVIEW_SCAN_MAX_VALUES / 1e6:g} M values", header_only)
+        with mock.patch.object(api, "SCAN_MAX_BYTES", 1000):
+            out = self.m.list_traces(str(HERE / "test_9601.tr0"))
+            self.assertNotIn("ranges", out)
+            self.assertIn("header_only=False reads it all", out["note"])
+            self.assertEqual(out["engine"], "python")
+            self.assertIn("ranges", self.m.list_traces(str(HERE / "test_9601.tr0"), header_only=False))
+
+    def test_list_traces_documents_its_cut_result(self):
+        names = ["TIME"] + [f"v(x{c}.n{i}" for c in range(3) for i in range(50)]
+        path = self.dir / "cut.tr0"
+        fixtures.write_binary(path, "2001", names, [1] * len(names), [([], np.ones((3, len(names))))])
+        out = self.m.list_traces(str(path))
+        self.assertEqual(out["groups"], {"v(x0.*": 50, "v(x1.*": 50, "v(x2.*": 50})
+        text = self.tools()["list_traces"].description
+        for field in out:
+            self.assertRegex(text, rf"\b{field}\b", field)
 
     def test_a_missed_window_says_where_the_data_is(self):
         hint = "the whole plot has 2605 points with TIME in [0, 0.01]"

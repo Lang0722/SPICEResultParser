@@ -93,8 +93,10 @@ extract("run.tr0", ["v(out)", "v(in)"], xrange=(1e-9, 5e-9), yrange=(0, 1.2), ou
 - `sweeps`, `sweep_params` and `sweep_values`: the number of sweeps (indices `0` to
   `sweeps - 1`, for `sweeps=`) and the parameter values of each sweep.
 - `truncated`: `True` when the simulator did not finish writing the file.
-- `traces` and `ranges`: the trace names, and the `[min, max]` of each trace, for
-  `yrange`.
+- `trace_count`, `traces` and `ranges`: the number of traces, their names, and the
+  `[min, max]` of each trace, for `yrange`.
+- `groups` and `note`: see the paragraphs on large files below. They are in the result
+  only when it needs them.
 
 The ranges skip NaN values. A range is `None` when a trace has no value that is not
 NaN. In JSON, NaN and infinite bounds become `null`. The API writes a float32 value (from
@@ -106,6 +108,9 @@ selects them as `extract` does. `ac_format` names the AC traces and sets the val
 are ranged. `list_traces(path, header_only=True)` reads only the header. This is
 instant on any file. The result then has no `x_range`, `points`, `sweep_values`,
 `truncated` or `ranges`, and `sweeps` is the count that the header announces.
+
+By default `list_traces` reads the data only of a file of at most 1 GB, and it can
+list a part of the trace names. See [Large files](#large-files).
 
 `reader.scan(path, plot, ac_format, names)` returns the same facts as a `Scan` object,
 with the bounds in the dtype of the file and a point count per sweep (`sweep_points`).
@@ -176,6 +181,49 @@ least 2 for each series. The size of the summary grows with the number of traces
 the number of sweeps. On large files, select a few traces or sweeps. If you call
 `summarize` on a TraceSet that `extract` already downsampled, `summarize` reports
 statistics of the downsampled points.
+
+## Large files
+
+A pass over the data takes about 1.6 s per GB of a 9601 file, 3 s per GB of a 2013
+file, and 8 to 13 s per GB of an ASCII file, when the file is in the page cache. A
+pass over a 100 GB file takes minutes, or longer from a network disk. Thus by default
+(`header_only=None`) `list_traces` reads the data only of a file of at most 1 GB
+(`api.SCAN_MAX_BYTES`). Of a larger file it reads only the header, and the `note` of
+the result says why:
+
+```python
+list_traces("chip.tr0")["note"]
+# 'list_traces read only the header: the file has 100 GB, more than the 1 GB that it
+#  reads by default; header_only=False reads it all for x_range, points, sweep_values,
+#  truncated and ranges (names does not make that read shorter)'
+```
+
+`header_only=False` reads the data of any file. `names` does not make the pass shorter,
+because each point of the file holds every trace.
+
+A large design can write a million traces. `list_traces(path, max_traces=N)` lists at
+most `N` of them in `traces` and `ranges`. `trace_count` gives the number of traces
+that `names` selects. The result then has `groups`: every selected trace, counted by
+name prefix, in at most `N` and 50 keys (`reader.GROUPS_MAX`):
+
+```python
+info = list_traces("chip.tr0", max_traces=100)
+info["trace_count"]                     # 3002
+info["groups"]                          # {'v(xtop.xcore0.*': 300, ..., 'v(xtop.xcore9.*': 300,
+                                        #  'v(out': 1, 'i(vdd': 1}
+list_traces("chip.tr0", names="v(xtop.xcore3.*", max_traces=100)["trace_count"]   # 300
+```
+
+Each key of `groups` is a value for `names`: a glob for a group, or the name of one
+trace. Together the keys select every trace once. The names split at the levels of
+their hierarchy, below the part that they all share: after the function (`v(`, `i1(`),
+then at each `.`, `:` or `/`. The largest groups split again while the limit allows,
+all groups of the same count together. A level with more branches than the limit
+allows, such as an instance array, splits by characters: `v(xtop.xbit1*` holds
+`xbit1.`, `xbit10.` to `xbit19.`, and so on. A group whose names have no level below
+it splits only when it is the only group. Thus the groups of a block of 300 nodes are
+`v(xtop.xcore3.n0`, `v(xtop.xcore3.n1*` (111 traces) and so on. `reader.name_groups`
+computes the groups of any list of names. On a million names it takes about 1 s.
 
 ## Shape-preserving reduction
 
@@ -284,11 +332,22 @@ cannot select the sanitized base name `v_vo` on its own. To select both, pass th
 name `v(vo)` or a glob such as `v_vo*`. If you give `v_vo`, the error tells you so. A probe output, such as `vdb(vo)` from
 `.probe ac vdb(vo)`, is real. It stays one trace, `vdb_vo`.
 
+A glob works on the sanitized names and on the raw names. `*` matches any characters,
+and `?` matches one character. Brackets match themselves, so `v(d[*]` selects the bus
+bits `v(d[0]` and `v(d[1]`. A glob on raw names keeps to one level of the hierarchy:
+`v(xtop.xcore3.*` selects the nodes of `xtop.xcore3`. The sanitized glob
+`v_xtop_xcore3_*` also selects `v(xtop.xcore3_dbg`, because `.` and `_` both become
+`_`. A raw name or glob finds its trace with or without the closing paren: `v(out` and
+`v(out)` both select `v(out` in an HSPICE file and `v(out)` in a Nutmeg file.
+
 If a name matches no trace exactly, the reader tries it again and ignores case, because
 SPICE names are not case-sensitive: `V(VO)` and `TIME` select `v(vo)` and `time`. An
 exact match always wins. A name that still matches nothing raises a `ValueError` that suggests
-similar names, then lists the available traces. `read_measures` matches measure names
-in the same way.
+similar names, then lists the available traces. For a raw name with levels, the
+suggestion is the near branch at the deepest level that the file has: for
+`v(xtop.xcor3.*` it is `v(xtop.xcore3.*`. When the file has more than 20 traces, the
+error also gives their `groups` (at most 20). `read_measures` matches measure names in
+the same way, with `fnmatch` globs.
 
 ## AC results: `ac_format`
 
@@ -495,6 +554,13 @@ The WaveView engine is different from the Python engine in these ways:
   about 4 s. `list_traces` also reads every point, to give `x_range`, `points` and
   `ranges`, because WaveView has no pass that keeps nothing. `header_only=True` runs only
   WaveView's listing.
+- By default `list_traces` reads the points only when WaveView writes at most 2 M values
+  for the listed traces (`api.WAVEVIEW_SCAN_MAX_VALUES`). The listing gives the point
+  count of each signal, so the engine knows the count before it reads.
+  `waveview.scan_cost` gives it. In a file whose signals have their own x points (an
+  HSPICE `post=3` file), `extract.tcl` stops at the second signal, so `list_traces`
+  ranges only one trace at a time. Else the result is the listing alone, with a `note`.
+  `list_traces` runs the listing once for both steps.
 - It reads plot 0 of a Nutmeg rawfile only. `plots` holds one name, and `plot=1` raises
   `ValueError`.
 - WaveView does not report some facts. The engine reads them from the file header when
@@ -605,6 +671,13 @@ The server marks `list_traces` and `read_measures` as read-only for the client. 
 [Low-memory trace API](#low-memory-trace-api). The agent calls it first and takes the
 `extract` parameters from it: `x_range` for `xrange`, `sweeps` and `sweep_values` for
 `sweeps`, and the trace `ranges` for `yrange`.
+
+Over MCP, `list_traces` lists at most 100 trace names and their ranges (`max_traces` is
+100). When the selection has more, the result has `trace_count` and `groups` (see
+[Large files](#large-files)), and a `note` tells the agent to pass a key of `groups` as
+`names`. Thus each result stays near 10 k characters, also for a million traces.
+`header_only` is `None` by default: the result of a file over 1 GB has the header facts
+only, and a `note` says how to read the data.
 
 Over MCP, `output` is one of these values:
 

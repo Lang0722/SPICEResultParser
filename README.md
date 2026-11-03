@@ -76,6 +76,7 @@ from spice_result_parser import list_traces, extract
 
 list_traces("run.tr0")                              # names, x range, points, sweeps, each trace's [min, max]
 list_traces("run.tr0", header_only=True)            # names and sweep count only: instant on any file
+list_traces("chip.tr0", names="v(xtop.xcore3.*")    # the traces of one block: a glob on netlist names
 ts = extract("run.tr0", ["v(out)", "i_*"])          # numpy arrays, one per trace per sweep
 extract("run.tr0", ["v(out)"], output="csv")        # or "npz", "summary", "png"
 extract("run.tr0", ["v(out)"], xrange=(1e-9, 5e-9), yrange=(0, 1.2), output="png")
@@ -101,6 +102,16 @@ and their parameter values, and the `[min, max]` of each trace. It keeps no trac
 memory. On a 126 MB 9601 file (20 traces, 1.5 M points), it took about 0.2 s at 37 MB
 peak RSS. Reading all 20 traces took 157 MB. Use these values to set the `extract`
 parameters.
+
+A pass over a 100 GB file takes minutes. Thus `list_traces` reads the data only of a
+file of at most 1 GB. Of a larger file it reads only the header, and a `note` says so.
+`header_only=False` reads the data of any file. `names` does not make that pass
+shorter, because each point of the file holds every trace.
+
+`list_traces(path, max_traces=N)` lists at most `N` trace names. `trace_count` gives
+the number of traces, and `groups` counts all of them by name prefix:
+`{"v(xtop.xcore0.*": 300, ..., "v(out": 1}`. Each key is a value for `names`, so the
+next call lists the traces of one group. The MCP server sets `max_traces` to 100.
 
 The `extract` parameters work as follows:
 
@@ -153,7 +164,9 @@ read_measures("run.mt0", engine="waveview")
 - `SRP_WAVEVIEW_TIMEOUT` sets the time limit of one WaveView run (default 600 s).
 
 The WaveView engine reads every point of the selected traces into memory, and only plot
-0 of a Nutmeg rawfile. The three Tcl scripts in `spice_result_parser/tcl/` also run by
+0 of a Nutmeg rawfile. Thus `list_traces` ranges the traces through WaveView only up to
+2 M values. In a file whose signals have their own x points (an HSPICE `post=3` file),
+it ranges one trace at a time. Else it gives WaveView's listing alone, with a `note`. The three Tcl scripts in `spice_result_parser/tcl/` also run by
 hand with `wv -ace_no_gui`. Run a copy in a working directory, because WaveView writes
 `ace_tcl.log` beside the script. [Usage.md](Usage.md#waveview-engine) gives the details
 and the known differences between the two engines.
@@ -180,7 +193,10 @@ selects one plot of a Nutmeg rawfile. `read_measures` accepts HSPICE measure fil
 
 An agent calls `list_traces` first. Its result gives the values that the `extract`
 parameters take: the trace names, `x_range` for `xrange`, `sweeps` and `sweep_values`
-for `sweeps`, and the `ranges` of the traces for `yrange`.
+for `sweeps`, and the `ranges` of the traces for `yrange`. It lists at most 100 trace
+names. When a file has more, `groups` counts all of them by name prefix, and a `note`
+tells the agent to pass a key of `groups` as `names`. Thus an agent reaches the traces
+of one block in a file of a million traces in a few calls. Each call stays small.
 
 Over MCP, the `output` parameter of `extract` takes one of these values:
 
@@ -241,8 +257,12 @@ the envelope of every point (the first, last, lowest and highest sample of each 
 samples), so a narrow spike stays visible.
 
 The tools match trace and measure names the way SPICE does. If no name matches
-exactly, they ignore case, so `V(OUT)` selects `v(out)`. An unknown name gives an error
-that suggests similar names and lists the available names.
+exactly, they ignore case, so `V(OUT)` selects `v(out)`. A trace glob works on the
+netlist names too: `v(xtop.xcore3.*` selects one block. It does not also select
+`v(xtop.xcore3_dbg`, as the sanitized glob `v_xtop_xcore3_*` does. `*` and `?` are the
+only wildcards: `v(d[*]` selects the bus bits `v(d[0]` and `v(d[1]`. An unknown name gives
+an error that suggests similar names, the near block for a netlist name, and lists the
+available names.
 
 `spice_result_parser.mcp_server.format_text(ts, points, tolerance)` returns the `text`
 report for any `TraceSet`. It does not need the `mcp` package.

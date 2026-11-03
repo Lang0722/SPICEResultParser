@@ -27,6 +27,8 @@ truncated file on its console ("waveform file ... not complete").
 from __future__ import annotations
 
 import atexit
+import contextlib
+import contextvars
 import math
 import os
 import re
@@ -376,7 +378,48 @@ def _hspice_header(path: str) -> Optional[Header]:
         return None
 
 
+_LISTINGS: contextvars.ContextVar = contextvars.ContextVar("srp_waveview_listings", default=None)
+
+
+@contextlib.contextmanager
+def listing_memo():
+    """Within the block, WaveView lists each (path, plot, ac_format) once: api.list_traces
+    takes the header, the cost of a scan (scan_cost) and the scan from one run of
+    list_traces.tcl. Outside a block every call runs WaveView, as the file can change."""
+    token = _LISTINGS.set({})
+    try:
+        yield
+    finally:
+        _LISTINGS.reset(token)
+
+
 def _listing(path: str, plot, ac_format: str) -> Tuple[Header, _Listing]:
+    memo = _LISTINGS.get()
+    key = (os.fspath(path), plot, ac_format)
+    if memo is not None and key in memo:
+        return memo[key]
+    listed = _list(path, plot, ac_format)
+    if memo is not None:
+        memo[key] = listed
+    return listed
+
+
+def scan_cost(path, plot: int = 0, ac_format: str = "magphase", names=None) -> Tuple[int, int, bool]:
+    """(signals, values, shared_x) of scan(path, plot, ac_format, names), from WaveView's
+    listing: the signals that extract.tcl writes, the values that it writes for them (x
+    and each signal, by their -npoints; a complex point has two), and whether the signals
+    of the file share their x points (else extract.tcl stops at a second signal)."""
+    header, listing = _listing(path, plot, ac_format)
+    signals: Dict[str, int] = {}                # WaveView name -> values per point (a complex point: 2)
+    for c in resolve_columns(header, names)[1:]:
+        wv_name, part = listing.columns[c]
+        signals[wv_name] = 1 if part is None else 2
+    values = listing.npoints.get(next(iter(signals), listing.first), 0)
+    values += sum(listing.npoints.get(name, 0) * width for name, width in signals.items())
+    return len(signals), values, listing.shared_x
+
+
+def _list(path: str, plot, ac_format: str) -> Tuple[Header, _Listing]:
     path = os.fspath(path)
     check_ac_format(ac_format)
     _check_input(path, plot)
