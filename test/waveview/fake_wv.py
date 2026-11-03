@@ -14,8 +14,8 @@ the error record of the scripts.
 
 For extract.tcl the fake also writes what the script writes and the canned output has
 not: the npoints records (see with_counts). They come from the canned listing of the
-same file, which holds WaveView's real -npoints values. It also applies SRP_MAX_VALUES
-as the script does (see limited).
+same file, which holds WaveView's real -npoints values. It also applies SRP_XLO and
+SRP_XHI (see windowed) and SRP_MAX_VALUES (see limited) as the script does.
 
 The canned listings come from list_traces.tcl before it stopped asking for -npoints: the
 fake serves their signal records without that fourth field, as the script writes them.
@@ -38,6 +38,7 @@ TCL_ERROR = (b"[Tcl Error] [line 12]:invalid command name \"sx_bogus\"\r\n"
              b"  [ error ] ACE Tcl error at line 12\r\n"
              b"   *** Tcl script failed ... ***\r\n")
 KEPT_RECORDS = (b"srp_extract", b"srp_measures", b"title", b"trace", b"x", b"error")
+WINDOW_XNAMES = (b"TIME", b"time", b"HERTZ", b"frequency")    # WaveView gave the x unit s or Hz for these
 
 
 def sliced(lines, signals):
@@ -88,6 +89,51 @@ def with_counts(lines, source, signals):
     records = [b"npoints\t" + name + b"\t" + n + b"\r\n" for name, n in counts if name in names]
     end = len(lines) - 1 if lines and lines[-1].rstrip(b"\r\n") == b"srp_done" else len(lines)
     return lines[:end] + records + lines[end:]
+
+
+def canned_xname(source):
+    """The xname record of the canned listing of source (b"" when there is none)."""
+    path = os.path.join(CANNED, f"{os.path.basename(source)}.list_traces.txt")
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            for line in f:
+                if line.startswith(b"xname\t"):
+                    return line.rstrip(b"\r\n").split(b"\t", 1)[1]
+    return b""
+
+
+def windowed(lines, lo, hi):
+    """Cut each trace to the window [lo, hi] (None: open) as extract.tcl does. A scan starts
+    at point 0 when one of the first 8 points has x >= lo, else at the point before the first
+    such point, and stops before the first x above hi. A span record follows each trace
+    record. A signal whose values end inside the window gets the stopped record."""
+    out, i = [], 0
+    while i < len(lines):
+        out.append(lines[i])
+        i += 1
+        if not out[-1].startswith(b"trace\t"):
+            continue
+        records = []                                    # (record line, value lines) of the trace
+        while i < len(lines) and lines[i].split(b"\t", 1)[0] in (b"x", b"real", b"complex"):
+            head, i = lines[i], i + 1
+            values = []
+            while i < len(lines) and b"\t" not in lines[i] and lines[i].rstrip(b"\r\n") != b"srp_done":
+                values.append(lines[i])
+                i += 1
+            records.append((head, values))
+        xs = next((v for head, v in records if head.startswith(b"x\t")), [])
+        x = [float(v) for v in xs]
+        k = len(x) if lo is None else next((j for j, v in enumerate(x) if v >= lo), len(x))
+        start = 0 if lo is None or k < 8 else k - 1
+        stop = len(x) if hi is None else next((j for j in range(start, len(x)) if x[j] > hi), len(x))
+        ends = [v.rstrip(b"\r\n") for v in xs[:1] + xs[-1:]] if xs else [b"", b""]
+        out.append(b"span\t" + ends[0] + b"\t" + ends[-1] + b"\r\n")
+        for head, values in records:
+            kept = values[start:stop]
+            out += [head] + kept
+            if kept and len(values) < stop and not head.startswith(b"x\t"):
+                out.append(b"stopped\t" + head.rstrip(b"\r\n").split(b"\t", 1)[1] + b"\r\n")
+    return out
 
 
 def limited(lines, limit):
@@ -152,6 +198,9 @@ def main(argv) -> int:
         lines = sliced(lines, signals)
     if script == "extract":
         lines = with_counts(lines, source, signals)
+        bounds = [float(os.environ[key]) if key in os.environ else None for key in ("SRP_XLO", "SRP_XHI")]
+        if bounds != [None, None] and canned_xname(source) in WINDOW_XNAMES:
+            lines = windowed(lines, *bounds)
         if "SRP_MAX_VALUES" in os.environ:
             lines = limited(lines, int(os.environ["SRP_MAX_VALUES"]))
     if mode == "no_done":

@@ -12,6 +12,7 @@ them. The tests against the real WaveView are in test_waveview_e2e.py.
 """
 import asyncio
 import json
+import math
 import os
 import shutil
 import signal
@@ -648,6 +649,78 @@ class TestReadTraces(FakeWaveView):
         with self.assertRaises(waveview.ValueLimitError):
             api.extract(TR, "v(vo", engine="waveview", max_values=101)
         api.extract(TR, "v(vo", engine="python", max_values=101)
+
+    WINDOW_FILES = (TR, WV / "rc.tr0", WV / "two.tr0", WV / "rc.ac0", NUTMEG)
+
+    def windows(self, path):
+        """On points, between points, half infinite, one point, past the end."""
+        ts = read_traces(path)
+        x = np.unique(np.concatenate(ts.data[ts.header.x_name]))
+        n = x.size
+        a, b, c = float(x[n // 3]), float(x[n // 3 + 1]), float(x[n // 2])
+        return [(a, c), ((a + b) / 2, c), (-math.inf, float(x[5])), (float(x[-5]), math.inf),
+                (float(x[0]), float(x[0])), (float(x[-1]) * 2 + 1, float(x[-1]) * 3 + 2)]
+
+    def test_window_equals_python(self):
+        for path in self.WINDOW_FILES:
+            for w in self.windows(path):
+                with self.subTest(path=path.name, window=w):
+                    self.assert_same_traces(waveview.read_traces(path, xrange=w), read_traces(path, xrange=w))
+
+    def test_window_reaches_tcl(self):
+        lo, hi = 1e-4, 2e-3
+        with mock.patch.object(waveview, "run_script", wraps=waveview.run_script) as run:
+            waveview.read_traces(TR, ["v(vo"], xrange=(lo, hi))
+            env = run.call_args_list[-1].args[1]
+            self.assertEqual((env["SRP_XLO"], env["SRP_XHI"]),
+                             (repr(float(np.float32(lo))), repr(float(np.float32(hi)))))     # 9601: float32
+            waveview.read_traces(WV / "rc.tr0", ["v(out"], xrange=(lo, math.inf))
+            env = run.call_args_list[-1].args[1]
+            self.assertEqual(env["SRP_XLO"], repr(lo))                                       # 2013: float64 x
+            self.assertNotIn("SRP_XHI", env)
+
+    def test_window_writes_only_the_window(self):
+        x = read_traces(TR).data["TIME"][0]
+        text, end, _ = waveview._run("extract.tcl", str(TR), ["v(vo)"], window=(float(x[1000]), float(x[1010])))
+        values = [line for line in text[:end].splitlines() if "\t" not in line]
+        self.assertLessEqual(len(values), 2 * (11 + 8))         # x and v(vo): the window, and at most 8 points before it
+        self.assertEqual(waveview._export_info(text, end).spans, [(0.0, float(x[-1]))])
+
+    def test_window_only_for_time_and_frequency(self):
+        path = WV / "dc2.sw0"                                    # x in volts: 3 sweeps of 0, 0.5 and 1 V
+        ts = read_traces(path)
+        x = np.unique(np.concatenate(ts.data[ts.header.x_name]))
+        w = (float(x[1]), float(x[2]))
+        text, end, _ = waveview._run("extract.tcl", str(path), None, window=w)
+        self.assertEqual(waveview._export_info(text, end).spans, [])
+        self.assert_same_traces(waveview.read_traces(path, xrange=w), read_traces(path, xrange=w))
+
+    def test_no_window_for_dimensions_or_a_cut_file(self):
+        with tempfile.TemporaryDirectory() as tmp, warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cut = self.cut(tmp, "cut_t9601.tr0", TR, 0.6)
+            for path in (WV / "dims.raw", cut):
+                with mock.patch.object(waveview, "run_script", wraps=waveview.run_script) as run:
+                    waveview.read_traces(path, xrange=(0.0, 1.0))
+                self.assertNotIn("SRP_XLO", run.call_args_list[-1].args[1], path)
+        self.assert_same_traces(waveview.read_traces(WV / "dims.raw", xrange=(0.0, 1.0)),
+                                read_traces(WV / "dims.raw", xrange=(0.0, 1.0)), rtol=1e-15)
+
+    def test_stopped_scan_is_an_error(self):
+        real = waveview._export_info
+
+        def stopped(text, end):
+            info = real(text, end)
+            info.stopped.append((0, "v(vo)"))
+            return info
+        with mock.patch.object(waveview, "_export_info", side_effect=stopped):
+            with self.assertRaisesRegex(WaveViewError, r"WaveView stops its scan of v\(vo\) in sweep 0 before "
+                                                       r"the end of the sweep"):
+                waveview.read_traces(TR, ["v(vo"], xrange=(1e-4, 2e-3))
+        # The scan of v(g36) ends after 100 of its 122 points: inside the window, a stopped record.
+        x = read_traces(WV / "big9.tr0").data["TIME"][0]
+        with self.assertRaisesRegex(WaveViewError, r"WaveView stops its scan of v\(g36\) in sweep 0"):
+            waveview.read_traces(WV / "big9.tr0", ["v(g36"], xrange=(float(x[90]), math.inf))
 
     def test_truncated_sweep(self):
         # rc9.tr0 cut inside sweep 1: WaveView reads sweep 0 only, the header declares 3.

@@ -667,8 +667,8 @@ def extract(
     xrange: Annotated[Optional[List[float]], Number, Field(
         description="[min, max] on x (list_traces gives x_range): keep only rows inside the "
                     "closed interval, for every output. Applied while reading, so memory follows "
-                    "the window, but the read still goes through the whole file (WaveView: "
-                    "every point of the traces).")] = None,
+                    "the window, but the read still goes through the whole file (WaveView: only "
+                    "the window for a time or frequency x, else every point of the traces).")] = None,
     yrange: Annotated[Optional[List[float]], Number, Field(
         description="[min, max] vertical axis limits of the png plot (list_traces gives each "
                     "trace's range); other outputs do not use it, but a malformed value is "

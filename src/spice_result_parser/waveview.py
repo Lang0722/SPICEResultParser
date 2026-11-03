@@ -11,9 +11,9 @@ Tcl source. The exit code of WaveView does not show success (it is 0 after an er
 that the script catches), so every script ends its output with `srp_done`; a missing
 srp_done is a failure.
 
-Differences from the Python engine: every point of the selected signals is read
-into memory, and xrange is applied after the read (scan, for list_traces, reads them
-too); only plot 0 of a Nutmeg rawfile; arrays are float64 unless the header gives the
+Differences from the Python engine: the selected signals are read into memory, every
+point of them, or with xrange on a time or frequency x only the window and a few points
+before it (see read_traces); scan, for list_traces, reads every point; only plot 0 of a Nutmeg rawfile; arrays are float64 unless the header gives the
 file's dtypes (9601: float32; 2013: float64 x and float32 values, as the Python engine
 gives them); a measure file has no `alter#` column; a truncated binary HSPICE file
 loses its partial sweep. Names follow the Python engine (see raw_name). What WaveView
@@ -209,7 +209,8 @@ atexit.register(stop_all)
 
 
 def _run(name: str, path: str, signals: Optional[List[str]] = None, xcheck: bool = False,
-         npoints_all: bool = False, max_values: Optional[int] = None) -> Tuple[str, int, str]:
+         npoints_all: bool = False, max_values: Optional[int] = None,
+         window: Optional[Tuple[float, float]] = None) -> Tuple[str, int, str]:
     """Run a script on `path`; return its output, the offset of the final srp_done, where
     the records end, and the console. The text is not sliced: an extract output can be large.
 
@@ -217,6 +218,7 @@ def _run(name: str, path: str, signals: Optional[List[str]] = None, xcheck: bool
     xcheck: set SRP_XCHECK (extract.tcl checks that all signals have the same x points).
     npoints_all: set SRP_NPOINTS=all (extract.tcl writes the point count of every signal).
     max_values: set SRP_MAX_VALUES (extract.tcl stops before a row would go past it).
+    window: (lo, hi) of x, sent as SRP_XLO and SRP_XHI; an infinite bound is not sent.
     Raises WaveViewError when the output has no srp_done or holds an error record.
     """
     # A WaveView that outlives a timeout can hold files in tmp (Windows): the clean-up must
@@ -237,6 +239,10 @@ def _run(name: str, path: str, signals: Optional[List[str]] = None, xcheck: bool
             env["SRP_NPOINTS"] = "all"
         if max_values is not None:
             env["SRP_MAX_VALUES"] = str(int(max_values))
+        if window is not None:
+            for key, bound in zip(("SRP_XLO", "SRP_XHI"), window):
+                if math.isfinite(bound):
+                    env[key] = repr(float(bound))       # repr reads back to the same double
         if signals is not None:
             env["SRP_SIGNALS"] = os.path.join(tmp, "signals.txt")
             with open(env["SRP_SIGNALS"], "w", encoding="utf-8", newline="\n") as f:
@@ -593,18 +599,31 @@ class _ExportInfo:
     """The records of extract.tcl that hold no values."""
     npoints: Dict[str, int] = field(default_factory=dict)  # WaveView name -> -npoints (one more per sweep)
     limit: Optional[Tuple[int, int, Optional[float]]] = None  # SRP_MAX_VALUES: (values, trace, last x)
+    spans: List[Tuple[float, float]] = field(default_factory=list)   # the window: (first x, last x) per trace
+    stopped: List[Tuple[int, str]] = field(default_factory=list)     # the window: (trace, WaveView name) of a
+                                                                     # scan that ended early
+
+
+def _number(text: str) -> float:
+    return float(_WINDOWS_SPECIAL.sub(_special, text))
 
 
 def _export_info(text: str, end: int) -> _ExportInfo:
     """The records of extract.tcl output up to `end` that hold no values (_INFO_RECORDS)."""
     info = _ExportInfo()
+    trace = -1
     for mark in _RECORD.finditer(text, 0, end):
         kind, fields = mark.group(1), mark.group(2).split("\t")
-        if kind == "npoints" and len(fields) == 2 and fields[1].isdigit():
+        if kind == "trace":
+            trace += 1
+        elif kind == "npoints" and len(fields) == 2 and fields[1].isdigit():
             info.npoints[fields[0]] = int(fields[1])
         elif kind == "limit" and len(fields) == 3:
-            x = float(_WINDOWS_SPECIAL.sub(_special, fields[2])) if fields[2] else None
-            info.limit = (int(fields[0]), int(fields[1]), x)
+            info.limit = (int(fields[0]), int(fields[1]), _number(fields[2]) if fields[2] else None)
+        elif kind == "span" and len(fields) == 2 and all(fields):
+            info.spans.append((_number(fields[0]), _number(fields[1])))
+        elif kind == "stopped":
+            info.stopped.append((trace, mark.group(2)))
     return info
 
 
@@ -661,9 +680,11 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
                 ac_format: str = "magphase", max_values: Optional[int] = None) -> TraceSet:
     """Read selected traces through WaveView (see reader.read_traces for the arguments).
 
-    Two WaveView runs: list_traces.tcl for the names, then extract.tcl for every point of
-    the selected signals. The sweeps filter and the closed xrange window are applied
-    afterwards, so memory follows the selected signals times all their points.
+    Two WaveView runs: list_traces.tcl for the names, then extract.tcl for the points of
+    the selected signals. With xrange, extract.tcl writes only the window and at most 8
+    points before it, when x is time or frequency (x unit s or Hz), the file is complete,
+    and it is not a Nutmeg plot of a Dimensions line. Else it writes every point. The
+    sweeps filter and the closed xrange mask are applied afterwards.
 
     max_values: the most values that extract.tcl writes. A point of x counts its whole
     row: x, 1 per real and 2 per complex signal. When the next row would go past it,
@@ -695,12 +716,26 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
         wv_name = listing.columns[c][0]
         if wv_name not in signals:
             signals.append(wv_name)
+    x_dtype, value_dtype = listing.dtypes or (np.dtype(np.float64), np.dtype(np.float64))
+    window = xrange
+    if xrange is not None and x_dtype == np.float32:
+        with np.errstate(over="ignore"):    # as the Python engine compares: float32 x with float32 bounds
+            window = (float(np.float32(xrange[0])), float(np.float32(xrange[1])))
+    # A Nutmeg plot of a Dimensions line is one WaveView trace that Python splits by point
+    # count, and a cut file needs every row to find its last one: they get every point.
+    send = window if listing.nsplit == 1 and not listing.incomplete else None
     text, end, _ = _run("extract.tcl", path, signals, xcheck=not listing.shared_x, npoints_all=listing.incomplete,
-                        max_values=max_values)
+                        max_values=max_values, window=send)
     info = _export_info(text, end)
     if info.limit is not None:
         del text
         raise ValueLimitError(path, int(max_values), *info.limit, header.x_name)
+    if info.stopped:
+        del text
+        trace, name = info.stopped[0]
+        raise WaveViewError(f"{path}: WaveView stops its scan of {name} in sweep {trace} before the end of the "
+                            f"sweep: WaveView stops early on some values of about 1e34 or more, so the engine cannot "
+                            f"read this signal (read the file with engine='python', or leave out the signal)")
     traces = _parse_points(text, end, path)
     del text
     if len(traces) > listing.ntraces:   # the simulator ended a sweep between the two WaveView runs
@@ -708,7 +743,10 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
     if len(traces) != listing.ntraces:
         raise WaveViewError(f"{path}: WaveView wrote {len(traces)} traces; its listing has {listing.ntraces} "
                             f"(the file can have changed between the two WaveView runs)")
-    _check_counts(path, listing, traces, signals, info.npoints)
+    spans = info.spans[:listing.ntraces]
+    if not spans:                           # with the window there are no counts to compare
+        _check_counts(path, listing, traces, signals, info.npoints)
+    xsig = signals[0] if signals else listing.first
     if listing.incomplete:
         # The last row can be partial: keep the points that every signal of the file has.
         # -npoints shows the signals that have a point of that row (extract.tcl writes the
@@ -727,7 +765,7 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
             raise WaveViewError(f"{path}: WaveView changes a value of a Nutmeg file above {NUTMEG_LIMIT:g} to "
                                 f"+-{NUTMEG_LIMIT:g}, and an infinite value changes the whole plot. This file holds "
                                 f"such a value: read it with engine='python'")
-        npoints = traces[0][0].size
+        npoints = info.npoints.get(xsig, 0) if spans else traces[0][0].size
         if 0 < npoints < listing.nut_points and not truncated:
             truncated = True
             _warn_truncated(path, listing, f"WaveView reads {npoints} of the {listing.nut_points} points of the plot")
@@ -736,20 +774,21 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
         if len(traces) < listing.nsplit:
             check_sweeps(path, wanted, len(traces), True)
     sweep_values = [_condition_values(c, listing.params, path) for c in listing.conditions] or [[] for _ in traces]
-    x_dtype, value_dtype = listing.dtypes or (np.dtype(np.float64), np.dtype(np.float64))
     if listing.dtypes is not None:
         # The arrays get the dtypes of the file, as the Python engine gives them: float32 in
         # 9601, and float32 values beside a float64 x in 2013. WaveView prints each value at
         # 17 digits, so the cast is exact (its AC values round to the stored ones).
         traces = [(x.astype(x_dtype), {name: v.astype(value_dtype) for name, v in ys.items()})
                   for x, ys in traces]
-    span = _XSpan(x_dtype)
-    for x, _ in traces:                     # the whole plot, before sweeps and xrange select
-        span.add(x)
-    window = xrange
-    if xrange is not None and x_dtype == np.float32:
-        with np.errstate(over="ignore"):    # as the Python engine compares: float32 x with float32 bounds
-            window = (float(np.float32(xrange[0])), float(np.float32(xrange[1])))
+    span = _XSpan(x_dtype)                  # the whole plot, before sweeps and xrange select
+    if spans:                               # the window: WaveView's first and last x of each trace
+        for first, last in spans:
+            span.add(np.array([first, last], dtype=x_dtype))
+        plot_points = max(0, info.npoints.get(xsig, 0) - (listing.ntraces if listing.params else 0))
+    else:
+        for x, _ in traces:
+            span.add(x)
+        plot_points = span.points
     data: Dict[str, list] = {header.names[c]: [] for c in cols}
     kept: List[int] = []
     for i, (x, ys) in enumerate(traces):
@@ -786,7 +825,7 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
         sweep_indices=kept,
         data=data,
         truncated=truncated,
-        plot_points=span.points,
+        plot_points=plot_points,
         plot_x_range=span.range,
         xrange=xrange,
     )

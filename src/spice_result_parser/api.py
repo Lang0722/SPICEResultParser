@@ -713,9 +713,9 @@ def extract(path, names=None, sweeps=None, output: str = "arrays",
     ac_format is what each complex (AC) variable becomes: "magphase" (_Mag, _Phase in
     degrees), "db" (_dB = 20 log10 |z|, _Phase) or "realimag" (_Re, _Im).
     engine is the reader: "python" (this package's parser) or "waveview" (Synopsys
-    WaveView in batch mode, see waveview.py: it reads every point of the selected
-    traces, then applies xrange). None uses the SRP_ENGINE environment variable, else
-    "python".
+    WaveView in batch mode, see waveview.py: it reads the selected traces, only the
+    window of xrange for a time or frequency x, else every point). None uses the
+    SRP_ENGINE environment variable, else "python".
     max_values (WaveView only, see waveview.read_traces): the most values that WaveView
     writes. At the limit, extract raises waveview.ValueLimitError (a ValueError). The
     Python engine ignores it.
