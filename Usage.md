@@ -221,7 +221,8 @@ a `ReadCost`:
 For the WaveView engine, `values`, `memory` and `seconds` are 0, because its listing
 gives no point counts. `large` means more than 200 selected traces
 (`api.WAVEVIEW_MAX_TRACES`). The MCP `extract` also stops WaveView at 2 M values
-(`api.WAVEVIEW_SCAN_MAX_VALUES`), and its error says where WaveView stopped.
+(`api.WAVEVIEW_SCAN_MAX_VALUES`). Its error says where WaveView stopped, and whether a
+narrower `xrange` takes fewer values.
 
 Over MCP, `extract` warns before a large read. It reads a large file only with
 `allow_large=True`. Without it, the call fails before the read:
@@ -606,7 +607,10 @@ The WaveView engine is different from the Python engine in these ways:
   per real trace and two per complex one. At either limit the result is the listing
   alone, with a `note`. The MCP `extract` uses both limits unless `allow_large=True`. In
   Python, `api.extract(..., engine="waveview", max_values=N)` stops at N values and
-  raises `waveview.ValueLimitError`, a `ValueError`.
+  raises `waveview.ValueLimitError`, a `ValueError`. Its `windowed` is True when WaveView
+  wrote only the window, False when it writes every point of this file, and None without
+  `xrange`. With `allow_large=True`, the MCP `extract` gives the time of each WaveView
+  read.
 - In a file whose signals have their own x points (an HSPICE `post=3` file),
   `extract.tcl` stops at the second signal, so `list_traces` ranges only one trace at a
   time. `waveview.scan_cost` gives the signals and whether they share their x points.

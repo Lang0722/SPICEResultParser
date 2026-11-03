@@ -735,7 +735,8 @@ def extract(
         except waveview.ValueLimitError as exc:
             raise ValueError(_value_limit(exc)) from None
         took = time.perf_counter() - start         # png draws every point's envelope; text and summary reduce
-    note = _large_took(cost, took) if cost.large else None
+    # Through WaveView, allow_large=True can also read more than WAVEVIEW_SCAN_MAX_VALUES values.
+    note = _large_took(cost, took) if cost.large or (allow_large and cost.engine == "waveview") else None
     if output == "text":
         text = format_text(ts, downsample, reduce.DEFAULT_TOLERANCE if tolerance is None else tolerance)
         return f"{text}\n-- {note} --" if note else text
@@ -788,15 +789,23 @@ def _large_read(cost: api.ReadCost, output: str, windowed: bool) -> str:
 def _value_limit(exc: waveview.ValueLimitError) -> str:
     """The error of extract when WaveView stopped at the value limit: where, and what takes fewer values."""
     where = "before its first point" if exc.x is None else f"at {exc.x_name} = {exc.x:.6g}"
+    if exc.windowed:
+        fewer = "A narrower xrange or fewer traces take fewer values"
+    elif exc.windowed is None:
+        fewer = ("An xrange takes fewer values only when x is time or frequency (x unit s or Hz). Fewer traces take "
+                 "fewer values")
+    else:
+        fewer = "WaveView writes every point of this file, also with an xrange. Fewer traces take fewer values"
     return (f"extract stopped WaveView at the limit of {exc.limit:,} values, in sweep {exc.trace} {where}: without "
-            f"allow_large=True, extract takes at most {exc.limit:,} values from WaveView. A narrower xrange or "
-            f"fewer traces take fewer values. allow_large=True reads them all")
+            f"allow_large=True, extract takes at most {exc.limit:,} values from WaveView. {fewer}. sweeps=[...] "
+            f"does not take fewer values, because WaveView writes every sweep. allow_large=True reads them all")
 
 
 def _large_took(cost: api.ReadCost, took: float) -> str:
     """The note of a large read: how long it took, as every later read of the file takes it again."""
     if cost.engine == "waveview":
-        return f"WaveView took {api._duration(took)} for these {cost.traces} traces"
+        traces = "this trace" if cost.traces == 1 else f"these {cost.traces} traces"
+        return f"WaveView took {api._duration(took)} for {traces}"
     return (f"this read took {api._duration(took)}: each extract reads all {api._size(cost.bytes)} of the "
             f"file again, for any names, sweeps and xrange")
 

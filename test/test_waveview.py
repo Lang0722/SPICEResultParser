@@ -645,6 +645,24 @@ class TestReadTraces(FakeWaveView):
         with self.assertRaises(waveview.ValueLimitError):
             waveview.read_traces(WV / "rc.ac0", ["v(out"], max_values=3 * n - 1)
 
+    def test_value_limit_says_if_an_xrange_takes_fewer_values(self):
+        # windowed: True when WaveView wrote only the window. False when it writes every point of
+        # this file, also with an xrange. None without a finite bound: then the x unit decides.
+        x = read_traces(TR).data["TIME"][0]
+        sw = read_traces(WV / "dc2.sw0")
+        v = sw.data[sw.header.x_name][0]
+        with tempfile.TemporaryDirectory() as tmp, warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cut = self.cut(tmp, "cut_t9601.tr0", TR, 0.6)
+            cases = [(TR, (float(x[10]), float(x[2000])), True), (TR, None, None),
+                     (TR, (-math.inf, math.inf), None), (WV / "dc2.sw0", (float(v[1]), float(v[2])), False),
+                     (WV / "dims.raw", None, False), (WV / "dims.raw", (0.0, 1.0), False), (cut, None, False)]
+            for path, xrange, windowed in cases:
+                with self.subTest(path=path.name, xrange=xrange):
+                    with self.assertRaises(waveview.ValueLimitError) as caught:
+                        waveview.read_traces(path, xrange=xrange, max_values=3)
+                    self.assertIs(caught.exception.windowed, windowed)
+
     def test_api_extract_passes_the_limit_to_waveview_only(self):
         with self.assertRaises(waveview.ValueLimitError):
             api.extract(TR, "v(vo", engine="waveview", max_values=101)
@@ -1318,6 +1336,33 @@ class TestMcpOutputs(FakeWaveView):
                                                           r"in sweep 0 at TIME = "):
                 self.m.extract(str(TR), "v(vo", engine="waveview")
             self.m.extract(str(TR), "v(vo", engine="waveview", allow_large=True)
+
+    def test_value_limit_error_says_what_takes_fewer_values(self):
+        x = read_traces(TR).data["TIME"][0]
+        sw = read_traces(WV / "dc2.sw0")
+        v = sw.data[sw.header.x_name][0]
+        every = r"WaveView writes every point of this file, also with an xrange\. Fewer traces take fewer values\. "
+        cases = [(TR, [float(x[10]), float(x[2000])], r"A narrower xrange or fewer traces take fewer values\. "),
+                 (TR, None, r"An xrange takes fewer values only when x is time or frequency \(x unit s or Hz\)\. "
+                            r"Fewer traces take fewer values\. "),
+                 (WV / "dc2.sw0", [float(v[1]), float(v[2])], every), (WV / "dims.raw", None, every)]
+        with mock.patch.object(api, "WAVEVIEW_SCAN_MAX_VALUES", 3):
+            for path, xrange, advice in cases:
+                with self.subTest(path=path.name, xrange=xrange):
+                    with self.assertRaisesRegex(self.m.ToolError, r"^extract stopped WaveView at the limit of 3 "
+                                                r"values, in sweep 0 [^:]+: without "
+                                                r"allow_large=True, extract takes at most 3 values from WaveView\. "
+                                                + advice + r"sweeps=\[\.\.\.\] does not take fewer values, because "
+                                                r"WaveView writes every sweep\. allow_large=True reads them all"):
+                        self.m.extract(str(path), xrange=xrange, engine="waveview")
+
+    def test_waveview_read_with_allow_large_gives_its_time(self):
+        # Under 200 traces, allow_large=True can still read more than 2 M values through WaveView.
+        text = self.m.extract(str(TR), "v(vo", engine="waveview", allow_large=True)
+        self.assertRegex(text.splitlines()[-1], r"^-- WaveView took \d+ s for this trace --$")
+        out = self.m.extract(str(TR), "v(vo", output="summary", engine="waveview", allow_large=True)
+        self.assertRegex(out["note"], r"WaveView took \d+ s for this trace$")
+        self.assertNotIn("WaveView took", self.m.extract(str(TR), "v(vo", engine="waveview"))
 
     def test_signal_stops_waveview_first(self):
         with mock.patch.object(waveview, "stop_all") as stop, mock.patch.object(self.m.os, "_exit") as end:

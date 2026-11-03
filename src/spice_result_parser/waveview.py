@@ -78,10 +78,15 @@ class WaveViewError(RuntimeError):
 class ValueLimitError(ValueError):
     """extract.tcl stopped at the limit of values that the caller set (max_values of read_traces).
     values: the values of the rows that fit. trace: the WaveView trace where it stopped. x: the
-    x of the last row that fits in that trace (None: no row fits). x_name: the name of x."""
+    x of the last row that fits in that trace (None: no row fits). x_name: the name of x.
+    windowed: True when WaveView wrote only the xrange window, so a narrower xrange takes fewer
+    values. False when WaveView writes every point of this file, also with an xrange. None
+    without a finite bound of xrange: then the x unit decides (a window for s or Hz)."""
 
-    def __init__(self, path: str, limit: int, values: int, trace: int, x: Optional[float], x_name: str):
+    def __init__(self, path: str, limit: int, values: int, trace: int, x: Optional[float], x_name: str,
+                 windowed: Optional[bool] = None):
         self.limit, self.values, self.trace, self.x, self.x_name = limit, values, trace, x, x_name
+        self.windowed = windowed
         where = "before its first point" if x is None else f"at {x_name} = {x:.6g}"
         super().__init__(f"{path}: WaveView stopped at the limit of {limit:,} values, in sweep {trace} {where}")
 
@@ -729,7 +734,11 @@ def read_traces(path, names=None, sweeps=None, plot: int = 0, xrange=None,
     info = _export_info(text, end)
     if info.limit is not None:
         del text
-        raise ValueLimitError(path, int(max_values), *info.limit, header.x_name)
+        if send is not None and any(math.isfinite(b) for b in send):
+            windowed: Optional[bool] = bool(info.spans)     # a span starts each trace of the window
+        else:
+            windowed = None if listing.nsplit == 1 and not listing.incomplete else False
+        raise ValueLimitError(path, int(max_values), *info.limit, header.x_name, windowed)
     if info.stopped:
         del text
         trace, name = info.stopped[0]
