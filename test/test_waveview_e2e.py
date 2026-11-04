@@ -348,7 +348,7 @@ class TestPostVersion2013(Base):
                 got = waveview.read_traces(WV / binary)
                 want = waveview.read_traces(WV / other)
                 self.assertEqual((got.selected, got.sweep_values), (want.selected, want.sweep_values))
-                self.assert_same(got, want, 1e-5, 1e-9)
+                self.assert_same(got, want, 1e-5, 1e-9, dtype=False)       # float32 values, float64 ASCII
 
     def test_text_report(self):
         from spice_result_parser import mcp_server
