@@ -41,7 +41,9 @@ the same as a signal of 3,929 points. No larger FSDB was available. So it is not
 this cost grows with the size of the file.
 
 Each WaveView start on the VM took 29 s before the script ran. The engine design note
-(`2026-10-28-waveview-engine-design.md`) says 0.25 s. The cause is not known.
+(`2026-10-28-waveview-engine-design.md`) says 0.25 s. On 2026-11-04 a probe found the
+cause in the network of the VM. The engine design note gives the details. With the VM on
+the Shared Network, a start took about 0.25 s.
 
 ### The scan commands
 

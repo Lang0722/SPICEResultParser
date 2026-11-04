@@ -58,7 +58,12 @@ testing.
 
 Batch mode: `wv -ace_no_gui script.tcl`. It needs no display. Start-up is
 about 0.25 s. (On 2026-11-03 each start on the Parallels VM took about 29 s.
-The cause is not known.) The embedded Tcl is **8.4.20**: no `dict`, `lassign`, `{*}`,
+The cause was the network of the VM. At each start, `wv.exe` checks its own code
+signature, and Windows tries to download certificate data. On the Parallels
+Host-Only network, each download waited for a DNS timeout. On 2026-11-04, with the
+VM on the Shared Network, a start took about 0.25 s again. A Windows machine
+without internet access can have the same delay, if its DNS lookups wait for a
+timeout.) The embedded Tcl is **8.4.20**: no `dict`, `lassign`, `{*}`,
 `lmap`, `apply`, `string cat`. Environment variables are visible as
 `$env(NAME)`. Console messages (`*** loading waveform file ...`, `[ error ]
 ...`, `[Tcl Error] [line N]:...`) go to stdout. **The exit code does not show

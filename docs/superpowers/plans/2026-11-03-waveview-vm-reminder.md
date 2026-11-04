@@ -31,18 +31,28 @@ the plan passed on the VM:
 
 Six of the `TestWindow` tests ran before commit `b104c0c`, which adds a check for a
 frequency that goes down. Of the six, only `test_window_past_the_end_and_half_infinite`
-reads an AC file, so the check runs only in it. After `b104c0c`, `test_frequency_out_of_order`
-showed that `rc.ac0` still gets the window, but it compared no values of that window. A run
-of `test_window_past_the_end_and_half_infinite` (about 2 minutes) compares them.
+reads an AC file, so the check runs only in it.
 
-On 2026-11-04 the owner chose not to run `TestFailures.test_truncated_files`. It is the
-only e2e test of a file that is not complete, and it takes about 20 minutes:
+**Status, later on 2026-11-04:** each WaveView start on the VM took 29 s because of the
+network of the VM, not because of this code. At each start, `wv.exe` checks its own code
+signature, and Windows tries to download certificate data. On the Parallels Host-Only
+network, each download waited for a DNS timeout. The owner moved the VM to the Shared
+Network. Now a start takes about 0.5 s, `prlctl` included. Then, on the VM:
 
-    SRP_E2E_WAVEVIEW=1 PYTHONPATH=src:test timeout 1800 python3 -m unittest -v \
-      test_waveview_e2e.TestFailures.test_truncated_files
+- `TestWindow`: all 7 tests pass in 14 s. So the check of `b104c0c` ran in
+  `test_window_past_the_end_and_half_infinite`, and it passed.
+- `TestFailures.test_truncated_files` passes in 20 s.
+- The first run of the whole e2e suite, at `f39c211`, found 2 failures in 44 tests (172 s).
+  Both were in `TestPostVersion2013.test_same_values_as_the_ascii_twin`. Since `76237e0`,
+  the test compared the dtypes of a 2013 binary (float32 values) and of its ASCII twin
+  (float64). Commit `9db07c2` fixes the test. The engine did not change.
+- At `9db07c2`, the whole e2e suite passes: 44 tests in 151 s.
 
-One run of all the e2e tests of the plan takes more than 45 minutes, because each parity
-file takes about 4 WaveView starts.
+A run of the whole e2e suite on the VM:
+
+    SRP_E2E_WAVEVIEW=1 PYTHONPATH=src:test timeout 300 python3 -m unittest -v test_waveview_e2e
+
+If the starts become slow again, check the network of the VM first.
 
 ## What the owner wants
 
